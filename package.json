@@ -1,0 +1,43 @@
+{
+  "name": "@catalyst-cloud/sdk",
+  "version": "0.1.0",
+  "description": "Isomorphic (browser + node/bun) read-layer-over-WebSocket client for the catalyst-cloud change-feed (ADR-0008/0009).",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "catalyst",
+    "websocket",
+    "change-feed",
+    "live-sync",
+    "isomorphic",
+    "cloudflare",
+    "durable-objects"
+  ],
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}

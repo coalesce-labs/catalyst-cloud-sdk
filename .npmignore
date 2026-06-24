@@ -1,0 +1,10 @@
+# Publish only the built dist/ (see package.json "files"). This .npmignore is a belt-and-suspenders
+# guard so source, tests, and tsconfigs never ship even if "files" is edited.
+src/
+test/
+tsconfig*.json
+vitest.config.ts
+.gitignore
+coverage/
+.turbo/
+*.tsbuildinfo

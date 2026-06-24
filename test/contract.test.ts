@@ -1,0 +1,91 @@
+import { describe, expect, it } from "vitest";
+import {
+  ENTITY_NAMES,
+  CHANGE_OPS,
+  type ChangeFrame,
+  type ResyncFrame,
+  type SyncFrame,
+  type EntityName,
+  type ChangeOp,
+} from "../src/index";
+
+// The SDK vendors the change-feed wire contract (src/types.ts) instead of depending on the internal
+// @catalyst-cloud/types workspace package. This test pins the LITERAL members + frame shapes so the
+// vendored copy can be diffed against the documented contract and any drift from the monorepo is
+// caught at SDK CI time (we can't import the internal package to compare against it directly).
+
+describe("wire contract", () => {
+  it("EntityName covers exactly the 15 canonical mirror tables, in order", () => {
+    // Byte-for-byte the @catalyst-cloud/types EntityName union (packages/types/src/index.ts 69-84).
+    expect([...ENTITY_NAMES]).toEqual([
+      "issues",
+      "labels",
+      "users",
+      "issue_labels",
+      "relations",
+      "issue_history",
+      "projects",
+      "cycles",
+      "initiatives",
+      "project_initiatives",
+      "comments",
+      "pull_requests",
+      "check_runs",
+      "commit_statuses",
+      "reviews",
+    ]);
+    expect(ENTITY_NAMES).toHaveLength(15);
+    // No duplicates (the union has none).
+    expect(new Set(ENTITY_NAMES).size).toBe(ENTITY_NAMES.length);
+  });
+
+  it("ChangeOp is exactly { upsert, delete }", () => {
+    expect([...CHANGE_OPS]).toEqual(["upsert", "delete"]);
+  });
+
+  it("ENTITY_NAMES values are assignable to the EntityName type (lockstep)", () => {
+    // A pure type-level assertion: if the runtime array and the type diverge, this stops compiling.
+    const sample: EntityName = ENTITY_NAMES[0];
+    expect(sample).toBe("issues");
+    const op: ChangeOp = CHANGE_OPS[0];
+    expect(op).toBe("upsert");
+  });
+
+  it("ChangeFrame has the documented shape (type/accountId/seq/entity/entityId/op/row?)", () => {
+    const frame: ChangeFrame = {
+      type: "change",
+      accountId: "tenant-0",
+      seq: 42,
+      entity: "issues",
+      entityId: "i1",
+      op: "upsert",
+      row: { id: "i1", title: "X", updated_at: 1 },
+    };
+    expect(frame.type).toBe("change");
+    expect(Object.keys(frame).sort()).toEqual(
+      ["accountId", "entity", "entityId", "op", "row", "seq", "type"].sort(),
+    );
+    // row is optional (delete frames omit it).
+    const del: ChangeFrame = {
+      type: "change",
+      accountId: "tenant-0",
+      seq: 43,
+      entity: "issues",
+      entityId: "i1",
+      op: "delete",
+    };
+    expect(del.row).toBeUndefined();
+  });
+
+  it("ResyncFrame is {type:'resync', accountId?}", () => {
+    const frame: ResyncFrame = { type: "resync", accountId: "tenant-0" };
+    expect(frame.type).toBe("resync");
+    const bare: ResyncFrame = { type: "resync" };
+    expect(bare.accountId).toBeUndefined();
+  });
+
+  it("SyncFrame is {type:'sync', after:number}", () => {
+    const frame: SyncFrame = { type: "sync", after: 7 };
+    expect(frame).toEqual({ type: "sync", after: 7 });
+  });
+});
