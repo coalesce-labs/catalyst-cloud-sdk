@@ -26,7 +26,7 @@
 // platform and a re-implemented heartbeat would re-pin the hibernating DO (ADR-0009), defeating the
 // whole point of moving off SSE.
 
-import type { ChangeFrame, ResyncFrame, ServerFrame, SyncFrame } from "./types";
+import type { ChangeFrame, ResyncFrame, ServerFrame, SyncFrame } from "./types.js";
 
 /**
  * The minimal WHATWG-WebSocket surface LiveSyncClient drives. Declared structurally (not via a DOM /

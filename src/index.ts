@@ -17,7 +17,7 @@ export {
   type LogLevel,
   type WebSocketLike,
   type WebSocketFactory,
-} from "./live-sync-client";
+} from "./live-sync-client.js";
 
 export {
   ENTITY_NAMES,
@@ -29,4 +29,4 @@ export {
   type ResyncFrame,
   type SyncFrame,
   type ServerFrame,
-} from "./types";
+} from "./types.js";
