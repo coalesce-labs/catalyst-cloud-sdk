@@ -1,0 +1,50 @@
+name: Publish
+
+# Publishes @catalyst-cloud/sdk to the public npm registry when a GitHub Release is published.
+# Flow: bump "version" in package.json + commit → cut a Release tagged vX.Y.Z → this workflow
+# builds, tests, and `npm publish`es that version. npm rejects re-publishing an existing version,
+# so each release must carry a fresh version. Requires an NPM_TOKEN repo secret (an npm "Automation"
+# token for the @catalyst-cloud org). Provenance is attached (id-token) for a verifiable supply chain.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: # manual re-run (still gated on the version being unpublished)
+
+permissions:
+  contents: read
+  id-token: write # npm provenance
+
+jobs:
+  publish:
+    name: build · test · publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # setup-node wires the npm registry + NODE_AUTH_TOKEN auth for `npm publish`.
+      - name: Set up Node (npm auth)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build (tsc → dist/)
+        run: bun run build
+
+      - name: Test
+        run: bunx vitest run
+
+      - name: Publish to npm (public, with provenance)
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
