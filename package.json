@@ -1,7 +1,7 @@
 {
   "name": "@catalyst-cloud/sdk",
-  "version": "0.1.0",
-  "description": "Isomorphic (browser + node/bun) read-layer-over-WebSocket client for the catalyst-cloud change-feed (ADR-0008/0009).",
+  "version": "0.1.1",
+  "description": "Keep a live local copy of your Linear and GitHub project data — pushed in real time, without polling rate limits or webhook tunnels.",
   "license": "MIT",
   "author": "Coalesce Labs",
   "homepage": "https://github.com/coalesce-labs/catalyst-cloud-sdk#readme",

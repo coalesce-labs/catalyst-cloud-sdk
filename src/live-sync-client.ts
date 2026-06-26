@@ -1,15 +1,14 @@
-// @catalyst-cloud/sdk — LiveSyncClient: the isomorphic read-layer-over-WebSocket client.
+// @catalyst-cloud/sdk — LiveSyncClient: the live-sync client.
 //
-// The push transport for the catalyst-cloud change-feed (ADR-0008/0009). It opens an OUTBOUND
-// WebSocket to a tenant's Mirror Durable Object (`{baseUrl}{connectPath}`) and lets the DO push each
-// change_log delta the instant it lands. On every (re)connect it sends `{type:"sync", after:<cursor>}`
-// so the DO replays — in seq order — everything the consumer missed; a `{type:"resync"}` frame
-// (cursor underflow) triggers a full re-seed via the injected `reseed` callback. It reconnects with
-// capped exponential backoff and never throws out of the event loop.
+// The push transport for the catalyst-cloud change feed. It opens an OUTBOUND WebSocket to the
+// tenant's mirror (`{baseUrl}{connectPath}`) and lets the service push each change the instant it
+// lands. On every (re)connect it sends `{type:"sync", after:<cursor>}` so the service replays — in
+// seq order — everything the consumer missed; a `{type:"resync"}` frame (cursor underflow) triggers a
+// full re-seed via the injected `reseed` callback. It reconnects with capped exponential backoff and
+// never throws out of the event loop.
 //
-// This is the STANDALONE extraction of apps/host-sync/src/live-client.ts. It is deliberately
-// transport-only and storage-agnostic: it does NOT know about bun:sqlite, /snapshot, ADMIN_TOKEN, or
-// any host-only assumption. Those are INJECTED:
+// It is deliberately transport-only and storage-agnostic: it does NOT know about a specific storage
+// engine, snapshot endpoint, or auth token — any host-only assumption is INJECTED:
 //
 //   • auth      — {kind:"token", token} (host → ?token=) OR {kind:"cookie"} (browser → nothing; the
 //                 same-origin cookie rides the upgrade). A cookie-kind client can never leak a token.
@@ -23,8 +22,7 @@
 //                 node-only import like 'ws'.
 //
 // There is intentionally NO setInterval keepalive: the WHATWG WebSocket ping/pong is handled by the
-// platform and a re-implemented heartbeat would re-pin the hibernating DO (ADR-0009), defeating the
-// whole point of moving off SSE.
+// platform, and a re-implemented heartbeat would keep the connection needlessly active.
 
 import type { ChangeFrame, ResyncFrame, ServerFrame, SyncFrame } from "./types.js";
 
@@ -48,10 +46,10 @@ export type WebSocketFactory = (url: string) => WebSocketLike;
 /**
  * How the consumer proves it may open `/connect`.
  *
- *  • `token`  — a SERVICE bearer (e.g. the host's ADMIN_TOKEN). The WHATWG WebSocket constructor
- *    cannot set an Authorization header, so the token rides the URL as `?token=`. The Worker
- *    constant-time compares it against the configured secret and STRIPS it before forwarding to the
- *    DO. Use this ONLY on a trusted backend (the host daemon) — never the browser.
+ *  • `token`  — a service bearer token. The WHATWG WebSocket constructor
+ *    cannot set an Authorization header, so the token rides the URL as `?token=`. The service
+ *    constant-time compares it and STRIPS it before forwarding internally. Use this ONLY on a
+ *    trusted backend — never the browser.
  *  • `cookie` — append NOTHING to the URL. The browser's same-origin session cookie rides the
  *    WebSocket upgrade automatically. This makes it impossible to leak a token from the browser path.
  */
@@ -66,21 +64,21 @@ export type LiveSyncStatus =
   | "error"
   | "stopped";
 
-/** Structured log levels (matches the host-sync logger contract). */
+/** Structured log levels. */
 export type LogLevel = "info" | "warn" | "error";
 
 /** Configuration for a {@link LiveSyncClient}. */
 export interface LiveSyncClientOptions {
   /**
-   * The Worker public origin, http(s), INCLUDING any versioned path prefix (e.g.
+   * The service's public origin, http(s), INCLUDING any versioned path prefix (e.g.
    * "https://api.example/api/v1"). The scheme is swapped to ws(s) and `connectPath` is appended
    * verbatim (path-preserving). A trailing slash is trimmed.
    */
   baseUrl: string;
-  /** The tenant id = the Mirror DO name; sent as `?account=` on the connect URL. */
+  /** The tenant id = the mirror's name; sent as `?account=` on the connect URL. */
   accountId: string;
   /**
-   * The connect route. Default "/connect"; the Worker dual-serves it at "/api/v1/connect" too, so a
+   * The connect route. Default "/connect"; the service dual-serves it at "/api/v1/connect" too, so a
    * path-prefixed `baseUrl` ("…/api/v1") with the default "/connect" resolves to "…/api/v1/connect".
    */
   connectPath?: string;
@@ -94,7 +92,7 @@ export interface LiveSyncClientOptions {
    */
   reseed: () => Promise<number>;
   /**
-   * Read the consumer's durable cursor (the last applied change_log.seq), or null/undefined if it has
+   * Read the consumer's durable cursor (the last applied feed seq), or null/undefined if it has
    * never seeded. Drives the `{type:"sync", after}` catch-up request. Return `null` to send
    * `after: -1` (replay from the start).
    */
@@ -312,7 +310,7 @@ export class LiveSyncClient {
     }, delay);
   }
 
-  /** Ask the DO to replay everything after our durable cursor. */
+  /** Ask the service to replay everything after our durable cursor. */
   private sendSync(): void {
     const after = this.getCursor() ?? -1;
     const frame: SyncFrame = { type: "sync", after };
@@ -343,7 +341,7 @@ export class LiveSyncClient {
   }
 
   /**
-   * Cursor underflow: the deltas we need were evicted from the DO's change_log ring. Close the socket
+   * Cursor underflow: the deltas we need were evicted from the service's retained change buffer. Close the socket
    * (so no live frame interleaves with the re-seed), re-seed via the injected callback, then reconnect
    * — which re-sends {type:"sync"} from the fresh cursor. `resyncing` guards against a second resync
    * frame and suppresses scheduleReconnect for the duration so we reopen exactly once.

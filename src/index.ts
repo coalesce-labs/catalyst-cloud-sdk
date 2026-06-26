@@ -1,8 +1,8 @@
 // @catalyst-cloud/sdk — public entrypoint.
 //
-// The isomorphic (browser + node/bun) read-layer-over-WebSocket client for the catalyst-cloud
-// change-feed (ADR-0008/0009). Open a WebSocket to a tenant's Mirror Durable Object, send a
-// cursor-replay request on every (re)connect, and apply each pushed change into your own store.
+// The live-sync client for the catalyst-cloud change feed (browser + node/bun). Open a WebSocket to a
+// tenant's mirror, send a cursor-replay request on every (re)connect, and apply each pushed change
+// into your own store.
 //
 // The class is storage-agnostic and auth-injected: see {@link LiveSyncClient}.
 
