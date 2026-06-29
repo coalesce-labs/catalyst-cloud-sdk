@@ -47,6 +47,7 @@ import {
 
 import {
   LiveSyncClient,
+  stripTrailingSlashes,
   type AuthStrategy,
   type LiveSyncStatus,
   type LogLevel,
@@ -167,7 +168,7 @@ export class CatalystReplica {
 
   constructor(opts: CatalystReplicaOptions) {
     this.opts = opts;
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = stripTrailingSlashes(opts.baseUrl);
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.log =
       opts.log ??

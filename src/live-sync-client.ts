@@ -138,13 +138,20 @@ export function toWsOrigin(baseUrl: string): string {
  * is ever appended (the type system + this single construction point make a browser token leak
  * impossible). Token is ordered FIRST so a truncated log line still reveals the account.
  */
+/** Strip trailing "/" without a backtracking regex (ReDoS-safe vs `/\/+$/`, CodeQL js/polynomial-redos). */
+export function stripTrailingSlashes(s: string): string {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 47 /* "/" */) end--;
+  return end === s.length ? s : s.slice(0, end);
+}
+
 export function buildConnectUrl(opts: {
   baseUrl: string;
   connectPath: string;
   accountId: string;
   auth: AuthStrategy;
 }): string {
-  const origin = toWsOrigin(opts.baseUrl.replace(/\/+$/, ""));
+  const origin = toWsOrigin(stripTrailingSlashes(opts.baseUrl));
   const params = new URLSearchParams();
   if (opts.auth.kind === "token") params.set("token", opts.auth.token);
   params.set("account", opts.accountId);
@@ -174,7 +181,7 @@ export class LiveSyncClient {
   private resolveDone: (() => void) | null = null;
 
   constructor(opts: LiveSyncClientOptions) {
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = stripTrailingSlashes(opts.baseUrl);
     this.accountId = opts.accountId;
     this.connectPath = opts.connectPath ?? "/connect";
     this.auth = opts.auth;
