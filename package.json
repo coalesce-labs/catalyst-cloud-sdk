@@ -24,6 +24,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js",
+      "default": "./dist/node.js"
     }
   },
   "files": [
@@ -51,5 +56,22 @@
   "devDependencies": {
     "typescript": "^5.6.3",
     "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "@catalyst-cloud/read-model": "^0.1.0",
+    "@catalyst-cloud/replicate": "^0.1.0",
+    "@catalyst-cloud/schema": "^0.1.0"
+  },
+  "peerDependencies": {
+    "better-sqlite3": "*",
+    "@sqlite.org/sqlite-wasm": "*"
+  },
+  "peerDependenciesMeta": {
+    "better-sqlite3": {
+      "optional": true
+    },
+    "@sqlite.org/sqlite-wasm": {
+      "optional": true
+    }
   }
 }
