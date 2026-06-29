@@ -16,6 +16,13 @@ import {
 
 const BASE = "https://api.example.test";
 
+// `process` isn't typed here (tsconfig `types: []`, no @types/node) — reach it via globalThis, the
+// same way the SDK source does. PID = this process; PPID = the parent, which is alive for the whole
+// test run and always distinct from PID (so it stands in for a different, live writer).
+const { pid: PID, ppid: PPID } = (
+  globalThis as unknown as { process: { pid: number; ppid: number } }
+).process;
+
 const dirs: string[] = [];
 function tmpDbPath(): string {
   const dir = fs.mkdtempSync("catalyst-replica-guard-");
@@ -149,6 +156,45 @@ describe("claimWriterLock — the guard mechanism", () => {
   });
 });
 
+describe("claimWriterLock — ownerKey fast-reclaim (kill -9 + fast relaunch)", () => {
+  // A live lock the normal gate WOULD treat as held: an alive pid (the parent process is alive for the
+  // duration of the test, and is always distinct from our own pid) + a fresh heartbeat.
+  function writeLiveLock(lockPath: string, ownerKey?: string): void {
+    fs.writeFileSync(
+      lockPath,
+      JSON.stringify({ pid: PPID, owner: "predecessor", heartbeat: Date.now(), ownerKey }),
+    );
+  }
+
+  it("a relaunch with the SAME ownerKey but a different pid reclaims IMMEDIATELY (no throw)", () => {
+    const dbPath = tmpDbPath();
+    const lockPath = `${dbPath}.writer.lock`;
+    writeLiveLock(lockPath, "host-a-tenant-0"); // our own crashed predecessor (alive-looking lock)
+
+    const lock = claimWriterLock(dbPath, { ownerKey: "host-a-tenant-0" });
+    expect(lock).not.toBeNull();
+    // Reclaimed: the lock file is now ours (our pid, our ownerKey), bypassing the staleMs/pid gate.
+    const rec = JSON.parse(fs.readFileSync(lockPath, "utf8")) as { pid: number; ownerKey?: string };
+    expect(rec.pid).toBe(PID);
+    expect(rec.ownerKey).toBe("host-a-tenant-0");
+    lock!.release();
+  });
+
+  it("WITHOUT ownerKey, the SAME live lock still throws (the bug it fixes is real)", () => {
+    const dbPath = tmpDbPath();
+    writeLiveLock(`${dbPath}.writer.lock`); // no ownerKey → falls through to the normal held gate
+    expect(() => claimWriterLock(dbPath, {})).toThrow(/another writer owns this replica/);
+  });
+
+  it("a DIFFERENT ownerKey does NOT fast-reclaim — a live lock still throws", () => {
+    const dbPath = tmpDbPath();
+    writeLiveLock(`${dbPath}.writer.lock`, "host-OTHER-tenant-9");
+    expect(() => claimWriterLock(dbPath, { ownerKey: "host-a-tenant-0" })).toThrow(
+      /another writer owns this replica/,
+    );
+  });
+});
+
 describe("CatalystReplica writer guard — end to end", () => {
   it("rejects a second concurrent writer on the same file", async () => {
     const dbPath = tmpDbPath();
@@ -182,5 +228,28 @@ describe("CatalystReplica writer guard — end to end", () => {
     const w2 = newWriter(dbPath, { writerGuard: { disabled: true } });
     await startToLive(w2.replica, w2.sockets); // guard skipped → no throw
     expect(w2.replica.status).toBe("live");
+  });
+});
+
+describe("CatalystReplica startTimeoutMs — fail-fast on a wedged start", () => {
+  it("rejects within the timeout when start() never reaches 'live', then leaves no held lock / open socket", async () => {
+    const dbPath = tmpDbPath();
+    const w = newWriter(dbPath, { startTimeoutMs: 100 });
+    // Seed completes (empty snapshot) and the socket is constructed, but we NEVER fire it open, so the
+    // status is stuck at 'connecting' and never reaches 'live'.
+    await expect(w.replica.start()).rejects.toThrow(/did not reach 'live' within 100ms/);
+
+    // The timeout tore down the SAME way close() does: the writer-lock sidecar is released and the
+    // socket was closed — no held lock, no dangling open handle.
+    expect(fs.existsSync(`${dbPath}.writer.lock`)).toBe(false);
+    expect(w.sockets[0]?.closed ?? true).toBe(true);
+  });
+
+  it("a normal fast start with a generous startTimeoutMs still resolves to 'live' (timer cancelled)", async () => {
+    const dbPath = tmpDbPath();
+    const w = newWriter(dbPath, { startTimeoutMs: 30_000 });
+    await startToLive(w.replica, w.sockets); // reaches 'live' → the deadline timer is cleared
+    expect(w.replica.status).toBe("live");
+    expect(fs.existsSync(`${dbPath}.writer.lock`)).toBe(true); // still the live writer
   });
 });
