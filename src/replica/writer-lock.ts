@@ -32,6 +32,13 @@ export interface WriterGuardOptions {
   staleMs?: number;
   /** How often the owning writer rewrites its heartbeat. Default max(1000, staleMs/3). */
   heartbeatMs?: number;
+  /**
+   * A stable identity for THIS logical (singleton) writer — e.g. `<host>-<tenant>`. A relaunch whose
+   * ownerKey matches an existing lock with a DIFFERENT pid reclaims it IMMEDIATELY (its own crashed
+   * predecessor), bypassing the staleMs/pid-liveness gate. Only set this when you guarantee a single
+   * writer per ownerKey per dbPath; the default (unset) keeps full two-writer protection.
+   */
+  ownerKey?: string;
 }
 
 /** A claimed writer lock. `release()` stops the heartbeat and removes the file if still ours. Idempotent. */
@@ -48,6 +55,9 @@ interface LockRecord {
   owner: string;
   /** epoch-ms of the last heartbeat (the freshness signal). */
   heartbeat: number;
+  /** Optional stable identity of the logical writer (see {@link WriterGuardOptions.ownerKey}). A
+   *  relaunch with a matching ownerKey but a different pid reclaims its own crashed predecessor at once. */
+  ownerKey?: string;
 }
 
 type Logger = (level: LogLevel, msg: string, extra?: unknown) => void;
@@ -97,7 +107,7 @@ export function claimWriterLock(
   const pid = (globalThis as { process?: { pid?: number } }).process?.pid ?? 0;
   const owner = `${pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   const serialize = (): string =>
-    JSON.stringify({ pid, owner, heartbeat: Date.now() } satisfies LockRecord);
+    JSON.stringify({ pid, owner, heartbeat: Date.now(), ownerKey: opts.ownerKey } satisfies LockRecord);
   const writeFresh = (): void => fs.writeFileSync(lockPath, serialize());
 
   // Atomic exclusive create: wins the claim outright if no file exists.
@@ -113,25 +123,37 @@ export function claimWriterLock(
 
   if (!created) {
     const existing = readLock(lockPath);
-    const held =
-      existing != null && Date.now() - existing.heartbeat < staleMs && pidAlive(existing.pid);
-    if (held && !opts.override) {
-      throw new Error(
-        `CatalystReplica: another writer owns this replica at ${dbPath} ` +
-          `(pid=${existing!.pid}, last heartbeat ${Date.now() - existing!.heartbeat}ms ago). ` +
-          `Only ONE writer may hold a replica file (ADR-0008 single-writer/many-reader); open it ` +
-          `read-only with CatalystReplica.openReadOnly() instead. Pass writerGuard:{override:true} ` +
-          `to take it over, or writerGuard:{disabled:true} to skip the check. NOTE: this guard is ` +
-          `advisory (a sidecar ${lockPath}), not a hard OS lock.`,
+    // FAST-RECLAIM: a relaunch of THIS logical writer (same ownerKey) but a DIFFERENT pid is our own
+    // crashed predecessor — reclaim it IMMEDIATELY, bypassing the staleMs/pid-liveness gate. This
+    // dodges the kill -9 + fast-relaunch window where a zombie/pid-reuse makes pidAlive() spuriously
+    // true and would otherwise block the relaunched writer for the full staleMs window.
+    if (opts.ownerKey != null && existing?.ownerKey === opts.ownerKey && existing.pid !== pid) {
+      log?.(
+        "info",
+        `writer-lock: reclaiming own crashed predecessor (ownerKey match) at ${lockPath}`,
       );
+      writeFresh();
+    } else {
+      const held =
+        existing != null && Date.now() - existing.heartbeat < staleMs && pidAlive(existing.pid);
+      if (held && !opts.override) {
+        throw new Error(
+          `CatalystReplica: another writer owns this replica at ${dbPath} ` +
+            `(pid=${existing!.pid}, last heartbeat ${Date.now() - existing!.heartbeat}ms ago). ` +
+            `Only ONE writer may hold a replica file (ADR-0008 single-writer/many-reader); open it ` +
+            `read-only with CatalystReplica.openReadOnly() instead. Pass writerGuard:{override:true} ` +
+            `to take it over, or writerGuard:{disabled:true} to skip the check. NOTE: this guard is ` +
+            `advisory (a sidecar ${lockPath}), not a hard OS lock.`,
+        );
+      }
+      log?.(
+        "warn",
+        held
+          ? `writer-lock: overriding a live writer at ${lockPath} (writerGuard.override)`
+          : `writer-lock: reclaiming a stale/abandoned lock at ${lockPath}`,
+      );
+      writeFresh();
     }
-    log?.(
-      "warn",
-      held
-        ? `writer-lock: overriding a live writer at ${lockPath} (writerGuard.override)`
-        : `writer-lock: reclaiming a stale/abandoned lock at ${lockPath}`,
-    );
-    writeFresh();
   }
 
   // Keep the lock fresh so peers see it's alive; unref so it never holds the event loop open.

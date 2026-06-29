@@ -112,6 +112,12 @@ export interface CatalystReplicaOptions {
    * `:memory:`. Default: enabled. Set `{ disabled: true }` to skip, `{ override: true }` to steal.
    */
   writerGuard?: WriterGuardOptions;
+  /**
+   * If set, `start()` rejects with a clear error if it doesn't reach `live` within this many ms (e.g.
+   * a wedged cold /snapshot), AFTER cleaning up — so a supervisor can fail-fast/restart instead of
+   * hanging. Off by default.
+   */
+  startTimeoutMs?: number;
 }
 
 /**
@@ -265,7 +271,7 @@ export class CatalystReplica {
       log: this.log,
     });
 
-    return new Promise<void>((resolve, reject) => {
+    const livePromise = new Promise<void>((resolve, reject) => {
       this.liveResolve = resolve;
       this.liveReject = reject;
       // The transport's start() resolves only on stop() ("runs forever"); we fork on first 'live'.
@@ -275,6 +281,46 @@ export class CatalystReplica {
         this.clearLiveDeferred();
         rej?.(err);
       });
+    });
+
+    const timeoutMs = this.opts.startTimeoutMs;
+    if (timeoutMs == null) return livePromise;
+
+    // Race the start sequence (seed + connect-to-live) against a deadline. On timeout, tear down the
+    // SAME way close() does (stop the socket, release the writer lock, close the engine) so nothing
+    // leaks, then reject — a supervisor fails fast instead of hanging on a wedged /snapshot. Reaching
+    // 'live' first cancels the (unref'd) timer, so there's no late rejection and the timer never holds
+    // the event loop open on its own.
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        void this.close().finally(() => {
+          reject(
+            new Error(
+              `CatalystReplica.start() did not reach 'live' within ${timeoutMs}ms ` +
+                `(account=${this.opts.account}, dbPath=${this.opts.dbPath})`,
+            ),
+          );
+        });
+      }, timeoutMs);
+      (timer as unknown as { unref?: () => void }).unref?.();
+
+      livePromise.then(
+        () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve();
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
     });
   }
 
