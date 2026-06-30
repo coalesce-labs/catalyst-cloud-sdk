@@ -25,6 +25,16 @@
 // platform, and a re-implemented heartbeat would keep the connection needlessly active.
 
 import type { ChangeFrame, ResyncFrame, ServerFrame, SyncFrame } from "./types.js";
+import {
+  NOOP_TELEMETRY,
+  createTelemetry,
+  CATALYST_ATTR,
+  REPLICA_SPAN,
+  DEFAULT_SCOPE_NAME,
+  type Telemetry,
+  type TelemetryConfig,
+  type ManualSpan,
+} from "./otel.js";
 
 /**
  * The minimal WHATWG-WebSocket surface LiveSyncClient drives. Declared structurally (not via a DOM /
@@ -115,6 +125,16 @@ export interface LiveSyncClientOptions {
   wsFactory?: WebSocketFactory;
   /** Optional structured logger; defaults to console. */
   log?: (level: LogLevel, msg: string, extra?: unknown) => void;
+  /**
+   * Opt-in OpenTelemetry (CTC-138). `false`/absent = OFF (zero overhead, no `@opentelemetry/api`
+   * import attempted). `true` = ON with the default instrumentation scope; an object overrides the
+   * tracer/meter name. This transport emits the `catalyst.replica.reconnect` (per connect attempt) and
+   * `catalyst.replica.resync` spans; the replica layer adds the seed/apply spans + the metrics. When a
+   * {@link CatalystReplica} owns this client it injects its already-resolved {@link Telemetry} so both
+   * layers share ONE tracer/meter (and the seed span nests under the resync span). Spans route through
+   * the consumer's global TracerProvider when one is registered.
+   */
+  telemetry?: TelemetryConfig | Telemetry;
 }
 
 /** Resolve the runtime global WebSocket, or fail with an actionable message. */
@@ -172,6 +192,7 @@ export class LiveSyncClient {
   private readonly maxBackoffMs: number;
   private readonly wsFactory: WebSocketFactory;
   private readonly log: NonNullable<LiveSyncClientOptions["log"]>;
+  private readonly telemetryConfig: TelemetryConfig | Telemetry | undefined;
 
   private ws: WebSocketLike | null = null;
   private stopped = false;
@@ -179,6 +200,10 @@ export class LiveSyncClient {
   private backoff: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private resolveDone: (() => void) | null = null;
+  /** Resolved once in start(); the no-op until then so any early call is safe. */
+  private telemetry: Telemetry = NOOP_TELEMETRY;
+  /** The in-flight connect-attempt span (ended OK on open, ERROR on construct-fail / close-before-open). */
+  private connectSpan: ManualSpan | null = null;
 
   constructor(opts: LiveSyncClientOptions) {
     this.baseUrl = stripTrailingSlashes(opts.baseUrl);
@@ -197,6 +222,7 @@ export class LiveSyncClient {
       opts.log ??
       ((lvl, msg, extra) =>
         console[lvl === "error" ? "error" : "log"](`[catalyst-sdk:live] ${msg}`, extra ?? ""));
+    this.telemetryConfig = opts.telemetry;
     this.backoff = this.backoffMs;
   }
 
@@ -208,6 +234,17 @@ export class LiveSyncClient {
    */
   async start(): Promise<void> {
     this.stopped = false;
+    // Resolve the OTel seam ONCE up front (before the first reseed, so the seed span exists on the
+    // cold-start path too). Keep the OFF path FULLY SYNCHRONOUS — no `await`, so a caller that opens
+    // the socket and inspects it in the same tick still sees it; only pay the async resolution (guarded
+    // dynamic import, or a CatalystReplica passing its already-resolved instance) when telemetry is on.
+    this.telemetry =
+      this.telemetryConfig === undefined || this.telemetryConfig === false
+        ? NOOP_TELEMETRY
+        : await createTelemetry(this.telemetryConfig, {
+            tracerName: DEFAULT_SCOPE_NAME,
+            meterName: DEFAULT_SCOPE_NAME,
+          });
     const saved = this.getCursor();
     if (saved == null) {
       this.setStatus("resyncing");
@@ -254,6 +291,11 @@ export class LiveSyncClient {
   private openSocket(): void {
     if (this.stopped) return;
     this.setStatus("connecting");
+    // One span per connect attempt: started here, ended OK in onopen, ERROR on construct-fail / a close
+    // before open. Manual (not active) because the lifecycle spans onopen…onclose callbacks.
+    this.connectSpan = this.telemetry.startSpan(REPLICA_SPAN.reconnect, {
+      [CATALYST_ATTR.tenant]: this.accountId,
+    });
     const wsUrl = this.connectUrl();
     let ws: WebSocketLike;
     try {
@@ -261,6 +303,7 @@ export class LiveSyncClient {
     } catch (err) {
       this.log("error", "ws construction failed; scheduling reconnect", err);
       this.setStatus("error");
+      this.endConnectSpan(err);
       this.scheduleReconnect();
       return;
     }
@@ -268,6 +311,7 @@ export class LiveSyncClient {
     ws.onopen = () => {
       this.backoff = this.backoffMs; // a successful open resets the backoff ramp
       this.setStatus("live");
+      this.endConnectSpan();
       this.sendSync();
     };
     ws.onmessage = (ev) => {
@@ -276,6 +320,8 @@ export class LiveSyncClient {
     ws.onclose = () => {
       if (this.ws === ws) this.ws = null;
       if (!this.stopped && !this.resyncing) this.setStatus("reconnecting");
+      // No-op if onopen already ended it (a normal disconnect of a healthy socket isn't a connect error).
+      this.endConnectSpan(new Error("socket closed before open"));
       this.scheduleReconnect();
     };
     ws.onerror = (err) => {
@@ -291,8 +337,18 @@ export class LiveSyncClient {
     };
   }
 
+  /** End the in-flight connect span exactly once (idempotent — nulls the handle). */
+  private endConnectSpan(error?: unknown): void {
+    const span = this.connectSpan;
+    if (!span) return;
+    this.connectSpan = null;
+    span.end(error);
+  }
+
   /** Detach handlers BEFORE closing so a programmatic close can't re-enter scheduleReconnect. */
   private closeSocket(): void {
+    // A deliberate teardown of an in-flight attempt (stop/resync): end the connect span neutrally.
+    this.endConnectSpan();
     const ws = this.ws;
     this.ws = null;
     if (!ws) return;
@@ -359,8 +415,16 @@ export class LiveSyncClient {
     this.setStatus("resyncing");
     this.closeSocket();
     try {
-      const cursor = await this.reseed();
-      this.log("info", `resynced, cursor=${cursor}`);
+      // The reseed runs inside an ACTIVE span so the replica's seed span (the injected reseed IS
+      // seedFromSnapshot) auto-parents under this resync span.
+      await this.telemetry.withActiveSpan(
+        REPLICA_SPAN.resync,
+        { [CATALYST_ATTR.tenant]: this.accountId },
+        async () => {
+          const cursor = await this.reseed();
+          this.log("info", `resynced, cursor=${cursor}`);
+        },
+      );
     } catch (err) {
       this.log("error", "resync reseed failed; will retry on reconnect", err);
     } finally {
