@@ -55,6 +55,18 @@ export {
   type ChangeFrame,
 } from "./types.js";
 
+// The opt-in OpenTelemetry contract (CTC-138) — see CatalystReplicaOptions.telemetry. Exports the
+// `telemetry` option type + the instrumentation scope / metric / span / attribute NAMES so a consumer
+// can type the option and build dashboards/alerts against the exact stream names.
+export {
+  DEFAULT_SCOPE_NAME,
+  CATALYST_ATTR,
+  REPLICA_METRIC,
+  REPLICA_SPAN,
+  REPLICA_STATUS_CODE,
+  type TelemetryConfig,
+} from "./otel.js";
+
 // Re-export the read-model view types so a consumer typing the read results needs only this import.
 export type {
   SqlExecutor,

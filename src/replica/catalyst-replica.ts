@@ -65,6 +65,21 @@ import {
   type WriterGuardOptions,
   type WriterLockHandle,
 } from "./writer-lock.js";
+import {
+  NOOP_TELEMETRY,
+  createTelemetry,
+  CATALYST_ATTR,
+  REPLICA_METRIC,
+  REPLICA_SPAN,
+  REPLICA_STATUS_CODE,
+  DEFAULT_SCOPE_NAME,
+  entitySource,
+  type Telemetry,
+  type TelemetryConfig,
+  type Counter,
+  type Histogram,
+  type GaugeRegistration,
+} from "../otel.js";
 
 /** Host-sync bookkeeping table (NOT part of the DO mirror schema, so not in MIRROR_MIGRATIONS): the
  *  change-feed cursor, so a restart resumes from the live `{type:"sync", after}` replay (or /changes)
@@ -118,6 +133,22 @@ export interface CatalystReplicaOptions {
    * hanging. Off by default.
    */
   startTimeoutMs?: number;
+  /**
+   * Opt-in OpenTelemetry (CTC-138). `false`/absent = OFF (strictly zero overhead; no
+   * `@opentelemetry/api` import is even attempted). `true` = ON with the default `@catalyst-cloud/sdk`
+   * instrumentation scope; an object overrides the tracer/meter name. When ON the replica emits:
+   *   • SPANS  — `catalyst.replica.seed` (snapshot pull+apply), `catalyst.replica.apply_batch` (per
+   *     seed batch), plus the transport's `catalyst.replica.resync` + `catalyst.replica.reconnect`.
+   *   • METRICS — observable gauges `catalyst.replica.cursor`, `catalyst.replica.lag_seq` (only when
+   *     the mirror head_seq is known from the `x-catalyst-head-seq` /snapshot response header),
+   *     `catalyst.replica.freshness_ms`, `catalyst.replica.status`; a `catalyst.replica.applied`
+   *     counter (per live frame) and a `catalyst.replica.apply_batch_rows` histogram.
+   * All carry `catalyst.tenant` (+ `catalyst.source` where a single entity is involved). `@opentelemetry/api`
+   * is an OPTIONAL peer dep: enabling this without it installed logs once and runs no-op (never throws).
+   * Spans/metrics route through the consumer's GLOBAL TracerProvider/MeterProvider so their Resource
+   * (service.name) flows through.
+   */
+  telemetry?: TelemetryConfig;
 }
 
 /**
@@ -171,6 +202,21 @@ export class CatalystReplica {
    *  an initial seed failure. */
   private liveResolve: (() => void) | null = null;
   private liveReject: ((err: unknown) => void) | null = null;
+
+  // ── OpenTelemetry (CTC-138, opt-in via opts.telemetry) ──────────────────────────────────────────
+  /** Resolved once in start(); the no-op until then so any early metric/span call is safe. */
+  private telemetry: Telemetry = NOOP_TELEMETRY;
+  /** Observable-gauge unregister handles, torn down in close() so a closed replica stops being scraped. */
+  private metricRegs: GaugeRegistration[] = [];
+  /** Per-live-frame applied counter + per-seed-batch row histogram (no-op until telemetry is wired). */
+  private appliedCounter: Counter = NOOP_TELEMETRY.counter(REPLICA_METRIC.applied);
+  private applyBatchHistogram: Histogram = NOOP_TELEMETRY.histogram(REPLICA_METRIC.applyBatchRows);
+  /** Last mirror head_seq + server clock observed from the `x-catalyst-head-seq` /snapshot headers
+   *  (CTC-137), or null until seen. Drives the `lag_seq` gauge (emitted ONLY when non-null). */
+  private lastHeadSeq: number | null = null;
+  private lastServerTimeMs: number | null = null;
+  /** Wall-clock ms of the last applied delta (live frame or seed), or null. Drives `freshness_ms`. */
+  private lastAppliedAtMs: number | null = null;
 
   constructor(opts: CatalystReplicaOptions) {
     this.opts = opts;
@@ -256,6 +302,16 @@ export class CatalystReplica {
 
     this.highWater = getCursor(this.writeDb) ?? 0;
 
+    // Resolve the OTel seam ONCE (guarded dynamic import; no-op when off / api absent) BEFORE wiring
+    // the transport, then cache the tracer/meter-backed instruments on the instance so the synchronous
+    // applyFrame/flush hot paths never go async, and SHARE the resolved instance with the transport so
+    // the seed span nests under the resync span and both layers use one tracer/meter.
+    this.telemetry = await createTelemetry(this.opts.telemetry, {
+      tracerName: DEFAULT_SCOPE_NAME,
+      meterName: DEFAULT_SCOPE_NAME,
+    });
+    this.registerMetrics();
+
     this.client = new LiveSyncClient({
       baseUrl: this.baseUrl,
       accountId: this.opts.account,
@@ -269,6 +325,7 @@ export class CatalystReplica {
       maxBackoffMs: this.opts.maxBackoffMs,
       wsFactory: this.opts.wsFactory,
       log: this.log,
+      telemetry: this.telemetry,
     });
 
     const livePromise = new Promise<void>((resolve, reject) => {
@@ -339,6 +396,15 @@ export class CatalystReplica {
       this.log("warn", "writer-lock release threw", err);
     }
     this.writerLock = null;
+    // Unregister the observable-gauge callbacks so a closed replica stops being scraped + can be GC'd.
+    for (const reg of this.metricRegs) {
+      try {
+        reg.remove();
+      } catch (err) {
+        this.log("warn", "metric unregister threw", err);
+      }
+    }
+    this.metricRegs = [];
     try {
       this.engine?.close();
     } catch (err) {
@@ -389,6 +455,24 @@ export class CatalystReplica {
   /** The raw driver Database the SDK owns — for `drizzle(replica.handle, { schema: mirrorSchema })`. */
   get handle(): unknown {
     return (this.engine as Partial<{ handle: unknown }> | null)?.handle;
+  }
+
+  /** Ms since the last applied delta (live frame or seed), or null before the first apply. The basis
+   *  of the `catalyst.replica.freshness_ms` gauge — "how stale is the local copy right now". */
+  get freshnessMs(): number | null {
+    return this.lastAppliedAtMs == null ? null : Date.now() - this.lastAppliedAtMs;
+  }
+
+  /** The last mirror head_seq read from the `x-catalyst-head-seq` /snapshot response header (CTC-137),
+   *  or null if the header has never been observed. `headSeq − cursor` is the replica's lag in seqs. */
+  get headSeq(): number | null {
+    return this.lastHeadSeq;
+  }
+
+  /** The mirror server clock (ms) read from the `x-catalyst-server-time-ms` /snapshot response header
+   *  (CTC-137), or null if never observed — for a consumer that wants to estimate clock skew. */
+  get serverTimeMs(): number | null {
+    return this.lastServerTimeMs;
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────────────────────────
@@ -454,6 +538,58 @@ export class CatalystReplica {
     this.liveReject = null;
   }
 
+  /**
+   * Register the four `catalyst.replica.*` observable gauges (whose async callbacks read live instance
+   * state) + create the per-frame counter and per-batch histogram. A no-op telemetry returns no-op
+   * instruments + empty registrations, so this is safe (and free) when telemetry is OFF. Idempotent
+   * per start(); the registrations are torn down in close().
+   */
+  private registerMetrics(): void {
+    if (!this.telemetry.enabled) return; // skip the gauge churn entirely on the no-op path
+    const tenant = (): Record<string, string> => ({ [CATALYST_ATTR.tenant]: this.opts.account });
+
+    this.metricRegs.push(
+      this.telemetry.observableGauge(
+        REPLICA_METRIC.cursor,
+        { description: "Durable change-feed cursor (last applied seq).", unit: "{seq}" },
+        (result) => result.observe(this.highWater, tenant()),
+      ),
+      // lag_seq is emitted ONLY when the mirror head_seq is known (CTC-137 header observed at seed).
+      this.telemetry.observableGauge(
+        REPLICA_METRIC.lagSeq,
+        { description: "Mirror lag in seqs (head_seq − cursor); only when head_seq is known.", unit: "{seq}" },
+        (result) => {
+          if (this.lastHeadSeq != null) result.observe(this.lastHeadSeq - this.highWater, tenant());
+        },
+      ),
+      this.telemetry.observableGauge(
+        REPLICA_METRIC.freshnessMs,
+        { description: "Ms since the last applied delta (live frame or seed).", unit: "ms" },
+        (result) => {
+          if (this.lastAppliedAtMs != null) result.observe(Date.now() - this.lastAppliedAtMs, tenant());
+        },
+      ),
+      this.telemetry.observableGauge(
+        REPLICA_METRIC.status,
+        { description: "Connection lifecycle status as a numeric code (see REPLICA_STATUS_CODE)." },
+        (result) =>
+          result.observe(REPLICA_STATUS_CODE[this._status], {
+            [CATALYST_ATTR.tenant]: this.opts.account,
+            [CATALYST_ATTR.status]: this._status,
+          }),
+      ),
+    );
+
+    this.appliedCounter = this.telemetry.counter(REPLICA_METRIC.applied, {
+      description: "Live change frames applied to the replica.",
+      unit: "{frame}",
+    });
+    this.applyBatchHistogram = this.telemetry.histogram(REPLICA_METRIC.applyBatchRows, {
+      description: "Rows applied per seed batch transaction.",
+      unit: "{row}",
+    });
+  }
+
   /** Land one delta + advance the durable cursor atomically (a crash can't skip a seq), then signal. */
   private applyFrame(frame: ChangeFrame): void {
     const engine = this.engine;
@@ -471,6 +607,13 @@ export class CatalystReplica {
         if (frame.seq > this.highWater) setCursor(writeDb, frame.seq, engine.toBindable);
       });
       if (frame.seq > this.highWater) this.highWater = frame.seq;
+      // Freshness stamp + per-frame counter (no-op instruments when telemetry is off). The cursor +
+      // freshness_ms gauges read this.highWater / this.lastAppliedAtMs on the next scrape.
+      this.lastAppliedAtMs = Date.now();
+      this.appliedCounter.add(1, {
+        [CATALYST_ATTR.tenant]: this.opts.account,
+        [CATALYST_ATTR.source]: entitySource(frame.entity),
+      });
       try {
         this.opts.onChange?.();
       } catch (err) {
@@ -489,58 +632,101 @@ export class CatalystReplica {
    * atomic truncate+apply+setCursor safety without holding one giant transaction.
    */
   private async seedFromSnapshot(): Promise<number> {
-    const engine = this.engine as ReplicaEngine;
-    const writeDb = this.writeDb as ReplicaWriteDb<unknown>;
+    // The whole seed (fetch + truncate + batched apply + setCursor) runs inside ONE active span so it
+    // nests under the resync span when triggered by a {type:"resync"} frame, and stands alone on a cold
+    // start. Active so the per-batch apply spans auto-parent under it.
+    return this.telemetry.withActiveSpan(
+      REPLICA_SPAN.seed,
+      { [CATALYST_ATTR.tenant]: this.opts.account },
+      async (span) => {
+        const engine = this.engine as ReplicaEngine;
+        const writeDb = this.writeDb as ReplicaWriteDb<unknown>;
 
-    const url = `${this.baseUrl}/snapshot?account=${encodeURIComponent(this.opts.account)}`;
-    const res = await this.fetchImpl(url, { headers: this.feedHeaders() });
-    if (!res.ok) throw new Error(`/snapshot ${res.status}`);
+        const url = `${this.baseUrl}/snapshot?account=${encodeURIComponent(this.opts.account)}`;
+        const res = await this.fetchImpl(url, { headers: this.feedHeaders() });
+        if (!res.ok) throw new Error(`/snapshot ${res.status}`);
 
-    // Invalidate the cursor BEFORE truncating so a crash mid-seed re-seeds rather than going live over
-    // an empty replica from a stale cursor.
-    engine.run("DELETE FROM sync_meta WHERE key = 'cursor'");
-    engine.transaction(() => truncateReplica(writeDb));
+        // CTC-137: the /snapshot response is the SINGLE HTTP Response the SDK reads, so it is the one
+        // place to learn the mirror's head_seq (+ server clock). Stashed for the lag_seq gauge, which
+        // only emits while head_seq is known. Guarded: test fetch stand-ins return no `headers`.
+        this.readHeadSeqHeaders(res);
 
-    let cursor = 0;
-    let batch: SnapshotLine[] = [];
-    const flush = (): void => {
-      if (batch.length === 0) return;
-      const rows = batch;
-      batch = [];
-      engine.transaction(() => {
-        for (const rec of rows) {
-          if (rec.entity === undefined) continue;
-          applyDelta(
-            writeDb,
-            { entity: rec.entity, op: rec.op ?? "upsert", row: rec.row ?? {} },
-            engine.toBindable,
+        // Invalidate the cursor BEFORE truncating so a crash mid-seed re-seeds rather than going live over
+        // an empty replica from a stale cursor.
+        engine.run("DELETE FROM sync_meta WHERE key = 'cursor'");
+        engine.transaction(() => truncateReplica(writeDb));
+
+        let cursor = 0;
+        let batch: SnapshotLine[] = [];
+        const flush = (): void => {
+          if (batch.length === 0) return;
+          const rows = batch;
+          batch = [];
+          // The literal batched-apply seam: one transaction per ≤SEED_BATCH_ROWS rows → its own span.
+          this.telemetry.withActiveSpanSync(
+            REPLICA_SPAN.applyBatch,
+            { [CATALYST_ATTR.tenant]: this.opts.account, [CATALYST_ATTR.batchRows]: rows.length },
+            () => {
+              engine.transaction(() => {
+                for (const rec of rows) {
+                  if (rec.entity === undefined) continue;
+                  applyDelta(
+                    writeDb,
+                    { entity: rec.entity, op: rec.op ?? "upsert", row: rec.row ?? {} },
+                    engine.toBindable,
+                  );
+                }
+              });
+            },
           );
+          this.applyBatchHistogram.record(rows.length, { [CATALYST_ATTR.tenant]: this.opts.account });
+        };
+
+        let rowCount = 0;
+        for await (const line of iterateNdjson(res)) {
+          const rec = JSON.parse(line) as SnapshotLine;
+          if (typeof rec.cursor === "number") {
+            cursor = rec.cursor; // the FINAL line carries the cursor
+            continue;
+          }
+          batch.push(rec);
+          rowCount++;
+          if (batch.length >= SEED_BATCH_ROWS) flush();
         }
-      });
-    };
+        flush();
 
-    let rowCount = 0;
-    for await (const line of iterateNdjson(res)) {
-      const rec = JSON.parse(line) as SnapshotLine;
-      if (typeof rec.cursor === "number") {
-        cursor = rec.cursor; // the FINAL line carries the cursor
-        continue;
-      }
-      batch.push(rec);
-      rowCount++;
-      if (batch.length >= SEED_BATCH_ROWS) flush();
-    }
-    flush();
+        engine.transaction(() => setCursor(writeDb, cursor, engine.toBindable));
+        this.highWater = cursor;
+        this.lastAppliedAtMs = Date.now(); // a completed seed refreshes freshness_ms
+        span.setAttribute(CATALYST_ATTR.rowCount, rowCount);
+        span.setAttribute(CATALYST_ATTR.cursor, cursor);
+        this.log("info", `snapshot seeded (${rowCount} rows), cursor=${cursor}`);
+        try {
+          this.opts.onChange?.();
+        } catch (err) {
+          this.log("warn", "onChange handler threw", err);
+        }
+        return cursor;
+      },
+    );
+  }
 
-    engine.transaction(() => setCursor(writeDb, cursor, engine.toBindable));
-    this.highWater = cursor;
-    this.log("info", `snapshot seeded (${rowCount} rows), cursor=${cursor}`);
-    try {
-      this.opts.onChange?.();
-    } catch (err) {
-      this.log("warn", "onChange handler threw", err);
+  /** Read CTC-137's `x-catalyst-head-seq` (+ `x-catalyst-server-time-ms`) off the /snapshot response,
+   *  if present. Guarded so a header-less test fetch stand-in is a no-op. */
+  private readHeadSeqHeaders(res: Response): void {
+    const headers = (res as { headers?: { get?(name: string): string | null } }).headers;
+    const get = headers?.get;
+    if (typeof get !== "function") return;
+    const headSeq = get.call(headers, "x-catalyst-head-seq");
+    if (headSeq != null && headSeq !== "") {
+      const n = Number(headSeq);
+      if (Number.isFinite(n)) this.lastHeadSeq = n;
     }
-    return cursor;
+    const serverTime = get.call(headers, "x-catalyst-server-time-ms");
+    if (serverTime != null && serverTime !== "") {
+      const n = Number(serverTime);
+      if (Number.isFinite(n)) this.lastServerTimeMs = n;
+    }
   }
 
   private feedHeaders(): Record<string, string> {
