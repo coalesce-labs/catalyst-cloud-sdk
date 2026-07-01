@@ -62,8 +62,10 @@ export {
   DEFAULT_SCOPE_NAME,
   CATALYST_ATTR,
   REPLICA_METRIC,
+  REPLICA_LOG,
   REPLICA_SPAN,
   REPLICA_STATUS_CODE,
+  type ReplicaApplyResult,
   type TelemetryConfig,
 } from "./otel.js";
 
