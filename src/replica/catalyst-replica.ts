@@ -25,6 +25,7 @@ import {
   getCursor,
   setCursor,
   type ReplicaWriteDb,
+  type ApplyOptions,
 } from "@catalyst-cloud/replicate";
 import {
   buildIssuesView,
@@ -93,6 +94,24 @@ const SYNC_META_DDL = `CREATE TABLE IF NOT EXISTS sync_meta (
 /** Rows per streamed seed transaction — bounds memory + fsync so a large tenant never OOMs the node/bun
  *  process the way host-sync's buffered `await res.text()` + `split("\n")` snapshot would. */
 const SEED_BATCH_ROWS = 1000;
+
+/**
+ * CTC-127: does any of the migrations applied THIS boot change a table's ROW SHAPE — i.e. add a column
+ * (`ALTER TABLE … ADD …`) or a new entity table (`CREATE TABLE`)? If so, a WARM replica's existing rows
+ * were seeded/applied before that column existed and hold NULL for it, so `start()` forces one re-seed
+ * to backfill. A pure `CREATE INDEX` migration changes no row shape → no re-seed. Detected by
+ * string-matching the applied tags' SQL — drizzle-kit emits bare `ADD` and `CREATE TABLE` (the same
+ * vocabulary @catalyst-cloud/schema's migration runner trusts). Conservative-safe: a false positive is
+ * a harmless extra re-seed; there are no false negatives for real `ALTER TABLE ADD` / `CREATE TABLE`.
+ * Exported for direct unit testing of the predicate.
+ */
+export function migrationsChangeRowShape(appliedTags: readonly string[]): boolean {
+  const byTag = MIRROR_MIGRATIONS.migrations as Record<string, string | undefined>;
+  return appliedTags.some((tag) => {
+    const sql = byTag[tag] ?? "";
+    return /\bADD\b/i.test(sql) || /\bCREATE\s+TABLE\b/i.test(sql);
+  });
+}
 
 export interface CatalystReplicaOptions {
   /** http(s) origin incl. any path prefix (…/api/v1); the scheme is swapped to ws(s) for /connect. */
@@ -219,6 +238,15 @@ export class CatalystReplica {
   private lastServerTimeMs: number | null = null;
   /** Wall-clock ms of the last applied delta (live frame or seed), or null. Drives `freshness_ms`. */
   private lastAppliedAtMs: number | null = null;
+  /** CTC-127: `table.column` keys already warned about (a mirror-ahead column this client's schema
+   *  lacks), so the per-row drop signal warns ONCE, not per delta (a drifted seed would else spam). */
+  private readonly warnedDrift = new Set<string>();
+  /** CTC-127: hoisted apply options passed to every applyDelta — the forward-compat column filter is
+   *  automatic inside @catalyst-cloud/replicate; this only wires the warn-once drift signal. Hoisted so
+   *  the synchronous applyFrame/seed hot paths allocate no per-row options object. */
+  private readonly applyOpts: ApplyOptions = {
+    onDroppedColumns: (table, dropped) => this.reportDroppedColumns(table, dropped),
+  };
 
   constructor(opts: CatalystReplicaOptions) {
     this.opts = opts;
@@ -299,8 +327,26 @@ export class CatalystReplica {
       exec: (sql) => engine.exec(sql),
       query: (sql) => engine.all(sql),
     };
-    applyMigrations(migrationDb, MIRROR_MIGRATIONS);
+    const { appliedTags } = applyMigrations(migrationDb, MIRROR_MIGRATIONS);
     engine.exec(SYNC_META_DDL);
+
+    // CTC-127 auto-reseed: a migration that CHANGES ROW SHAPE (adds a column, or a new entity table)
+    // just ran on a WARM replica → existing rows lack the new column's values (they were seeded/applied
+    // before the column existed; the forward-compat filter dropped it). Force ONE full re-seed to
+    // backfill. Detected by string-matching the applied tags' SQL — drizzle-kit emits bare
+    // `ALTER TABLE … ADD <col>` and `CREATE TABLE` (the vocabulary the migration runner already trusts);
+    // a pure `CREATE INDEX` migration needs no re-seed. Deleting the cursor makes the LiveSyncClient's
+    // injected getCursor() return null when it starts → it stream-seeds /snapshot EXACTLY ONCE (the
+    // clean cold-seed path — NOT a direct seedFromSnapshot() call, which would double-seed once the
+    // transport also seeds). Guarded on cursorBefore != null so a COLD replica (no cursor yet) skips it
+    // — its normal cold seed already pulls a full snapshot, so re-seeding would be redundant.
+    const cursorBefore = getCursor(this.writeDb);
+    if (cursorBefore != null && migrationsChangeRowShape(appliedTags)) {
+      this.log("info", "schema migration changed row shape — forcing one-time re-seed to backfill", {
+        appliedTags,
+      });
+      engine.run("DELETE FROM sync_meta WHERE key = 'cursor'");
+    }
 
     this.highWater = getCursor(this.writeDb) ?? 0;
 
@@ -606,6 +652,7 @@ export class CatalystReplica {
           writeDb,
           { entity: frame.entity, op: frame.op, row: frame.row ?? {}, entityId: frame.entityId },
           engine.toBindable,
+          this.applyOpts, // CTC-127: forward-compat filter (auto) + warn-once drift signal.
         );
         // Advance to the seq we SAW (not just applied), so a stale-but-newer-seq delta still moves the
         // cursor forward and a reconnect doesn't re-request it.
@@ -642,6 +689,23 @@ export class CatalystReplica {
    * Cardinality: only `source` + `result` are counter labels (both low-card); `seq` / `entity` /
    * `err_message` ride the log line as VALUES, never labels.
    */
+  /**
+   * CTC-127: warn ONCE per (table, column) that the mirror is emitting a column this client's bundled
+   * schema lacks (so @catalyst-cloud/replicate's forward-compat filter dropped it). Fires per row, so
+   * the dedupe is required — a drifted seed would otherwise log-spam. The drop is non-fatal (the row
+   * still applies without that column); the auto-reseed above backfills once this client's schema
+   * catches up, and this warn tells an operator to bump the client.
+   */
+  private reportDroppedColumns(table: string, dropped: readonly string[]): void {
+    const fresh = dropped.filter((c) => !this.warnedDrift.has(`${table}.${c}`));
+    if (fresh.length === 0) return;
+    for (const c of fresh) this.warnedDrift.add(`${table}.${c}`);
+    this.log("warn", `mirror is ahead: dropping unknown column(s) on ${table} (bump this client)`, {
+      table,
+      dropped: fresh,
+    });
+  }
+
   private recordApplyResult(result: ReplicaApplyResult, frame: ChangeFrame, err?: unknown): void {
     const source = entitySource(frame.entity);
     this.appliedCounter.add(1, {
@@ -710,6 +774,7 @@ export class CatalystReplica {
                     writeDb,
                     { entity: rec.entity, op: rec.op ?? "upsert", row: rec.row ?? {} },
                     engine.toBindable,
+                    this.applyOpts, // CTC-127: forward-compat filter (auto) + warn-once drift signal.
                   );
                 }
               });
