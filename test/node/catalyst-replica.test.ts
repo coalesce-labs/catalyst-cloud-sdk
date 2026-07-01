@@ -12,6 +12,7 @@ import {
   type WebSocketLike,
   type WebSocketFactory,
 } from "../../src/node";
+import { migrationsChangeRowShape } from "../../src/replica/catalyst-replica";
 
 // End-to-end coverage of CatalystReplica — the managed node/bun replica (CTC-113). The transport is
 // driven by a FakeWebSocket and the snapshot feed by an injected fetch stand-in, so every path —
@@ -313,6 +314,69 @@ describe("CatalystReplica cold stream-seed", () => {
     expect(sockets[0]!.lastSent()).toEqual({ type: "sync", after: 7 });
     expect(replica.cursor).toBe(7);
     expect(replica.issues()[0]!.title).toBe("Persisted");
+  });
+});
+
+describe("CatalystReplica auto-reseed on a column-adding migration (CTC-127)", () => {
+  it("migrationsChangeRowShape: true for ADD / CREATE TABLE, false for index-only / none", () => {
+    expect(migrationsChangeRowShape(["0008_optimal_rattler"])).toBe(true); // ALTER … ADD state_id/…
+    expect(migrationsChangeRowShape(["0000_baseline"])).toBe(true); // CREATE TABLE
+    expect(migrationsChangeRowShape([])).toBe(false);
+    expect(migrationsChangeRowShape(["does_not_exist"])).toBe(false);
+    // A migration whose SQL is CREATE INDEX only (no column/table added) must NOT force a re-seed.
+    const indexOnly = Object.entries(MIRROR_MIGRATIONS.migrations).find(
+      ([, sql]) =>
+        /CREATE\s+INDEX/i.test(sql) && !/\bADD\b/i.test(sql) && !/\bCREATE\s+TABLE\b/i.test(sql),
+    )?.[0];
+    if (indexOnly) expect(migrationsChangeRowShape([indexOnly])).toBe(false);
+  });
+
+  it("a WARM replica behind by a column-adding migration re-seeds to backfill", async () => {
+    // Build a replica DB migrated ONLY through 0007 (missing 0008) with a cursor — exactly a client
+    // that predates the mirror's column add. On start(), applyMigrations applies 0008
+    // (state_id/team_key/team_name) → row shape changed on a WARM DB → cursor deleted → cold re-seed
+    // from /snapshot. The warm-resume test above proves the no-drift case fetches NO snapshot; this is
+    // its mirror image — the reseed fires.
+    const engine: ReplicaEngine = await nodeSqliteEngine(":memory:");
+    const migrationDb: MigrationDb = { exec: (s) => engine.exec(s), query: (s) => engine.all(s) };
+    const partialBundle = {
+      ...MIRROR_MIGRATIONS,
+      journal: {
+        ...MIRROR_MIGRATIONS.journal,
+        entries: MIRROR_MIGRATIONS.journal.entries.filter((e) => e.tag !== "0008_optimal_rattler"),
+      },
+    };
+    applyMigrations(migrationDb, partialBundle); // DB now at 0007 (no state_id/team_key/team_name)
+    engine.exec(SYNC_META_DDL);
+    const writeDb: ReplicaWriteDb<unknown> = {
+      run: (s, ...b) => engine.run(s, ...b),
+      get: (s, ...b) => engine.get(s, ...b),
+    };
+    setCursor(writeDb, 7, engine.toBindable);
+
+    const { sockets, factory } = recordingFactory();
+    const seed = bufferedSnapshotFetch([], 0);
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "token", token: "t" },
+        dbPath: ":memory:",
+        engine,
+        fetchImpl: seed.fetchImpl,
+        wsFactory: factory,
+      }),
+    );
+
+    await startToLive(replica, sockets);
+
+    // RE-SEEDED (warm-at-0007 + 0008 applied), unlike the warm-resume test's 0.
+    expect(seed.calls.count).toBe(1);
+    // 0008's columns now exist on the replica (the ALTER ran) — sanity that the migration applied.
+    const cols = new Set(
+      (engine.all("PRAGMA table_info(issues)") as Array<{ name: string }>).map((r) => r.name),
+    );
+    expect(cols.has("state_id")).toBe(true);
   });
 });
 

@@ -6,8 +6,8 @@
       "name": "@catalyst-cloud/sdk",
       "dependencies": {
         "@catalyst-cloud/read-model": "^0.1.0",
-        "@catalyst-cloud/replicate": "^0.1.0",
-        "@catalyst-cloud/schema": "^0.1.0",
+        "@catalyst-cloud/replicate": "^0.1.3",
+        "@catalyst-cloud/schema": "^0.1.3",
       },
       "devDependencies": {
         "@opentelemetry/api": "^1.9.0",
@@ -19,10 +19,12 @@
         "vitest": "^2.1.8",
       },
       "peerDependencies": {
+        "@opentelemetry/api": ">=1.3.0 <2",
         "@sqlite.org/sqlite-wasm": "*",
         "better-sqlite3": "*",
       },
       "optionalPeers": [
+        "@opentelemetry/api",
         "@sqlite.org/sqlite-wasm",
         "better-sqlite3",
       ],
@@ -31,9 +33,9 @@
   "packages": {
     "@catalyst-cloud/read-model": ["@catalyst-cloud/read-model@0.1.0", "", {}, "sha512-TODVDFkY5moO0qnWnb/G6+7AI/X9Bl2Zp/2+ymBQDraf1aAjmXloem3qj/FPURjfakx1aDEVEFULO+PpKnC6JQ=="],
 
-    "@catalyst-cloud/replicate": ["@catalyst-cloud/replicate@0.1.0", "", { "dependencies": { "@catalyst-cloud/schema": "^0.1.0" } }, "sha512-Q8SLR0O4BJgMsaCLjtMKZOpcWoheSFjxUJkXSUXhOsd6l6gUW6/AEe2+LhKRDqYm0pM/PHmji9/L98ILpUPQ+A=="],
+    "@catalyst-cloud/replicate": ["@catalyst-cloud/replicate@0.1.3", "", { "dependencies": { "@catalyst-cloud/schema": "^0.1.3" } }, "sha512-7LyYJTG5fkjq9RA8OaCpCzP2b/gjPOYJJmCxRce++TPsIviQULpTiaffL7MuBfwGODf2dwGrO0ozeW7n8slTTQ=="],
 
-    "@catalyst-cloud/schema": ["@catalyst-cloud/schema@0.1.0", "", { "dependencies": { "drizzle-orm": "0.44.7" } }, "sha512-pCXC2vWAkIWYqbN3YBsQuKwNU3qI7Y1qlLu5QV95knCMdjIVUFVc4ppjoGuZL3yvB8iWI1JIf4g74NlZPFFt8w=="],
+    "@catalyst-cloud/schema": ["@catalyst-cloud/schema@0.1.3", "", { "dependencies": { "drizzle-orm": "0.44.7" } }, "sha512-qZGbGvJuvputQlX2TCH5IYAGGVJjunh7tZc9tsp4YxoE82Bj34F+zjqgtCuMTAc6yzR7rNJv90ZjZBLDNoKYwg=="],
 
     "@esbuild/aix-ppc64": ["@esbuild/aix-ppc64@0.21.5", "", { "os": "aix", "cpu": "ppc64" }, "sha512-1SDgH6ZSPTlggy1yI6+Dbkiz8xzpHJEVAlF/AM1tHPLsf5STom9rwtjE4hKAF20FfXXNTFqEYXyJNWh1GiZedQ=="],
 
