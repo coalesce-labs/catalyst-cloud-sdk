@@ -227,6 +227,8 @@ describe("CatalystReplica OpenTelemetry seam (CTC-138)", () => {
     const applied = byName.get("catalyst.replica.applied")!;
     expect(Number(applied.dataPoints[0]!.value)).toBeGreaterThanOrEqual(1);
     expect(applied.dataPoints[0]!.attributes["catalyst.source"]).toBe("github");
+    // CTL-1402: the counter now carries the apply outcome as a low-cardinality label.
+    expect(applied.dataPoints[0]!.attributes["catalyst.replica.result"]).toBe("applied");
 
     const histogram = byName.get("catalyst.replica.apply_batch_rows")!;
     expect((histogram.dataPoints[0]!.value as { count: number }).count).toBeGreaterThanOrEqual(1);
@@ -328,5 +330,114 @@ describe("CatalystReplica OpenTelemetry seam (CTC-138)", () => {
     // freshness stamping is telemetry-independent + cheap, so the getter still works.
     expect(replica.freshnessMs).not.toBeNull();
     expect(replica.cursor).toBe(1);
+  });
+});
+
+// ── CTL-1402: applyFrame emits catalyst.replica.apply{result} on every live frame ─────────────────
+// The fleet runs NO in-process MeterProvider, so the per-frame apply RESULT rides a STRUCTURED LOG
+// line (via the consumer's `log` callback → daemon → Loki → logs-to-metrics connector), independent
+// of the OTel seam. These tests capture `log` and prove applied/skipped/failed emit with the right
+// fields (result, seq, entity, source, err_message) — the join key `seq` ties to the mirror's
+// ingest.committed.headSeq.
+describe("CatalystReplica apply-result telemetry (CTL-1402)", () => {
+  interface LogLine {
+    level: string;
+    msg: string;
+    extra: Record<string, unknown>;
+  }
+  const applyLines = (logs: LogLine[]): Record<string, unknown>[] =>
+    logs.filter((l) => l.msg === "catalyst.replica.apply").map((l) => ({ level: l.level, ...l.extra }));
+
+  async function liveReplica(logs: LogLine[]): Promise<{ socket: FakeWebSocket }> {
+    const { sockets, factory } = recordingFactory();
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: snapshotFetch([], 0),
+        wsFactory: factory,
+        // telemetry OFF on purpose — the apply-result LOG line is the fleet's primary signal and must
+        // fire regardless of the OTLP seam.
+        log: (level, msg, extra) =>
+          logs.push({ level, msg, extra: (extra ?? {}) as Record<string, unknown> }),
+      }),
+    );
+    await startToLive(replica, sockets);
+    return { socket: sockets[0]! };
+  }
+
+  it("emits result:applied with seq+entity+source when a frame writes a row", async () => {
+    const logs: LogLine[] = [];
+    const { socket } = await liveReplica(logs);
+    socket.deliver({
+      type: "change",
+      accountId: "tenant-0",
+      seq: 1,
+      entity: "issues",
+      entityId: "i1",
+      op: "upsert",
+      row: { id: "i1", identifier: "CTL-1", title: "T", updated_at: 10 },
+    });
+    expect(applyLines(logs)).toContainEqual(
+      expect.objectContaining({
+        level: "info",
+        result: "applied",
+        seq: 1,
+        entity: "issues",
+        source: "linear",
+      }),
+    );
+  });
+
+  it("emits result:skipped when the last-write-wins guard drops an out-of-order delta", async () => {
+    const logs: LogLine[] = [];
+    const { socket } = await liveReplica(logs);
+    // First delta writes (updated_at 10); a later frame carrying an OLDER updated_at is dropped by the
+    // replica's stale-guard → applyDelta returns false → result:skipped (nothing was written).
+    socket.deliver({
+      type: "change",
+      accountId: "tenant-0",
+      seq: 1,
+      entity: "issues",
+      entityId: "i1",
+      op: "upsert",
+      row: { id: "i1", identifier: "CTL-1", title: "new", updated_at: 10 },
+    });
+    socket.deliver({
+      type: "change",
+      accountId: "tenant-0",
+      seq: 2,
+      entity: "issues",
+      entityId: "i1",
+      op: "upsert",
+      row: { id: "i1", identifier: "CTL-1", title: "stale", updated_at: 5 },
+    });
+    const lines = applyLines(logs);
+    expect(lines).toContainEqual(expect.objectContaining({ result: "applied", seq: 1 }));
+    expect(lines).toContainEqual(
+      expect.objectContaining({ result: "skipped", seq: 2, entity: "issues", source: "linear" }),
+    );
+  });
+
+  it("emits result:failed with the untruncated err_message when applyDelta throws", async () => {
+    const logs: LogLine[] = [];
+    const { socket } = await liveReplica(logs);
+    // An unknown entity makes applyDelta throw → the catch records result:failed + the error message
+    // (the untruncated string the #127 column-drift investigation needs).
+    socket.deliver({
+      type: "change",
+      accountId: "tenant-0",
+      seq: 1,
+      entity: "not_a_table",
+      entityId: "x",
+      op: "upsert",
+      row: { id: "x" },
+    });
+    const failed = applyLines(logs).find((l) => l["result"] === "failed");
+    expect(failed).toMatchObject({ level: "error", result: "failed", seq: 1, entity: "not_a_table" });
+    expect(String(failed!["err_message"])).toContain("unknown entity");
   });
 });

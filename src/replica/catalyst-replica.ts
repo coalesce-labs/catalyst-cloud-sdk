@@ -70,10 +70,12 @@ import {
   createTelemetry,
   CATALYST_ATTR,
   REPLICA_METRIC,
+  REPLICA_LOG,
   REPLICA_SPAN,
   REPLICA_STATUS_CODE,
   DEFAULT_SCOPE_NAME,
   entitySource,
+  type ReplicaApplyResult,
   type Telemetry,
   type TelemetryConfig,
   type Counter,
@@ -596,8 +598,11 @@ export class CatalystReplica {
     const writeDb = this.writeDb;
     if (!engine || !writeDb) return;
     try {
+      // `applyDelta` returns whether the row was actually written (`true`) or dropped by the replica's
+      // stale-guard (`false`) — the applied-vs-skipped signal (CTL-1402).
+      let written = false;
       engine.transaction(() => {
-        applyDelta(
+        written = applyDelta(
           writeDb,
           { entity: frame.entity, op: frame.op, row: frame.row ?? {}, entityId: frame.entityId },
           engine.toBindable,
@@ -607,21 +612,52 @@ export class CatalystReplica {
         if (frame.seq > this.highWater) setCursor(writeDb, frame.seq, engine.toBindable);
       });
       if (frame.seq > this.highWater) this.highWater = frame.seq;
-      // Freshness stamp + per-frame counter (no-op instruments when telemetry is off). The cursor +
-      // freshness_ms gauges read this.highWater / this.lastAppliedAtMs on the next scrape.
+      // Freshness stamp. The cursor + freshness_ms gauges read this.highWater / this.lastAppliedAtMs on
+      // the next scrape.
       this.lastAppliedAtMs = Date.now();
-      this.appliedCounter.add(1, {
-        [CATALYST_ATTR.tenant]: this.opts.account,
-        [CATALYST_ATTR.source]: entitySource(frame.entity),
-      });
+      this.recordApplyResult(written ? "applied" : "skipped", frame);
       try {
         this.opts.onChange?.();
       } catch (err) {
         this.log("warn", "onChange handler threw", err);
       }
     } catch (err) {
-      this.log("error", `apply failed for ${frame.entity} seq=${frame.seq}`, err);
+      this.recordApplyResult("failed", frame, err);
     }
+  }
+
+  /**
+   * CTL-1402: record ONE apply outcome per live frame. Two coherent emit paths, both carrying
+   * `result: applied|skipped|failed`:
+   *
+   *  1. A structured `catalyst.replica.apply` LOG line (via the consumer's `log` callback) — the
+   *     fleet's primary signal, since it runs NO in-process MeterProvider: the daemon serializes
+   *     `extra` into fields the Loki→metrics connector materializes. `seq` is the join key to the
+   *     mirror's `ingest.committed.headSeq`; the failure branch carries the untruncated `err_message`
+   *     the #127 drift needs. This REPLACES the old string-interpolated `"apply failed for … seq="`
+   *     line — one emit path, no double-count (the interim in-repo bridge retires on the SDK bump).
+   *  2. A `result`-tagged bump of the `catalyst.replica.applied` OTLP counter — durable for when a
+   *     MeterProvider is adopted; a no-op when telemetry is off.
+   *
+   * Cardinality: only `source` + `result` are counter labels (both low-card); `seq` / `entity` /
+   * `err_message` ride the log line as VALUES, never labels.
+   */
+  private recordApplyResult(result: ReplicaApplyResult, frame: ChangeFrame, err?: unknown): void {
+    const source = entitySource(frame.entity);
+    this.appliedCounter.add(1, {
+      [CATALYST_ATTR.tenant]: this.opts.account,
+      [CATALYST_ATTR.source]: source,
+      [CATALYST_ATTR.result]: result,
+    });
+    const errMessage =
+      err instanceof Error ? err.message : err !== undefined ? String(err) : undefined;
+    this.log(result === "failed" ? "error" : "info", REPLICA_LOG.apply, {
+      result,
+      seq: frame.seq,
+      entity: frame.entity,
+      source,
+      ...(errMessage !== undefined ? { err_message: errMessage } : {}),
+    });
   }
 
   /**

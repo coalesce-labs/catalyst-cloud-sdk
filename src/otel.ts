@@ -48,7 +48,13 @@ export const CATALYST_ATTR = {
   rowCount: "catalyst.replica.row_count",
   /** Rows in one seed apply-batch. */
   batchRows: "catalyst.replica.batch_rows",
+  /** The per-frame apply outcome (CTL-1402): `"applied"` | `"skipped"` | `"failed"`. Low-cardinality
+   *  — safe as a metric label; seq/entity/err_message are VALUES on the log line, never labels. */
+  result: "catalyst.replica.result",
 } as const;
+
+/** The per-frame apply outcome: a row written, dropped by the stale-guard, or a failed transaction. */
+export type ReplicaApplyResult = "applied" | "skipped" | "failed";
 
 /** Metric instrument names (OTel metric stream names). */
 export const REPLICA_METRIC = {
@@ -58,6 +64,14 @@ export const REPLICA_METRIC = {
   status: "catalyst.replica.status",
   applied: "catalyst.replica.applied",
   applyBatchRows: "catalyst.replica.apply_batch_rows",
+} as const;
+
+/** Structured-log MESSAGE names the daemon's `log` callback routes to Loki, where the fleet's
+ *  logs→metrics connector materializes them (the fleet has no in-process MeterProvider, so the
+ *  per-frame apply RESULT rides a structured log line, not an OTLP metric — CTL-1402). */
+export const REPLICA_LOG = {
+  /** Per applied frame: `{result, seq, entity, source, err_message?}`. */
+  apply: "catalyst.replica.apply",
 } as const;
 
 /** Span names. */
