@@ -2,9 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   ENTITY_NAMES,
   CHANGE_OPS,
+  PING_FRAME,
+  PONG_FRAME,
+  parseFrame,
   type ChangeFrame,
   type ResyncFrame,
   type SyncFrame,
+  type PongFrame,
   type EntityName,
   type ChangeOp,
 } from "../src/index";
@@ -87,5 +91,26 @@ describe("wire contract", () => {
   it("SyncFrame is {type:'sync', after:number}", () => {
     const frame: SyncFrame = { type: "sync", after: 7 };
     expect(frame).toEqual({ type: "sync", after: 7 });
+  });
+
+  // CTC-135 liveness ping/pong. The mirror registers setWebSocketAutoResponse(PING_FRAME → PONG_FRAME),
+  // which matches the request STRING byte-for-byte, so these literals MUST equal the mirror's copies in
+  // apps/mirror/src/do/ws.ts exactly — any drift (key order, spacing) silently breaks the auto-pong.
+  it("pins the liveness ping/pong wire bytes (must match apps/mirror/src/do/ws.ts exactly)", () => {
+    expect(PING_FRAME).toBe('{"type":"ping"}');
+    expect(PONG_FRAME).toBe('{"type":"pong"}');
+    // The bytes parse to the intended objects — but the wire contract is the STRING, not the object.
+    expect(JSON.parse(PING_FRAME)).toEqual({ type: "ping" });
+    expect(JSON.parse(PONG_FRAME)).toEqual({ type: "pong" });
+  });
+
+  it("parseFrame recognizes a pong as {type:'pong'} (so the watchdog can consume it)", () => {
+    const frame = parseFrame(PONG_FRAME);
+    expect(frame).toEqual({ type: "pong" });
+  });
+
+  it("PongFrame is {type:'pong'}", () => {
+    const frame: PongFrame = { type: "pong" };
+    expect(frame.type).toBe("pong");
   });
 });

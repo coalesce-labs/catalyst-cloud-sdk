@@ -169,6 +169,40 @@ describe("CatalystReplica lifecycle + the managed-replica drop-in", () => {
     expect(replica.handle).toBeDefined(); // the raw driver Database for drizzle
   });
 
+  it("exposes lastFrameAt (CTC-135): null before any WS frame, advancing after a delivered delta", async () => {
+    const { sockets, factory } = recordingFactory();
+    const seed = bufferedSnapshotFetch([], 0);
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "token", token: "tok" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: seed.fetchImpl,
+        wsFactory: factory,
+      }),
+    );
+
+    await startToLive(replica, sockets);
+    // Seeded via /snapshot (a fetch, not a WS frame) → no inbound frame has been observed yet.
+    expect(replica.lastFrameAt).toBeNull();
+
+    const before = Date.now();
+    sockets[0]!.deliver({
+      type: "change",
+      accountId: "tenant-0",
+      seq: 1,
+      entity: "issues",
+      entityId: "i1",
+      op: "upsert",
+      row: { id: "i1", identifier: "CTC-1", title: "Hi", updated_at: 1 },
+    });
+    // Any inbound frame stamps lastFrameAt — the per-frame timestamp the daemon's stall classifier needs.
+    expect(replica.lastFrameAt).not.toBeNull();
+    expect(replica.lastFrameAt!).toBeGreaterThanOrEqual(before);
+  });
+
   it("fires onChange after an applied live delta (the refetch hook)", async () => {
     const { sockets, factory } = recordingFactory();
     const seed = bufferedSnapshotFetch([], 0);

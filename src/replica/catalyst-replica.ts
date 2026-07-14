@@ -137,6 +137,14 @@ export interface CatalystReplicaOptions {
   backoffMs?: number;
   /** Reconnect backoff ceiling in ms. Default 30_000. */
   maxBackoffMs?: number;
+  /**
+   * Liveness watchdog idle-ping interval in ms (CTC-135). After this much inbound silence the client
+   * pings the mirror and force-reconnects if no frame comes back within {@link pongTimeoutMs}. Default
+   * `90_000`; `0` disables the watchdog (close/error-only detection). See {@link lastFrameAt}.
+   */
+  pingIntervalMs?: number;
+  /** Liveness pong deadline in ms after a ping before declaring the socket half-open. Default `15_000`. */
+  pongTimeoutMs?: number;
   /** Injectable WebSocket factory (tests). Defaults to the runtime global WebSocket. */
   wsFactory?: WebSocketFactory;
   /** Optional structured logger; defaults to console. */
@@ -371,6 +379,8 @@ export class CatalystReplica {
       onStatus: (status) => this.handleStatus(status),
       backoffMs: this.opts.backoffMs,
       maxBackoffMs: this.opts.maxBackoffMs,
+      pingIntervalMs: this.opts.pingIntervalMs,
+      pongTimeoutMs: this.opts.pongTimeoutMs,
       wsFactory: this.opts.wsFactory,
       log: this.log,
       telemetry: this.telemetry,
@@ -498,6 +508,13 @@ export class CatalystReplica {
   /** The connection lifecycle status. */
   get status(): LiveSyncStatus {
     return this._status;
+  }
+
+  /** Epoch ms of the last inbound live-sync frame (CTC-135), or null before the first frame / in
+   *  reader mode (no socket). Any inbound bytes prove the socket is alive — pairing this with `status`
+   *  lets a supervisor tell a quiet feed from a half-open socket the watchdog is about to recover. */
+  get lastFrameAt(): number | null {
+    return this.client?.lastFrameAt ?? null;
   }
 
   /** The raw driver Database the SDK owns — for `drizzle(replica.handle, { schema: mirrorSchema })`. */

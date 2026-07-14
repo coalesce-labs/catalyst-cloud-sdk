@@ -21,10 +21,20 @@
 //                 platform global `WebSocket` (browser, Bun, Node >=22) so the shared core has NO
 //                 node-only import like 'ws'.
 //
-// There is intentionally NO setInterval keepalive: the WHATWG WebSocket ping/pong is handled by the
-// platform, and a re-implemented heartbeat would keep the connection needlessly active.
+// Liveness (CTC-135): a pure-receive socket cannot tell a quiet feed from a HALF-OPEN one. A laptop
+// sleep or network roam can kill the TCP path with no FIN/RST, so `onclose`/`onerror` never fire and
+// the client would report "live" forever while frozen (a mini ran 3+ days, a laptop 6.8 days stuck at
+// one cursor). The premise that "the platform handles ping/pong" is false here — WHATWG platforms
+// *respond* to protocol pings but nothing in this stack ever *sends* one, and browsers can't send RFC
+// 6455 pings at all. So this client runs an app-level watchdog: after `pingIntervalMs` of inbound
+// silence it sends the pinned `{"type":"ping"}` frame; the mirror answers via `setWebSocketAutoResponse`
+// (which replies WITHOUT waking a hibernated DO — ADR-0009's cost model is preserved). If no frame
+// arrives within `pongTimeoutMs`, the socket is force-reconnected through the existing backoff path.
+// Traffic postpones pings (no keepalive on a busy stream), and a 3-probe feature-detect disables the
+// watchdog against an old server that never pongs — so it degrades to exactly today's behavior.
 
-import type { ChangeFrame, ResyncFrame, ServerFrame, SyncFrame } from "./types.js";
+import type { ChangeFrame, PongFrame, ResyncFrame, ServerFrame, SyncFrame } from "./types.js";
+import { PING_FRAME } from "./types.js";
 import {
   NOOP_TELEMETRY,
   createTelemetry,
@@ -121,6 +131,18 @@ export interface LiveSyncClientOptions {
   backoffMs?: number;
   /** Reconnect backoff ceiling in ms. Default 30_000. */
   maxBackoffMs?: number;
+  /**
+   * Liveness watchdog (CTC-135): after this many ms of inbound silence, send one `{"type":"ping"}` and
+   * expect a frame back within {@link pongTimeoutMs}. Any inbound frame (change OR pong) postpones the
+   * next ping, so a busy stream never pings. Default `90_000`; set `0` to disable the watchdog entirely
+   * (back to close/error-only detection).
+   */
+  pingIntervalMs?: number;
+  /**
+   * How long (ms) to wait for ANY inbound frame after sending a liveness ping before declaring the
+   * socket half-open and force-reconnecting through the normal backoff path. Default `15_000`.
+   */
+  pongTimeoutMs?: number;
   /** Injectable WebSocket factory (tests / a node polyfill). Defaults to `globalThis.WebSocket`. */
   wsFactory?: WebSocketFactory;
   /** Optional structured logger; defaults to console. */
@@ -178,6 +200,13 @@ export function buildConnectUrl(opts: {
   return `${origin}${opts.connectPath}?${params.toString()}`;
 }
 
+/**
+ * Consecutive opened-then-never-ponged connections after which the watchdog disables itself for the
+ * client's lifetime (feature-detect for a server without auto-pong). Bounds worst-case reconnect
+ * churn against an old server to exactly this many attempts, making mirror/SDK deploy order harmless.
+ */
+const PROBE_FAILURE_LIMIT = 3;
+
 export class LiveSyncClient {
   private readonly baseUrl: string;
   private readonly accountId: string;
@@ -190,6 +219,8 @@ export class LiveSyncClient {
   private readonly onStatus?: (status: LiveSyncStatus) => void;
   private readonly backoffMs: number;
   private readonly maxBackoffMs: number;
+  private readonly pingIntervalMs: number;
+  private readonly pongTimeoutMs: number;
   private readonly wsFactory: WebSocketFactory;
   private readonly log: NonNullable<LiveSyncClientOptions["log"]>;
   private readonly telemetryConfig: TelemetryConfig | Telemetry | undefined;
@@ -205,6 +236,24 @@ export class LiveSyncClient {
   /** The in-flight connect-attempt span (ended OK on open, ERROR on construct-fail / close-before-open). */
   private connectSpan: ManualSpan | null = null;
 
+  // ── Liveness watchdog state (CTC-135) ──
+  /** Epoch ms of the last inbound frame (any bytes: change, pong, even malformed). Null before the
+   *  first frame. Public via {@link lastFrameAt} — the per-frame timestamp the catalyst daemon's
+   *  stall classifier lacked (it can now distinguish a quiet feed from a dead socket). Client-lifetime. */
+  private _lastFrameAt: number | null = null;
+  /** Per-CONNECTION: has this socket answered at least one ping? Gates a real liveness timeout vs a
+   *  never-ponged feature-detect probe. Reset on every (re)open. */
+  private pongObserved = false;
+  /** Per-CONNECTION: epoch ms the last ping was sent, for the deadline's late-timer re-check. */
+  private pingSentAt = 0;
+  /** Client-lifetime: consecutive opened-then-never-ponged connections. Reset to 0 by ANY pong. */
+  private probeFailures = 0;
+  /** Client-lifetime: after PROBE_FAILURE_LIMIT never-ponged connections we stop pinging for good
+   *  (an old server without auto-pong), degrading to close/error-only detection. */
+  private watchdogDisabled = false;
+  private pingTimer: ReturnType<typeof setTimeout> | null = null;
+  private pongDeadline: ReturnType<typeof setTimeout> | null = null;
+
   constructor(opts: LiveSyncClientOptions) {
     this.baseUrl = stripTrailingSlashes(opts.baseUrl);
     this.accountId = opts.accountId;
@@ -217,6 +266,8 @@ export class LiveSyncClient {
     this.onStatus = opts.onStatus;
     this.backoffMs = opts.backoffMs ?? 1000;
     this.maxBackoffMs = opts.maxBackoffMs ?? 30_000;
+    this.pingIntervalMs = opts.pingIntervalMs ?? 90_000;
+    this.pongTimeoutMs = opts.pongTimeoutMs ?? 15_000;
     this.wsFactory = opts.wsFactory ?? defaultWsFactory;
     this.log =
       opts.log ??
@@ -312,13 +363,21 @@ export class LiveSyncClient {
       this.backoff = this.backoffMs; // a successful open resets the backoff ramp
       this.setStatus("live");
       this.endConnectSpan();
+      // Fresh connection: reset per-connection watchdog state, then start the idle-ping countdown.
+      this.pongObserved = false;
+      this.pingSentAt = 0;
       this.sendSync();
+      this.armPing();
     };
     ws.onmessage = (ev) => {
+      // ANY inbound bytes prove the socket is alive: stamp lastFrameAt, clear a pending pong deadline,
+      // and postpone the next ping — BEFORE parsing, so even a malformed frame counts as liveness.
+      this.onInboundFrame();
       void this.handleFrame(ev.data);
     };
     ws.onclose = () => {
       if (this.ws === ws) this.ws = null;
+      this.clearLivenessTimers(); // this connection's ping/deadline die with its socket
       if (!this.stopped && !this.resyncing) this.setStatus("reconnecting");
       // No-op if onopen already ended it (a normal disconnect of a healthy socket isn't a connect error).
       this.endConnectSpan(new Error("socket closed before open"));
@@ -349,6 +408,9 @@ export class LiveSyncClient {
   private closeSocket(): void {
     // A deliberate teardown of an in-flight attempt (stop/resync): end the connect span neutrally.
     this.endConnectSpan();
+    // The single choke point for liveness-timer teardown — covers stop/resync/forceReconnect. (The
+    // server-close path clears them in onclose; both routes null this.ws, so no timer outlives a socket.)
+    this.clearLivenessTimers();
     const ws = this.ws;
     this.ws = null;
     if (!ws) return;
@@ -387,6 +449,14 @@ export class LiveSyncClient {
   private async handleFrame(data: unknown): Promise<void> {
     const frame = parseFrame(data);
     if (!frame) return;
+    if (frame.type === "pong") {
+      // Transport-internal liveness ack: the socket is alive and the server speaks auto-pong. Record
+      // capability and reset the feature-detect counter; a pong is NEVER surfaced to onFrame/onChange.
+      // (lastFrameAt + the pending-deadline clear already happened synchronously in onInboundFrame.)
+      this.pongObserved = true;
+      this.probeFailures = 0;
+      return;
+    }
     try {
       this.onFrame?.(frame);
     } catch (err) {
@@ -432,6 +502,108 @@ export class LiveSyncClient {
     }
     if (!this.stopped) this.openSocket();
   }
+
+  // ── Liveness watchdog (CTC-135) ──
+
+  /** Epoch ms of the last inbound frame (change, pong, or malformed) — null before the first frame.
+   *  Any inbound bytes prove the socket is alive; the catalyst daemon's stall classifier reads this to
+   *  tell a quiet feed from a half-open socket (the per-frame timestamp it previously lacked). */
+  get lastFrameAt(): number | null {
+    return this._lastFrameAt;
+  }
+
+  /** Any inbound frame: stamp liveness, cancel a pending pong deadline (it was answered), and postpone
+   *  the next ping so a busy stream never sends one. Runs synchronously in onmessage before parsing. */
+  private onInboundFrame(): void {
+    this._lastFrameAt = Date.now();
+    this.clearPongDeadline();
+    this.armPing();
+  }
+
+  /** (Re)arm the idle-ping timer. No-op when the watchdog is disabled/off or there is no live socket,
+   *  so it is safe to call on every frame. A setTimeout chain (not setInterval): each frame resets it. */
+  private armPing(): void {
+    this.clearPingTimer();
+    if (this.watchdogDisabled || this.pingIntervalMs <= 0 || this.stopped || !this.ws) return;
+    this.pingTimer = setTimeout(() => this.sendPing(), this.pingIntervalMs);
+  }
+
+  /** The feed has been idle for a full interval: send one liveness ping and start the pong deadline. A
+   *  synchronous send throw means the socket is already dead — treat it as an unanswered probe now. */
+  private sendPing(): void {
+    this.pingTimer = null; // this timer just fired
+    if (this.stopped || this.watchdogDisabled || !this.ws) return;
+    this.pingSentAt = Date.now();
+    try {
+      this.ws.send(PING_FRAME);
+    } catch (err) {
+      this.log("warn", "liveness ping send failed (dead socket); forcing reconnect", err);
+      this.onProbeUnanswered();
+      return;
+    }
+    this.pongDeadline = setTimeout(() => this.onPongDeadline(), this.pongTimeoutMs);
+  }
+
+  /** The pong deadline elapsed. Late-timer guard first: in a throttled background tab this callback can
+   *  fire long after a frame actually arrived, so if ANYTHING landed at/after the ping we sent, liveness
+   *  is proven — re-arm and move on (detection latency grows; correctness holds). Otherwise: half-open. */
+  private onPongDeadline(): void {
+    this.pongDeadline = null; // this timer just fired
+    if (this.stopped || !this.ws) return;
+    if (this._lastFrameAt != null && this._lastFrameAt >= this.pingSentAt) {
+      this.armPing();
+      return;
+    }
+    this.onProbeUnanswered();
+  }
+
+  /** A ping went unanswered (deadline elapsed or the send threw). If this connection had already proven
+   *  pong capability it is a genuine liveness timeout; otherwise it counts toward the feature-detect —
+   *  after PROBE_FAILURE_LIMIT never-ponged connections the watchdog disables itself for good (an old
+   *  server without auto-pong). Either way, force-reconnect through the existing backoff path. */
+  private onProbeUnanswered(): void {
+    if (this.pongObserved) {
+      this.log("warn", "liveness timeout: no frame within the pong deadline; reconnecting");
+    } else {
+      this.probeFailures += 1;
+      if (this.probeFailures >= PROBE_FAILURE_LIMIT) {
+        this.watchdogDisabled = true;
+        this.log(
+          "warn",
+          `liveness watchdog disabled after ${PROBE_FAILURE_LIMIT} unanswered probes (server lacks auto-pong); relying on close/error detection`,
+        );
+      }
+    }
+    this.forceReconnect();
+  }
+
+  /** Tear the socket down and reconnect through the normal backoff. closeSocket detaches handlers (so
+   *  onclose won't also fire) and clears the liveness timers, so we schedule the reopen ourselves. */
+  private forceReconnect(): void {
+    this.closeSocket();
+    if (this.stopped) return;
+    this.setStatus("reconnecting");
+    this.scheduleReconnect();
+  }
+
+  private clearPingTimer(): void {
+    if (this.pingTimer != null) {
+      clearTimeout(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
+
+  private clearPongDeadline(): void {
+    if (this.pongDeadline != null) {
+      clearTimeout(this.pongDeadline);
+      this.pongDeadline = null;
+    }
+  }
+
+  private clearLivenessTimers(): void {
+    this.clearPingTimer();
+    this.clearPongDeadline();
+  }
 }
 
 /** Parse a WS frame (string or ArrayBuffer) into a known server frame, or null for anything malformed. */
@@ -453,5 +625,6 @@ export function parseFrame(data: unknown): ServerFrame | null {
   const type = (parsed as { type?: unknown }).type;
   if (type === "resync") return parsed as ResyncFrame;
   if (type === "change") return parsed as ChangeFrame;
+  if (type === "pong") return parsed as PongFrame;
   return null;
 }

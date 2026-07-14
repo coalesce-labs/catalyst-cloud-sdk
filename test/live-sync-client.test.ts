@@ -4,6 +4,7 @@ import {
   buildConnectUrl,
   parseFrame,
   toWsOrigin,
+  PING_FRAME,
   type WebSocketLike,
   type WebSocketFactory,
   type LiveSyncStatus,
@@ -19,12 +20,15 @@ import {
 class FakeWebSocket implements WebSocketLike {
   sent: string[] = [];
   closed = false;
+  /** When set, the next send() throws — simulates writing to an already-dead socket (CTC-135). */
+  throwOnSend = false;
   onopen: ((ev: unknown) => void) | null = null;
   onmessage: ((ev: { data: unknown }) => void) | null = null;
   onclose: ((ev: unknown) => void) | null = null;
   onerror: ((ev: unknown) => void) | null = null;
 
   send(data: string): void {
+    if (this.throwOnSend) throw new Error("send on a dead socket");
     this.sent.push(data);
   }
   close(): void {
@@ -447,6 +451,270 @@ describe("LiveSyncClient", () => {
       idx = sockets.length - 1;
       sockets[idx]!.fireServerClose();
     }
+    client.stop();
+  });
+});
+
+// ── CTC-135 liveness watchdog: half-open detection via app-level ping/pong ──
+describe("LiveSyncClient liveness watchdog (CTC-135)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Fake timers with a fixed epoch so lastFrameAt / pingSentAt are exact and deterministic. */
+  function useFakeClock(): void {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+  }
+
+  function makeClient(opts: {
+    pingIntervalMs?: number;
+    pongTimeoutMs?: number;
+    initialCursor?: number | null;
+  }) {
+    const store = makeStore(opts.initialCursor ?? 7);
+    const { sockets, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(0),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      onStatus: (s) => statuses.push(s),
+      backoffMs: 1000,
+      maxBackoffMs: 30_000,
+      pingIntervalMs: opts.pingIntervalMs,
+      pongTimeoutMs: opts.pongTimeoutMs,
+      wsFactory: factory,
+    });
+    return { client, sockets, statuses, store };
+  }
+
+  const change = (seq: number): ChangeFrame => ({
+    type: "change",
+    accountId: "tenant-0",
+    seq,
+    entity: "issues",
+    entityId: `i${seq}`,
+    op: "upsert",
+    row: { id: `i${seq}` },
+  });
+  const pingsOn = (ws: FakeWebSocket) => ws.sent.filter((s) => s === PING_FRAME);
+  const lastSent = (ws: FakeWebSocket) => ws.sent[ws.sent.length - 1];
+
+  it("pings after an idle interval and stays connected when the server pongs", () => {
+    useFakeClock();
+    const { client, sockets } = makeClient({ pingIntervalMs: 1000, pongTimeoutMs: 200 });
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    // No ping until a full idle interval elapses.
+    vi.advanceTimersByTime(999);
+    expect(pingsOn(sockets[0]!)).toHaveLength(0);
+    vi.advanceTimersByTime(1);
+    expect(lastSent(sockets[0]!)).toBe(PING_FRAME); // ping at t=1000, deadline armed at t=1200
+
+    // Each pong clears the deadline and re-arms the next ping — three clean cycles, no reconnect.
+    for (let i = 0; i < 3; i++) {
+      sockets[0]!.deliver({ type: "pong" });
+      vi.advanceTimersByTime(1000);
+      expect(lastSent(sockets[0]!)).toBe(PING_FRAME);
+    }
+    expect(pingsOn(sockets[0]!)).toHaveLength(4);
+    expect(sockets).toHaveLength(1); // a ponging server keeps the one socket alive
+
+    client.stop();
+  });
+
+  it("force-reconnects when a previously-ponging connection stops answering", () => {
+    useFakeClock();
+    const { client, sockets, statuses } = makeClient({ pingIntervalMs: 1000, pongTimeoutMs: 200 });
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    // Prove capability: the first ping is ponged.
+    vi.advanceTimersByTime(1000);
+    sockets[0]!.deliver({ type: "pong" });
+
+    // Then go silent: the next ping's deadline elapses with no frame → liveness timeout.
+    vi.advanceTimersByTime(1000); // ping (pingSentAt=2000)
+    expect(lastSent(sockets[0]!)).toBe(PING_FRAME);
+    vi.advanceTimersByTime(200); // deadline: lastFrameAt(1000) < pingSentAt(2000) → not answered
+    expect(sockets[0]!.closed).toBe(true);
+    expect(statuses).toContain("reconnecting");
+
+    vi.advanceTimersByTime(1000); // backoff reconnect
+    expect(sockets).toHaveLength(2);
+
+    client.stop();
+  });
+
+  it("sends no pings while change frames keep arriving", () => {
+    useFakeClock();
+    const { client, sockets } = makeClient({ pingIntervalMs: 1000, pongTimeoutMs: 200 });
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    // A change every 500ms (< the 1000ms interval) postpones the ping indefinitely.
+    for (let i = 0; i < 5; i++) {
+      vi.advanceTimersByTime(500);
+      sockets[0]!.deliver(change(10 + i));
+    }
+    expect(pingsOn(sockets[0]!)).toHaveLength(0);
+    expect(sockets).toHaveLength(1);
+
+    client.stop();
+  });
+
+  it("does not reconnect when a frame answers just before the pong deadline", () => {
+    useFakeClock();
+    const { client, sockets } = makeClient({ pingIntervalMs: 1000, pongTimeoutMs: 200 });
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    vi.advanceTimersByTime(1000); // ping at t=1000, deadline armed for t=1200
+    expect(lastSent(sockets[0]!)).toBe(PING_FRAME);
+    vi.advanceTimersByTime(150); // t=1150
+    sockets[0]!.deliver(change(50)); // answers before the deadline → deadline cleared
+    vi.advanceTimersByTime(100); // t=1250, PAST the original deadline — but it was cancelled
+    expect(sockets[0]!.closed).toBe(false);
+    expect(sockets).toHaveLength(1);
+
+    client.stop();
+  });
+
+  it("disables the watchdog after 3 consecutive unanswered probes (old server)", () => {
+    useFakeClock();
+    const { client, sockets } = makeClient({ pingIntervalMs: 1000, pongTimeoutMs: 200 });
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    // One probe cycle against a server that never pongs: ping → deadline → force-reconnect → reopen.
+    const probeFailAndReopen = () => {
+      vi.advanceTimersByTime(1000); // ping fires
+      vi.advanceTimersByTime(200); // deadline elapses (never ponged) → force-reconnect
+      vi.advanceTimersByTime(1000); // backoff reconnect opens the next socket
+      sockets[sockets.length - 1]!.fireOpen();
+    };
+
+    probeFailAndReopen(); // failure 1 → conn2
+    expect(sockets).toHaveLength(2);
+    probeFailAndReopen(); // failure 2 → conn3
+    expect(sockets).toHaveLength(3);
+    probeFailAndReopen(); // failure 3 → watchdog disabled → conn4
+    expect(sockets).toHaveLength(4);
+
+    // conn4 opened with the watchdog disabled: it never pings and never reconnects again.
+    vi.advanceTimersByTime(10_000);
+    expect(pingsOn(sockets[3]!)).toHaveLength(0);
+    expect(sockets).toHaveLength(4); // bounded to exactly 3 reconnects against an old server
+
+    client.stop();
+  });
+
+  it("a pong resets the consecutive-probe-failure counter", () => {
+    useFakeClock();
+    const { client, sockets } = makeClient({ pingIntervalMs: 1000, pongTimeoutMs: 200 });
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    const probeFailAndReopen = () => {
+      vi.advanceTimersByTime(1000);
+      vi.advanceTimersByTime(200);
+      vi.advanceTimersByTime(1000);
+      sockets[sockets.length - 1]!.fireOpen();
+    };
+
+    probeFailAndReopen(); // probeFailures = 1 → conn2
+    probeFailAndReopen(); // probeFailures = 2 → conn3
+
+    // conn3 pongs its first probe → probeFailures resets to 0.
+    vi.advanceTimersByTime(1000);
+    expect(lastSent(sockets[2]!)).toBe(PING_FRAME);
+    sockets[2]!.deliver({ type: "pong" });
+
+    // A server-initiated close moves us to conn4 without a probe failure.
+    sockets[2]!.fireServerClose();
+    vi.advanceTimersByTime(1000);
+    sockets[3]!.fireOpen();
+    expect(sockets).toHaveLength(4);
+
+    // conn4 still pings — proof the counter reset (were it at 3, the watchdog would be disabled).
+    vi.advanceTimersByTime(1000);
+    expect(pingsOn(sockets[3]!)).toHaveLength(1);
+
+    client.stop();
+  });
+
+  it("clears liveness timers on stop (no ping fires afterward)", () => {
+    useFakeClock();
+    const { client, sockets } = makeClient({ pingIntervalMs: 1000, pongTimeoutMs: 200 });
+    void client.start();
+    sockets[0]!.fireOpen();
+    client.stop(); // closeSocket → clearLivenessTimers
+    vi.advanceTimersByTime(10_000);
+    expect(pingsOn(sockets[0]!)).toHaveLength(0);
+  });
+
+  it("clears the ping timer on resync teardown (the old socket never pings mid-reseed)", async () => {
+    useFakeClock();
+    const { client, sockets } = makeClient({ pingIntervalMs: 1000, pongTimeoutMs: 200 });
+    void client.start();
+    sockets[0]!.fireOpen(); // ping armed on conn1
+    sockets[0]!.deliver({ type: "resync", accountId: "tenant-0" }); // closeSocket → clears timers, reopen
+    await vi.advanceTimersByTimeAsync(2000); // flush the async reseed + reopen, past conn1's interval
+    expect(pingsOn(sockets[0]!)).toHaveLength(0); // conn1's ping timer was cleared with its socket
+    expect(sockets.length).toBeGreaterThanOrEqual(2);
+    client.stop();
+  });
+
+  it("never pings when pingIntervalMs is 0", () => {
+    useFakeClock();
+    const { client, sockets } = makeClient({ pingIntervalMs: 0, pongTimeoutMs: 200 });
+    void client.start();
+    sockets[0]!.fireOpen();
+    vi.advanceTimersByTime(1_000_000);
+    expect(pingsOn(sockets[0]!)).toHaveLength(0);
+    expect(sockets).toHaveLength(1);
+    client.stop();
+  });
+
+  it("exposes lastFrameAt, updated by ANY inbound frame (change, malformed, or pong)", () => {
+    useFakeClock();
+    const { client, sockets } = makeClient({ pingIntervalMs: 1000, pongTimeoutMs: 200 });
+    void client.start();
+    sockets[0]!.fireOpen();
+    expect(client.lastFrameAt).toBeNull(); // null before the first inbound frame
+
+    vi.advanceTimersByTime(500);
+    sockets[0]!.deliver(change(10));
+    expect(client.lastFrameAt).toBe(500);
+
+    vi.advanceTimersByTime(300);
+    sockets[0]!.deliverRaw("not json at all"); // malformed bytes still prove liveness
+    expect(client.lastFrameAt).toBe(800);
+
+    vi.advanceTimersByTime(100);
+    sockets[0]!.deliver({ type: "pong" }); // a transport-internal pong counts too
+    expect(client.lastFrameAt).toBe(900);
+
+    client.stop();
+  });
+
+  it("force-reconnects when sending a ping throws (a dead socket surfaces synchronously)", () => {
+    useFakeClock();
+    const { client, sockets } = makeClient({ pingIntervalMs: 1000, pongTimeoutMs: 200 });
+    void client.start();
+    sockets[0]!.fireOpen(); // the {type:sync} frame sends fine
+    sockets[0]!.throwOnSend = true; // the ping send will throw
+
+    vi.advanceTimersByTime(1000); // ping fires → send throws → immediate force-reconnect
+    expect(sockets[0]!.closed).toBe(true);
+    vi.advanceTimersByTime(1000); // backoff reconnect
+    expect(sockets).toHaveLength(2);
+
     client.stop();
   });
 });

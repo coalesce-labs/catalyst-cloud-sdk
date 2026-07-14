@@ -119,6 +119,7 @@ describe("CatalystReplica.openReadOnly — the read-only reader", () => {
       await reader.start(); // still inert on a second call
       expect(reader.issues()).toEqual(before);
       expect(reader.cursor).toBe(7);
+      expect(reader.lastFrameAt).toBeNull(); // CTC-135: a reader has no live socket → no frame timestamp
     } finally {
       await reader.close();
     }
