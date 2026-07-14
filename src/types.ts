@@ -100,5 +100,25 @@ export interface SyncFrame {
   after: number;
 }
 
-/** Any frame the service can push to a consumer over `/connect`. */
-export type ServerFrame = ChangeFrame | ResyncFrame;
+/**
+ * The liveness ping/pong wire literals (CTC-135). The client sends `PING_FRAME` after an idle
+ * interval; the mirror answers `PONG_FRAME` via `setWebSocketAutoResponse`, which matches the request
+ * string BYTE-FOR-BYTE and replies WITHOUT waking a hibernated Durable Object. These must therefore
+ * be pinned bytes — never `JSON.stringify(...)` at runtime (a different key order or spacing would
+ * silently stop matching). The mirror pins the identical literals (`apps/mirror/src/do/ws.ts`); a
+ * contract test in each repo asserts the two agree.
+ */
+export const PING_FRAME = '{"type":"ping"}';
+export const PONG_FRAME = '{"type":"pong"}';
+
+/**
+ * The liveness pong the mirror's auto-response returns for a client `PING_FRAME`. Transport-internal:
+ * the {@link LiveSyncClient} watchdog consumes it to prove the socket is alive and NEVER surfaces it
+ * to `onFrame`/`onChange`.
+ */
+export interface PongFrame {
+  type: "pong";
+}
+
+/** Any frame the service can push to a consumer over `/connect`. `pong` is transport-internal. */
+export type ServerFrame = ChangeFrame | ResyncFrame | PongFrame;

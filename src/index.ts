@@ -22,12 +22,15 @@ export {
 export {
   ENTITY_NAMES,
   CHANGE_OPS,
+  PING_FRAME,
+  PONG_FRAME,
   type AccountId,
   type EntityName,
   type ChangeOp,
   type ChangeFrame,
   type ResyncFrame,
   type SyncFrame,
+  type PongFrame,
   type ServerFrame,
 } from "./types.js";
 
