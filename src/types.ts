@@ -101,6 +101,21 @@ export interface SyncFrame {
 }
 
 /**
+ * The end-of-pass head nudge (CTL-1402). The mirror's reconcile pass appends `change_log` rows but
+ * never broadcasts them individually, so a quiet-webhook period leaves the client with no later frame
+ * to detect a gap FROM. After a pass the mirror broadcasts ONE `{type:"head", seq:<max change_log
+ * seq>}` so the client can notice its baseline trails the feed head and re-request the hole. It is a
+ * pure control nudge — never applied and never a cursor advance. Transport-internal: the
+ * {@link LiveSyncClient} consumes it and NEVER surfaces it to `onFrame`/`onChange`.
+ */
+export interface HeadFrame {
+  type: "head";
+  accountId?: AccountId;
+  /** The mirror's current feed head — the max `change_log` seq at the end of the reconcile pass. */
+  seq: number;
+}
+
+/**
  * The liveness ping/pong wire literals (CTC-135). The client sends `PING_FRAME` after an idle
  * interval; the mirror answers `PONG_FRAME` via `setWebSocketAutoResponse`, which matches the request
  * string BYTE-FOR-BYTE and replies WITHOUT waking a hibernated Durable Object. These must therefore
@@ -120,5 +135,6 @@ export interface PongFrame {
   type: "pong";
 }
 
-/** Any frame the service can push to a consumer over `/connect`. `pong` is transport-internal. */
-export type ServerFrame = ChangeFrame | ResyncFrame | PongFrame;
+/** Any frame the service can push to a consumer over `/connect`. `pong` and `head` are
+ *  transport-internal (consumed by the client, never surfaced to `onFrame`/`onChange`). */
+export type ServerFrame = ChangeFrame | ResyncFrame | PongFrame | HeadFrame;

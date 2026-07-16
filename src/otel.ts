@@ -82,9 +82,10 @@ export const REPLICA_METRIC = {
 export const REPLICA_LOG = {
   /** Per applied frame: `{result, seq, entity, source, err_message?}`. */
   apply: "catalyst.replica.apply",
-  /** Per gap lifecycle event: `{event, seq_from, seq_to, size, retries}`. `detected` is the alarm the
-   *  CTL-1402 incident lacked; `healed` means the replay redelivered the hole; `escalated` means the
-   *  re-request budget ran out and the client fell back to a full re-seed. */
+  /** Per gap lifecycle event: `{event, seq_from, seq_to, size, retries}`. `detected` is the visibility
+   *  the CTL-1402 incident lacked; `healed` means the replay redelivered the hole; `escalated` means
+   *  the re-request budget ran out and the client fell back to a full re-seed. A gap is the
+   *  steady-state path, so `detected`/`healed` log at INFO and alerting keys on `escalated` (ERROR). */
   gap: "catalyst.replica.gap",
 } as const;
 

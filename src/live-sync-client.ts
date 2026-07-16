@@ -41,13 +41,19 @@
 // the client re-requests the hole with the SAME `{type:"sync", after:<deliveredSeq>}` control frame it
 // already sends on every (re)connect, and the mirror replays the missing rows as ordinary change
 // frames through this same path (server support has existed since CTC-63 — `replaySince` is keyset-
-// paginated and answers `{type:"resync"}` on underflow). Bounded: after `gapRetryLimit` unanswered
-// re-requests the client escalates to the full re-seed path rather than spinning — a gap is never
+// paginated and answers `{type:"resync"}` on underflow). Bounded: after `gapRetryLimit` no-PROGRESS
+// windows (the heal deadline re-arms on every delivered frame, so a big-but-advancing heal never
+// escalates) the client escalates to the full re-seed path rather than spinning — a gap is never
 // silently accepted. Every transition emits the `catalyst.replica.gap` log/counter signal, the
 // detector the per-frame apply telemetry is structurally blind to (an undelivered frame lands in no
-// apply bucket).
+// apply bucket). Gaps are the STEADY-STATE path here — the mirror's reconcile pass appends change_log
+// rows it never broadcasts, so every pass punches a hole that heals via re-request — hence `detected`
+// /`healed` log at INFO and only `escalated` alerts. A reconcile pass with NO webhook frame after it
+// would leave nothing to detect the hole FROM, so the mirror also broadcasts one end-of-pass
+// `{type:"head", seq:<feed head>}` nudge; the client treats a head beyond its baseline exactly like a
+// beyond-gap change frame (re-request the hole `deliveredSeq+1..head`) but never applies it.
 
-import type { ChangeFrame, PongFrame, ResyncFrame, ServerFrame, SyncFrame } from "./types.js";
+import type { ChangeFrame, HeadFrame, PongFrame, ResyncFrame, ServerFrame, SyncFrame } from "./types.js";
 import { PING_FRAME } from "./types.js";
 import {
   NOOP_TELEMETRY,
@@ -517,6 +523,15 @@ export class LiveSyncClient {
       this.probeFailures = 0;
       return;
     }
+    if (frame.type === "head") {
+      // Transport-internal end-of-pass nudge (CTL-1402): a reconcile pass appended change_log rows it
+      // never broadcast individually, so this head seq may sit beyond our contiguous baseline with no
+      // change frame to detect the hole FROM. Treat that as a gap to re-request — but the head frame
+      // is itself NEVER delivered/applied and advances NO cursor. Not surfaced to onFrame/onChange
+      // (same convention as pong); onInboundFrame already stamped it as liveness bytes.
+      this.onHeadFrame(frame);
+      return;
+    }
     try {
       this.onFrame?.(frame);
     } catch (err) {
@@ -544,8 +559,20 @@ export class LiveSyncClient {
     }
     if (frame.seq > this.deliveredSeq) {
       this.deliveredSeq = frame.seq;
-      // The replay walked the whole detected hole: contiguity is restored, live frames resume.
-      if (this.gap && this.deliveredSeq >= this.gap.seqTo) this.onGapHealed();
+      if (this.gap) {
+        if (this.deliveredSeq >= this.gap.seqTo) {
+          // The replay walked the whole detected hole: contiguity is restored, live frames resume.
+          this.onGapHealed();
+        } else {
+          // Progress WITHIN the hole: refund the heal deadline. It measures "no progress for
+          // gapTimeoutMs", NOT "not fully healed within gapTimeoutMs" — the steady-state first heal
+          // replays thousands of frames (keyset-paginated server-side), and a slow consumer / heavy
+          // first heal must not retry (overlapping replays on the same socket) or escalate to a full
+          // /snapshot WHILE frames are actively landing. The retry budget still bounds a genuinely
+          // STALLED heal (no frames at all for a full window).
+          this.armGapDeadline();
+        }
+      }
     }
   }
 
@@ -567,6 +594,25 @@ export class LiveSyncClient {
     this.sendGapRequest();
   }
 
+  /**
+   * An end-of-pass head nudge (CTL-1402): `{type:"head", seq:N}` reports the mirror's current feed
+   * head after a reconcile pass whose change_log rows were never individually broadcast. If N sits
+   * beyond our contiguous baseline and no gap episode is pending, start one exactly as a beyond-gap
+   * change frame would — the hole is `deliveredSeq+1..N` (N itself is a real, un-broadcast row, so —
+   * unlike a change frame's trigger seq — it IS part of the hole) — and re-request it with the same
+   * bounded retry/escalation machinery and telemetry. The head frame is never applied and never
+   * advances a cursor. A head at/below the baseline is a no-op (already caught up); a head arriving
+   * while a gap is already pending is ignored (the in-flight replay already covers up to the head).
+   */
+  private onHeadFrame(frame: HeadFrame): void {
+    if (this.gap) return; // a re-request is pending; its replay already walks up to (past) this head
+    if (this.deliveredSeq <= 0) return; // no baseline yet — nothing to be contiguous with (see gap check)
+    if (frame.seq <= this.deliveredSeq) return; // caught up (or a stale head): no hole to re-request
+    this.gap = { seqFrom: this.deliveredSeq + 1, seqTo: frame.seq, retries: 0 };
+    this.recordGap("detected", this.gap);
+    this.sendGapRequest();
+  }
+
   /** Send (or re-send) the gap re-request from the current baseline and arm the heal deadline. */
   private sendGapRequest(): void {
     const req: SyncFrame = { type: "sync", after: this.deliveredSeq };
@@ -576,6 +622,14 @@ export class LiveSyncClient {
       // A dead socket: leave the deadline armed — it retries/escalates, and a reconnect re-baselines.
       this.log("error", "gap re-request send failed", err);
     }
+    this.armGapDeadline();
+  }
+
+  /** (Re)arm the gap heal deadline. Armed when a re-request is sent AND refreshed on every frame of
+   *  heal progress (the delivery path), so the deadline measures "no PROGRESS for gapTimeoutMs" rather
+   *  than "not fully healed within gapTimeoutMs". `gapTimeoutMs === 0` disables it (heals only via the
+   *  replay itself or the next reconnect). Only ever called with a gap episode pending. */
+  private armGapDeadline(): void {
     this.clearGapTimer();
     if (this.gapTimeoutMs > 0) {
       this.gapTimer = setTimeout(() => this.onGapTimeout(), this.gapTimeoutMs);
@@ -611,13 +665,15 @@ export class LiveSyncClient {
   /** Emit the gap lifecycle signal: a structured `catalyst.replica.gap` log line (the fleet's primary,
    *  Loki-materialized channel — same convention as `catalyst.replica.apply`) + a `result`-style
    *  low-cardinality bump of the `catalyst.replica.gaps` counter. seq_from/seq_to/size ride the log
-   *  line as VALUES, never labels. */
+   *  line as VALUES, never labels. Levels: `detected` and `healed` log at INFO — a gap is the
+   *  steady-state path (every reconcile pass punches one that heals via re-request), so ALERTING MUST
+   *  KEY ON `escalated` ONLY (logged at ERROR); a gap that heals is routine and boring. */
   private recordGap(event: ReplicaGapEvent, gap: { seqFrom: number; seqTo: number; retries: number }): void {
     this.gapCounter.add(1, {
       [CATALYST_ATTR.tenant]: this.accountId,
       [CATALYST_ATTR.gapEvent]: event,
     });
-    this.log(event === "detected" ? "warn" : event === "escalated" ? "error" : "info", REPLICA_LOG.gap, {
+    this.log(event === "escalated" ? "error" : "info", REPLICA_LOG.gap, {
       event,
       seq_from: gap.seqFrom,
       seq_to: gap.seqTo,
@@ -809,5 +865,6 @@ export function parseFrame(data: unknown): ServerFrame | null {
   if (type === "resync") return parsed as ResyncFrame;
   if (type === "change") return parsed as ChangeFrame;
   if (type === "pong") return parsed as PongFrame;
+  if (type === "head") return parsed as HeadFrame;
   return null;
 }

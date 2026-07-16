@@ -31,6 +31,7 @@ export {
   type ResyncFrame,
   type SyncFrame,
   type PongFrame,
+  type HeadFrame,
   type ServerFrame,
 } from "./types.js";
 
