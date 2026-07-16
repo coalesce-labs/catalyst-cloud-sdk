@@ -9,6 +9,7 @@ import {
   type ResyncFrame,
   type SyncFrame,
   type PongFrame,
+  type HeadFrame,
   type EntityName,
   type ChangeOp,
 } from "../src/index";
@@ -112,5 +113,22 @@ describe("wire contract", () => {
   it("PongFrame is {type:'pong'}", () => {
     const frame: PongFrame = { type: "pong" };
     expect(frame.type).toBe("pong");
+  });
+
+  // CTL-1402 end-of-pass head nudge: the mirror broadcasts one {type:"head", seq:<feed head>} after a
+  // reconcile pass whose change_log rows were never individually broadcast, so the client can detect a
+  // trailing gap with no later change frame to trigger from. Transport-internal (never surfaced).
+  it("HeadFrame is {type:'head', seq:number, accountId?}", () => {
+    const frame: HeadFrame = { type: "head", accountId: "tenant-0", seq: 42 };
+    expect(frame.type).toBe("head");
+    expect(frame.seq).toBe(42);
+    const bare: HeadFrame = { type: "head", seq: 7 };
+    expect(bare.accountId).toBeUndefined();
+  });
+
+  it("parseFrame recognizes a head as {type:'head', seq}", () => {
+    const frame = parseFrame(JSON.stringify({ type: "head", accountId: "tenant-0", seq: 42 }));
+    expect(frame?.type).toBe("head");
+    expect((frame as HeadFrame).seq).toBe(42);
   });
 });

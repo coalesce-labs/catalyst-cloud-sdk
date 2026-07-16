@@ -66,6 +66,7 @@ export {
   REPLICA_SPAN,
   REPLICA_STATUS_CODE,
   type ReplicaApplyResult,
+  type ReplicaGapEvent,
   type TelemetryConfig,
 } from "./otel.js";
 

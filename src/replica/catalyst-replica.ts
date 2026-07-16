@@ -145,6 +145,12 @@ export interface CatalystReplicaOptions {
   pingIntervalMs?: number;
   /** Liveness pong deadline in ms after a ping before declaring the socket half-open. Default `15_000`. */
   pongTimeoutMs?: number;
+  /** Gap detection (CTL-1402): ms to wait for a `{type:"sync"}` gap re-request to heal the detected
+   *  hole before retrying/escalating. Default `10_000`; `0` = no deadline. See LiveSyncClientOptions. */
+  gapTimeoutMs?: number;
+  /** Gap detection (CTL-1402): total sync re-requests to spend on one gap before escalating to a full
+   *  /snapshot re-seed. Default `3`. */
+  gapRetryLimit?: number;
   /** Injectable WebSocket factory (tests). Defaults to the runtime global WebSocket. */
   wsFactory?: WebSocketFactory;
   /** Optional structured logger; defaults to console. */
@@ -381,6 +387,8 @@ export class CatalystReplica {
       maxBackoffMs: this.opts.maxBackoffMs,
       pingIntervalMs: this.opts.pingIntervalMs,
       pongTimeoutMs: this.opts.pongTimeoutMs,
+      gapTimeoutMs: this.opts.gapTimeoutMs,
+      gapRetryLimit: this.opts.gapRetryLimit,
       wsFactory: this.opts.wsFactory,
       log: this.log,
       telemetry: this.telemetry,
@@ -515,6 +523,14 @@ export class CatalystReplica {
    *  lets a supervisor tell a quiet feed from a half-open socket the watchdog is about to recover. */
   get lastFrameAt(): number | null {
     return this.client?.lastFrameAt ?? null;
+  }
+
+  /** Epoch ms of the last inbound CHANGE frame (CTL-1402), or null before the first / in reader mode.
+   *  Unlike {@link lastFrameAt} — which the mirror's watchdog auto-pongs also stamp — this only moves
+   *  when the feed pushes data, so a stall supervisor can separate "socket alive" (lastFrameAt fresh)
+   *  from "feed delivering" (lastChangeFrameAt fresh) without the unhealthy-status AND-gate. */
+  get lastChangeFrameAt(): number | null {
+    return this.client?.lastChangeFrameAt ?? null;
   }
 
   /** The raw driver Database the SDK owns — for `drizzle(replica.handle, { schema: mirrorSchema })`. */
@@ -672,7 +688,10 @@ export class CatalystReplica {
           this.applyOpts, // CTC-127: forward-compat filter (auto) + warn-once drift signal.
         );
         // Advance to the seq we SAW (not just applied), so a stale-but-newer-seq delta still moves the
-        // cursor forward and a reconnect doesn't re-request it.
+        // cursor forward and a reconnect doesn't re-request it. Safe ONLY because the transport now
+        // guarantees contiguity (CTL-1402): LiveSyncClient never delivers a frame beyond
+        // deliveredSeq+1 — it holds the cursor at the hole and re-requests the gap — so "seen" here
+        // can no longer seal over an undelivered frame.
         if (frame.seq > this.highWater) setCursor(writeDb, frame.seq, engine.toBindable);
       });
       if (frame.seq > this.highWater) this.highWater = frame.seq;
