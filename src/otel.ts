@@ -51,10 +51,19 @@ export const CATALYST_ATTR = {
   /** The per-frame apply outcome (CTL-1402): `"applied"` | `"skipped"` | `"failed"`. Low-cardinality
    *  — safe as a metric label; seq/entity/err_message are VALUES on the log line, never labels. */
   result: "catalyst.replica.result",
+  /** The gap lifecycle event (CTL-1402 delivery loss): `"detected"` | `"healed"` | `"escalated"`.
+   *  Low-cardinality — safe as a metric label; seq_from/seq_to/size ride the log line as VALUES. */
+  gapEvent: "catalyst.replica.gap_event",
 } as const;
 
 /** The per-frame apply outcome: a row written, dropped by the stale-guard, or a failed transaction. */
 export type ReplicaApplyResult = "applied" | "skipped" | "failed";
+
+/** The seq-gap lifecycle (CTL-1402): a delivery gap was detected on the live feed, healed by a
+ *  `{type:"sync"}` replay re-request, or escalated to a full /snapshot re-seed. This is the detector
+ *  for the failure mode the per-frame apply signal is structurally blind to — a frame that never
+ *  arrives lands in no apply bucket, but it DOES leave a hole in the seq contiguity. */
+export type ReplicaGapEvent = "detected" | "healed" | "escalated";
 
 /** Metric instrument names (OTel metric stream names). */
 export const REPLICA_METRIC = {
@@ -64,6 +73,7 @@ export const REPLICA_METRIC = {
   status: "catalyst.replica.status",
   applied: "catalyst.replica.applied",
   applyBatchRows: "catalyst.replica.apply_batch_rows",
+  gaps: "catalyst.replica.gaps",
 } as const;
 
 /** Structured-log MESSAGE names the daemon's `log` callback routes to Loki, where the fleet's
@@ -72,6 +82,10 @@ export const REPLICA_METRIC = {
 export const REPLICA_LOG = {
   /** Per applied frame: `{result, seq, entity, source, err_message?}`. */
   apply: "catalyst.replica.apply",
+  /** Per gap lifecycle event: `{event, seq_from, seq_to, size, retries}`. `detected` is the alarm the
+   *  CTL-1402 incident lacked; `healed` means the replay redelivered the hole; `escalated` means the
+   *  re-request budget ran out and the client fell back to a full re-seed. */
+  gap: "catalyst.replica.gap",
 } as const;
 
 /** Span names. */

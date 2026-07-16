@@ -718,3 +718,290 @@ describe("LiveSyncClient liveness watchdog (CTC-135)", () => {
     client.stop();
   });
 });
+
+// ── CTL-1402 gap detection + self-healing re-request ──
+// The live push is at-most-once (the mirror's broadcastChange swallows send failures), and before this
+// fix the client advanced its cursor to any seq it SAW — an undelivered frame was sealed over
+// permanently by the next delivered one, with no telemetry (an unarrived frame lands in no apply
+// bucket). These tests pin the new contract: a frame beyond deliveredSeq+1 is never applied; the
+// client re-requests the hole via {type:"sync", after:<deliveredSeq>} (the mirror's replaySince has
+// served client-requested replay since CTC-63); the replayed frames heal the gap through the SAME
+// apply path; bounded retries escalate to the full re-seed; {type:"resync"} is always honoured.
+describe("LiveSyncClient gap detection + self-healing re-request (CTL-1402)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  interface LogLine {
+    level: string;
+    msg: string;
+    extra?: unknown;
+  }
+
+  function makeGapClient(opts: {
+    initialCursor?: number | null;
+    gapTimeoutMs?: number;
+    gapRetryLimit?: number;
+    reseedTo?: number;
+  }) {
+    const store = makeStore(opts.initialCursor ?? 7);
+    const { sockets, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
+    const logs: LogLine[] = [];
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(opts.reseedTo ?? 100),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      onStatus: (s) => statuses.push(s),
+      backoffMs: 1000,
+      maxBackoffMs: 30_000,
+      pingIntervalMs: 0, // liveness watchdog off — isolate the gap machinery
+      gapTimeoutMs: opts.gapTimeoutMs,
+      gapRetryLimit: opts.gapRetryLimit,
+      wsFactory: factory,
+      log: (level, msg, extra) => logs.push({ level, msg, extra }),
+    });
+    return { client, store, sockets, statuses, logs };
+  }
+
+  const change = (seq: number): ChangeFrame => ({
+    type: "change",
+    accountId: "tenant-0",
+    seq,
+    entity: "issues",
+    entityId: `i${seq}`,
+    op: "upsert",
+    row: { id: `i${seq}`, updated_at: seq },
+  });
+  /** All {type:"sync"} control frames this socket has sent, parsed. */
+  const syncsSent = (ws: FakeWebSocket): Array<{ type: string; after: number }> =>
+    ws.sent.map((s) => JSON.parse(s) as { type: string; after: number }).filter((f) => f.type === "sync");
+  /** All catalyst.replica.gap log lines, flattened. */
+  const gapLines = (logs: LogLine[]): Record<string, unknown>[] =>
+    logs
+      .filter((l) => l.msg === "catalyst.replica.gap")
+      .map((l) => ({ level: l.level, ...(l.extra as Record<string, unknown>) }));
+
+  it("contiguous frames apply with no gap re-request and no gap telemetry", () => {
+    const { client, store, sockets, logs } = makeGapClient({ initialCursor: 7 });
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    sockets[0]!.deliver(change(8));
+    sockets[0]!.deliver(change(9));
+    sockets[0]!.deliver(change(10));
+
+    expect(store.applied.map((f) => f.seq)).toEqual([8, 9, 10]);
+    expect(store.getCursor()).toBe(10);
+    expect(syncsSent(sockets[0]!)).toEqual([{ type: "sync", after: 7 }]); // only the on-open sync
+    expect(gapLines(logs)).toEqual([]);
+    client.stop();
+  });
+
+  it("a gap sends exactly one {type:'sync', after:highWater}, holds the cursor at the hole, and the replay heals it", () => {
+    const { client, store, sockets, logs } = makeGapClient({ initialCursor: 7 });
+    void client.start();
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver(change(8)); // contiguous — applied
+
+    sockets[0]!.deliver(change(11)); // seqs 9,10 were never delivered → GAP
+
+    // The gapped frame is NOT applied and the cursor did NOT advance past the hole.
+    expect(store.applied.map((f) => f.seq)).toEqual([8]);
+    expect(store.getCursor()).toBe(8);
+    // Exactly one re-request, from the last delivered seq.
+    expect(syncsSent(sockets[0]!)).toEqual([
+      { type: "sync", after: 7 },
+      { type: "sync", after: 8 },
+    ]);
+    expect(gapLines(logs)).toContainEqual(
+      expect.objectContaining({ level: "warn", event: "detected", seq_from: 9, seq_to: 10, size: 2 }),
+    );
+
+    // The mirror answers the re-request by replaying 9..head as ORDINARY change frames — the same
+    // apply path — which closes the hole; live frames then resume contiguously.
+    sockets[0]!.deliver(change(9));
+    sockets[0]!.deliver(change(10));
+    sockets[0]!.deliver(change(11)); // the dropped trigger frame is redelivered by the replay
+    sockets[0]!.deliver(change(12)); // live resumes
+
+    expect(store.applied.map((f) => f.seq)).toEqual([8, 9, 10, 11, 12]);
+    expect(store.getCursor()).toBe(12);
+    expect(syncsSent(sockets[0]!)).toHaveLength(2); // no further re-request
+    expect(gapLines(logs)).toContainEqual(
+      expect.objectContaining({ level: "info", event: "healed", seq_from: 9, seq_to: 10 }),
+    );
+    client.stop();
+  });
+
+  it("while a re-request is pending, further beyond-gap frames are dropped WITHOUT another sync (no spam)", () => {
+    const { client, store, sockets, logs } = makeGapClient({ initialCursor: 7 });
+    void client.start();
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver(change(8));
+
+    sockets[0]!.deliver(change(11)); // gap detected → one re-request
+    sockets[0]!.deliver(change(13)); // in-flight live pushes beyond the gap…
+    sockets[0]!.deliver(change(14)); // …are dropped; the replay covers them
+
+    expect(store.applied.map((f) => f.seq)).toEqual([8]);
+    expect(syncsSent(sockets[0]!)).toHaveLength(2); // on-open + ONE gap re-request
+    expect(gapLines(logs).filter((l) => l["event"] === "detected")).toHaveLength(1);
+
+    // Replay walks the hole and everything beyond, in order.
+    for (const seq of [9, 10, 11, 12, 13, 14]) sockets[0]!.deliver(change(seq));
+    expect(store.applied.map((f) => f.seq)).toEqual([8, 9, 10, 11, 12, 13, 14]);
+    expect(store.getCursor()).toBe(14);
+    expect(gapLines(logs).filter((l) => l["event"] === "healed")).toHaveLength(1);
+    client.stop();
+  });
+
+  it("duplicates (seq <= highWater) still pass through to onChange (stale-guard dedup semantics preserved)", () => {
+    const { client, store, sockets, logs } = makeGapClient({ initialCursor: 7 });
+    void client.start();
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver(change(8));
+    sockets[0]!.deliver(change(8)); // duplicate — e.g. a live push racing a replay of the same seq
+
+    // Passed through unchanged (the consumer's stale-guard dedups); cursor never moves backward.
+    expect(store.applied.map((f) => f.seq)).toEqual([8, 8]);
+    expect(store.getCursor()).toBe(8);
+    expect(syncsSent(sockets[0]!)).toHaveLength(1); // no gap machinery involved
+    expect(gapLines(logs)).toEqual([]);
+    client.stop();
+  });
+
+  it("an unanswered gap re-request retries on the deadline and ESCALATES to the full re-seed after gapRetryLimit", async () => {
+    vi.useFakeTimers();
+    const { client, store, sockets, statuses, logs } = makeGapClient({
+      initialCursor: 7,
+      gapTimeoutMs: 1000,
+      gapRetryLimit: 3,
+      reseedTo: 100,
+    });
+    void client.start();
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver(change(8));
+    sockets[0]!.deliver(change(11)); // gap → re-request #1 (after 8)
+
+    await vi.advanceTimersByTimeAsync(1000); // deadline → re-request #2
+    await vi.advanceTimersByTimeAsync(1000); // deadline → re-request #3
+    expect(syncsSent(sockets[0]!)).toEqual([
+      { type: "sync", after: 7 },
+      { type: "sync", after: 8 },
+      { type: "sync", after: 8 },
+      { type: "sync", after: 8 },
+    ]);
+    expect(store.reseedCalls.count).toBe(0); // still trying replay
+
+    await vi.advanceTimersByTimeAsync(1000); // budget spent → escalate to reseed
+    await vi.advanceTimersByTimeAsync(0); // flush the async reseed → reopen
+
+    expect(store.reseedCalls.count).toBe(1);
+    expect(statuses).toContain("resyncing");
+    expect(gapLines(logs)).toContainEqual(
+      expect.objectContaining({ level: "error", event: "escalated", seq_from: 9, seq_to: 10, retries: 3 }),
+    );
+    expect(sockets).toHaveLength(2); // reopened after the re-seed
+    sockets[1]!.fireOpen();
+    expect(sockets[1]!.lastSent()).toEqual({ type: "sync", after: 100 }); // fresh post-seed cursor
+    // The old gap is gone: the next live frame from the fresh cursor applies cleanly.
+    sockets[1]!.deliver(change(101));
+    expect(store.getCursor()).toBe(101);
+    client.stop();
+  });
+
+  it("{type:'resync'} answering a gap re-request triggers the existing full re-seed (never a silent no-op)", async () => {
+    const { client, store, sockets, logs } = makeGapClient({ initialCursor: 7, reseedTo: 50 });
+    void client.start();
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver(change(8));
+    sockets[0]!.deliver(change(11)); // gap → re-request
+    expect(syncsSent(sockets[0]!)).toHaveLength(2);
+
+    // The hole predates the mirror's retained window → replaySince answers resync → full re-seed.
+    sockets[0]!.deliver({ type: "resync", accountId: "tenant-0" });
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+
+    expect(store.reseedCalls.count).toBe(1);
+    expect(store.getCursor()).toBe(50);
+    sockets[1]!.fireOpen();
+    expect(sockets[1]!.lastSent()).toEqual({ type: "sync", after: 50 });
+    // The pending gap was superseded by the re-seed — no stray heal/escalate afterwards.
+    expect(gapLines(logs).map((l) => l["event"])).toEqual(["detected"]);
+    client.stop();
+  });
+
+  it("replay-to-live boundary: catch-up replay then the first live frame do NOT false-positive", () => {
+    const { client, store, sockets, logs } = makeGapClient({ initialCursor: 5 });
+    void client.start();
+    sockets[0]!.fireOpen(); // sync after 5 → server replays 6..8, then live 9 arrives
+    for (const seq of [6, 7, 8]) sockets[0]!.deliver(change(seq)); // the replay
+    sockets[0]!.deliver(change(9)); // first LIVE frame — legitimately highWater+1
+
+    expect(store.applied.map((f) => f.seq)).toEqual([6, 7, 8, 9]);
+    expect(syncsSent(sockets[0]!)).toHaveLength(1); // never re-requested
+    expect(gapLines(logs)).toEqual([]);
+    client.stop();
+  });
+
+  it("no baseline (cursor 0): the first frame is accepted at any seq; detection arms from then on", () => {
+    const { client, store, sockets, logs } = makeGapClient({ initialCursor: 0 });
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    sockets[0]!.deliver(change(5)); // highWater 0 = nothing to be contiguous with → accepted
+    expect(store.applied.map((f) => f.seq)).toEqual([5]);
+    expect(gapLines(logs)).toEqual([]);
+
+    sockets[0]!.deliver(change(8)); // baseline now 5 → 8 skips 6,7 → detected
+    expect(store.applied.map((f) => f.seq)).toEqual([5]);
+    expect(gapLines(logs)).toContainEqual(
+      expect.objectContaining({ event: "detected", seq_from: 6, seq_to: 7 }),
+    );
+    client.stop();
+  });
+
+  it("a reconnect during an unhealed gap re-syncs from the durable cursor — the hole is never sealed", () => {
+    vi.useFakeTimers();
+    const { client, store, sockets } = makeGapClient({ initialCursor: 7 });
+    void client.start();
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver(change(8));
+    sockets[0]!.deliver(change(11)); // gap: 9,10 missing; cursor held at 8
+
+    sockets[0]!.fireServerClose(); // socket dies mid-gap
+    vi.advanceTimersByTime(1000); // backoff reconnect
+    expect(sockets).toHaveLength(2);
+    sockets[1]!.fireOpen();
+
+    // The on-open sync re-requests from the durable cursor (8) — NOT from the gapped 11.
+    expect(sockets[1]!.lastSent()).toEqual({ type: "sync", after: 8 });
+    // The replay on the new socket heals the hole through the same path.
+    for (const seq of [9, 10, 11]) sockets[1]!.deliver(change(seq));
+    expect(store.getCursor()).toBe(11);
+    client.stop();
+  });
+
+  it("lastChangeFrameAt moves only on change frames — auto-pongs stamp lastFrameAt but not it", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { client, sockets } = makeGapClient({ initialCursor: 7 });
+    void client.start();
+    sockets[0]!.fireOpen();
+    expect(client.lastChangeFrameAt).toBeNull();
+
+    vi.advanceTimersByTime(500);
+    sockets[0]!.deliver({ type: "pong" }); // socket alive — but the feed pushed nothing
+    expect(client.lastFrameAt).toBe(500);
+    expect(client.lastChangeFrameAt).toBeNull();
+
+    vi.advanceTimersByTime(100);
+    sockets[0]!.deliver(change(8)); // the feed actually delivered
+    expect(client.lastChangeFrameAt).toBe(600);
+    client.stop();
+  });
+});

@@ -441,3 +441,50 @@ describe("CatalystReplica apply-result telemetry (CTL-1402)", () => {
     expect(String(failed!["err_message"])).toContain("unknown entity");
   });
 });
+
+// ── CTL-1402: the catalyst.replica.gaps counter (gap detected/healed as low-cardinality OTLP) ─────
+describe("CatalystReplica gap telemetry counter (CTL-1402)", () => {
+  it("bumps catalyst.replica.gaps with gap_event=detected then healed across a gap episode", async () => {
+    const { reader } = installProviders();
+    const { sockets, factory } = recordingFactory();
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: snapshotFetch([], 5),
+        wsFactory: factory,
+        telemetry: true,
+      }),
+    );
+    await startToLive(replica, sockets);
+
+    const frame = (seq: number) => ({
+      type: "change",
+      accountId: "tenant-0",
+      seq,
+      entity: "issues",
+      entityId: `i${seq}`,
+      op: "upsert",
+      row: { id: `i${seq}`, identifier: `CTC-${seq}`, title: `t${seq}`, updated_at: seq },
+    });
+    sockets[0]!.deliver(frame(6)); // contiguous
+    sockets[0]!.deliver(frame(9)); // gap (7,8) → detected
+    sockets[0]!.deliver(frame(7)); // replay…
+    sockets[0]!.deliver(frame(8));
+    sockets[0]!.deliver(frame(9)); // …heals
+
+    const { byName } = await collect(reader);
+    const gaps = byName.get("catalyst.replica.gaps")!;
+    const byEvent = new Map(
+      gaps.dataPoints.map((p) => [p.attributes["catalyst.replica.gap_event"], p]),
+    );
+    expect(Number(byEvent.get("detected")!.value)).toBe(1);
+    expect(Number(byEvent.get("healed")!.value)).toBe(1);
+    expect(byEvent.get("detected")!.attributes["catalyst.tenant"]).toBe("tenant-0");
+    expect(byEvent.has("escalated")).toBe(false); // the replay healed it — no re-seed
+    expect(replica.cursor).toBe(9);
+  });
+});

@@ -610,3 +610,107 @@ describe("CatalystReplica default engine + teardown", () => {
     await replica.close(); // idempotent — no throw
   });
 });
+
+// ── CTL-1402: gap detection end-to-end over a REAL sqlite replica ──
+// The keystone contract: an undelivered live frame must never be sealed over by the durable cursor.
+// A frame arriving beyond cursor+1 is held back, the client re-requests the hole with
+// {type:"sync", after:<cursor>}, and the mirror's replay (ordinary change frames) heals it through
+// the SAME applyFrame path — then live frames resume.
+describe("CatalystReplica gap detection + self-healing (CTL-1402)", () => {
+  interface LogLine {
+    level: string;
+    msg: string;
+    extra: Record<string, unknown>;
+  }
+  const gapLines = (logs: LogLine[]): Record<string, unknown>[] =>
+    logs
+      .filter((l) => l.msg === "catalyst.replica.gap")
+      .map((l) => ({ level: l.level, ...l.extra }));
+  const issueFrame = (seq: number) => ({
+    type: "change",
+    accountId: "tenant-0",
+    seq,
+    entity: "issues",
+    entityId: `i${seq}`,
+    op: "upsert",
+    row: { id: `i${seq}`, identifier: `CTC-${seq}`, title: `t${seq}`, updated_at: seq },
+  });
+
+  it("holds the DURABLE cursor at the hole, re-requests the gap, and heals via the replayed frames", async () => {
+    const logs: LogLine[] = [];
+    const { sockets, factory } = recordingFactory();
+    const seed = bufferedSnapshotFetch([], 5); // seeded, cursor 5
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: seed.fetchImpl,
+        wsFactory: factory,
+        log: (level, msg, extra) =>
+          logs.push({ level, msg, extra: (extra ?? {}) as Record<string, unknown> }),
+      }),
+    );
+    await startToLive(replica, sockets);
+    expect(replica.cursor).toBe(5);
+
+    sockets[0]!.deliver(issueFrame(6)); // contiguous — applied
+    expect(replica.cursor).toBe(6);
+
+    sockets[0]!.deliver(issueFrame(9)); // 7,8 never delivered → GAP
+
+    // THE KEYSTONE ASSERTION: the durable cursor did NOT advance past the hole (pre-fix it went to 9,
+    // sealing seqs 7-8 permanently), the gapped row was NOT applied, and a re-request went out.
+    expect(replica.cursor).toBe(6);
+    expect(replica.issues().map((v) => v.id).sort()).toEqual(["i6"]);
+    expect(sockets[0]!.sent).toContain(JSON.stringify({ type: "sync", after: 6 }));
+    expect(gapLines(logs)).toContainEqual(
+      expect.objectContaining({ event: "detected", seq_from: 7, seq_to: 8, size: 2 }),
+    );
+
+    // The mirror replays 7..9 as ordinary change frames — same apply path — closing the hole.
+    sockets[0]!.deliver(issueFrame(7));
+    sockets[0]!.deliver(issueFrame(8));
+    sockets[0]!.deliver(issueFrame(9));
+    expect(replica.cursor).toBe(9);
+    expect(replica.issues().map((v) => v.id).sort()).toEqual(["i6", "i7", "i8", "i9"]);
+    expect(gapLines(logs)).toContainEqual(expect.objectContaining({ event: "healed" }));
+
+    // Live resumes; the apply log carries every recovered frame (7,8,9 all landed as "applied").
+    sockets[0]!.deliver(issueFrame(10));
+    expect(replica.cursor).toBe(10);
+    const appliedSeqs = logs
+      .filter((l) => l.msg === "catalyst.replica.apply" && l.extra["result"] === "applied")
+      .map((l) => l.extra["seq"]);
+    expect(appliedSeqs).toEqual([6, 7, 8, 9, 10]);
+  });
+
+  it("exposes lastChangeFrameAt (feed-delivery liveness), distinct from lastFrameAt (any-bytes liveness)", async () => {
+    const { sockets, factory } = recordingFactory();
+    const seed = bufferedSnapshotFetch([], 0);
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: seed.fetchImpl,
+        wsFactory: factory,
+      }),
+    );
+    await startToLive(replica, sockets);
+    expect(replica.lastChangeFrameAt).toBeNull();
+
+    sockets[0]!.deliver({ type: "pong" }); // the mirror's watchdog auto-pong: socket alive, no data
+    expect(replica.lastFrameAt).not.toBeNull();
+    expect(replica.lastChangeFrameAt).toBeNull(); // pongs must NOT look like feed progress
+
+    const before = Date.now();
+    sockets[0]!.deliver(issueFrame(1));
+    expect(replica.lastChangeFrameAt).not.toBeNull();
+    expect(replica.lastChangeFrameAt!).toBeGreaterThanOrEqual(before);
+  });
+});
