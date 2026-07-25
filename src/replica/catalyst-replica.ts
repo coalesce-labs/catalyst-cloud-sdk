@@ -145,6 +145,25 @@ export interface CatalystReplicaOptions {
   pingIntervalMs?: number;
   /** Liveness pong deadline in ms after a ping before declaring the socket half-open. Default `15_000`. */
   pongTimeoutMs?: number;
+  /** Connect/open deadline for each WS attempt (CTC-281): ms to wait for `onopen` before tearing the
+   *  attempt down and backoff-reconnecting. Default `20_000`; `0` disables. See LiveSyncClientOptions. */
+  openTimeoutMs?: number;
+  /**
+   * Snapshot NO-PROGRESS bound (CTC-281): abort the /snapshot seed if neither the response headers
+   * nor a body chunk arrive for this many ms. Deliberately an IDLE timeout, not a total-duration one —
+   * a large tenant's seed may legitimately stream for minutes, but a healthy stream never goes silent;
+   * a half-open /snapshot connection (the fleet-incident network profile) previously hung the fetch /
+   * body read forever, wedging the client in "resyncing" with no socket and no timers (restart-only).
+   * On abort the seed rejects and the transport retries through the normal backoff path. Default
+   * `30_000`; `0` disables.
+   */
+  snapshotIdleTimeoutMs?: number;
+  /** Transport-level TOTAL-duration backstop on any reseed (CTC-281): ms the LiveSyncClient waits for
+   *  seedFromSnapshot to settle before abandoning the attempt and backoff-reconnecting. Redundant in
+   *  the common case (the IDLE abort above already fails a dead stream fast) — it exists so a hung
+   *  reseed can never be a zero-timer wedge. Raise it if a very large tenant's seed legitimately
+   *  streams longer. Default `600_000`; `0` disables. See LiveSyncClientOptions. */
+  reseedTimeoutMs?: number;
   /** Gap detection (CTL-1402): ms to wait for a `{type:"sync"}` gap re-request to heal the detected
    *  hole before retrying/escalating. Default `10_000`; `0` = no deadline. See LiveSyncClientOptions. */
   gapTimeoutMs?: number;
@@ -165,7 +184,9 @@ export interface CatalystReplicaOptions {
   /**
    * If set, `start()` rejects with a clear error if it doesn't reach `live` within this many ms (e.g.
    * a wedged cold /snapshot), AFTER cleaning up — so a supervisor can fail-fast/restart instead of
-   * hanging. Off by default.
+   * hanging. Off by default. NOTE: the deadline bounds the seed/connect-to-live leg only — the
+   * engine-open/migrate/telemetry phase that precedes it (dynamic driver import, a lock-stuck
+   * migration) runs before the timer is armed.
    */
   startTimeoutMs?: number;
   /**
@@ -232,6 +253,13 @@ export class CatalystReplica {
   private readonlyMode = false;
   /** The claimed single-writer lock (writers only; null for readers / `:memory:` / disabled). */
   private writerLock: WriterLockHandle | null = null;
+
+  /** The in-flight seed's AbortController (CTC-281), or null when no seed is running. close() aborts
+   *  it SYNCHRONOUSLY so the pending /snapshot fetch + body read release their connection instead of
+   *  keeping the event loop referenced after close() resolved — the "close() succeeded but the
+   *  process can't exit" hostage mechanism from the incident chain. Also the seed idle-timeout's
+   *  abort seam. One controller per seed RUN (a retried seed gets a fresh one). */
+  private seedAbort: AbortController | null = null;
 
   /** Resolved on the first 'live' status (start() = caught-up + ready to read); rejected on close /
    *  an initial seed failure. */
@@ -387,6 +415,8 @@ export class CatalystReplica {
       maxBackoffMs: this.opts.maxBackoffMs,
       pingIntervalMs: this.opts.pingIntervalMs,
       pongTimeoutMs: this.opts.pongTimeoutMs,
+      openTimeoutMs: this.opts.openTimeoutMs,
+      reseedTimeoutMs: this.opts.reseedTimeoutMs,
       gapTimeoutMs: this.opts.gapTimeoutMs,
       gapRetryLimit: this.opts.gapRetryLimit,
       wsFactory: this.opts.wsFactory,
@@ -453,6 +483,16 @@ export class CatalystReplica {
     if (this.closed) return;
     this.closed = true;
     this.client?.stop();
+    // Abort any in-flight seed SYNCHRONOUSLY (CTC-281) — never await its settlement (close() must
+    // stay one-tick). Without this, the pending /snapshot fetch + un-cancelled body reader kept the
+    // TCP connection referenced after close() resolved, holding a supervised process's exit hostage.
+    // stop() ran first, so the seed's rejection lands in paths that already refuse to reopen.
+    try {
+      this.seedAbort?.abort(new Error("CatalystReplica closed"));
+    } catch (err) {
+      this.log("warn", "seed abort threw", err);
+    }
+    this.seedAbort = null;
     const rej = this.liveReject;
     this.clearLiveDeferred();
     rej?.(new Error("CatalystReplica: closed before first 'live'"));
@@ -778,72 +818,131 @@ export class CatalystReplica {
         const engine = this.engine as ReplicaEngine;
         const writeDb = this.writeDb as ReplicaWriteDb<unknown>;
 
-        const url = `${this.baseUrl}/snapshot?account=${encodeURIComponent(this.opts.account)}`;
-        const res = await this.fetchImpl(url, { headers: this.feedHeaders() });
-        if (!res.ok) throw new Error(`/snapshot ${res.status}`);
+        // CTC-281: one AbortController per seed run, published on the instance so close() can abort
+        // it synchronously. Every await below (fetch, each body chunk) is bounded by it — a hung
+        // /snapshot can no longer wedge the transport in "resyncing" (no socket, no timers) or keep
+        // the event loop referenced after close().
+        if (this.closed) throw new Error("CatalystReplica: seed aborted (already closed)");
+        const abort = new AbortController();
+        this.seedAbort = abort;
 
-        // CTC-137: the /snapshot response is the SINGLE HTTP Response the SDK reads, so it is the one
-        // place to learn the mirror's head_seq (+ server clock). Stashed for the lag_seq gauge, which
-        // only emits while head_seq is known. Guarded: test fetch stand-ins return no `headers`.
-        this.readHeadSeqHeaders(res);
-
-        // Invalidate the cursor BEFORE truncating so a crash mid-seed re-seeds rather than going live over
-        // an empty replica from a stale cursor.
-        engine.run("DELETE FROM sync_meta WHERE key = 'cursor'");
-        engine.transaction(() => truncateReplica(writeDb));
-
-        let cursor = 0;
-        let batch: SnapshotLine[] = [];
-        const flush = (): void => {
-          if (batch.length === 0) return;
-          const rows = batch;
-          batch = [];
-          // The literal batched-apply seam: one transaction per ≤SEED_BATCH_ROWS rows → its own span.
-          this.telemetry.withActiveSpanSync(
-            REPLICA_SPAN.applyBatch,
-            { [CATALYST_ATTR.tenant]: this.opts.account, [CATALYST_ATTR.batchRows]: rows.length },
-            () => {
-              engine.transaction(() => {
-                for (const rec of rows) {
-                  if (rec.entity === undefined) continue;
-                  applyDelta(
-                    writeDb,
-                    { entity: rec.entity, op: rec.op ?? "upsert", row: rec.row ?? {} },
-                    engine.toBindable,
-                    this.applyOpts, // CTC-127: forward-compat filter (auto) + warn-once drift signal.
-                  );
-                }
-              });
-            },
-          );
-          this.applyBatchHistogram.record(rows.length, { [CATALYST_ATTR.tenant]: this.opts.account });
-        };
-
-        let rowCount = 0;
-        for await (const line of iterateNdjson(res)) {
-          const rec = JSON.parse(line) as SnapshotLine;
-          if (typeof rec.cursor === "number") {
-            cursor = rec.cursor; // the FINAL line carries the cursor
-            continue;
+        // The idle (NO-PROGRESS) deadline: (re)armed before the fetch and on every body chunk, so a
+        // big-but-flowing seed never trips it while a silent half-open connection always does.
+        // Unref'd — the timer must never itself hold the process open.
+        const idleMs = this.opts.snapshotIdleTimeoutMs ?? 30_000;
+        let idleTimer: ReturnType<typeof setTimeout> | null = null;
+        const clearIdle = (): void => {
+          if (idleTimer != null) {
+            clearTimeout(idleTimer);
+            idleTimer = null;
           }
-          batch.push(rec);
-          rowCount++;
-          if (batch.length >= SEED_BATCH_ROWS) flush();
-        }
-        flush();
+        };
+        const armIdle = (): void => {
+          clearIdle();
+          if (idleMs <= 0) return;
+          idleTimer = setTimeout(() => {
+            abort.abort(new Error(`/snapshot made no progress for ${idleMs}ms (idle timeout, CTC-281)`));
+          }, idleMs);
+          (idleTimer as unknown as { unref?: () => void }).unref?.();
+        };
+        /** The abort reason as a throwable Error (close() and the idle deadline both pass one). */
+        const abortError = (): Error =>
+          abort.signal.reason instanceof Error
+            ? abort.signal.reason
+            : new Error("CatalystReplica: seed aborted");
 
-        engine.transaction(() => setCursor(writeDb, cursor, engine.toBindable));
-        this.highWater = cursor;
-        this.lastAppliedAtMs = Date.now(); // a completed seed refreshes freshness_ms
-        span.setAttribute(CATALYST_ATTR.rowCount, rowCount);
-        span.setAttribute(CATALYST_ATTR.cursor, cursor);
-        this.log("info", `snapshot seeded (${rowCount} rows), cursor=${cursor}`);
         try {
-          this.opts.onChange?.();
+          const url = `${this.baseUrl}/snapshot?account=${encodeURIComponent(this.opts.account)}`;
+          armIdle(); // bounds the headers phase
+          const res = await this.fetchImpl(url, { headers: this.feedHeaders(), signal: abort.signal });
+          armIdle(); // headers arrived — progress
+          if (!res.ok) throw new Error(`/snapshot ${res.status}`);
+
+          // CTC-137: the /snapshot response is the SINGLE HTTP Response the SDK reads, so it is the one
+          // place to learn the mirror's head_seq (+ server clock). Stashed for the lag_seq gauge, which
+          // only emits while head_seq is known. Guarded: test fetch stand-ins return no `headers`.
+          this.readHeadSeqHeaders(res);
+
+          // Never write to a closed engine (CTC-281): close() runs synchronously between our awaits,
+          // so re-check before the first write — and again before the final cursor commit below.
+          if (this.closed || abort.signal.aborted) throw abortError();
+
+          // Invalidate the cursor BEFORE truncating so a crash mid-seed re-seeds rather than going live over
+          // an empty replica from a stale cursor.
+          engine.run("DELETE FROM sync_meta WHERE key = 'cursor'");
+          engine.transaction(() => truncateReplica(writeDb));
+
+          let cursor = 0;
+          let batch: SnapshotLine[] = [];
+          const flush = (): void => {
+            if (batch.length === 0) return;
+            if (this.closed) throw abortError(); // CTC-281: never apply a batch into a closed engine
+            const rows = batch;
+            batch = [];
+            // The literal batched-apply seam: one transaction per ≤SEED_BATCH_ROWS rows → its own span.
+            this.telemetry.withActiveSpanSync(
+              REPLICA_SPAN.applyBatch,
+              { [CATALYST_ATTR.tenant]: this.opts.account, [CATALYST_ATTR.batchRows]: rows.length },
+              () => {
+                engine.transaction(() => {
+                  for (const rec of rows) {
+                    if (rec.entity === undefined) continue;
+                    applyDelta(
+                      writeDb,
+                      { entity: rec.entity, op: rec.op ?? "upsert", row: rec.row ?? {} },
+                      engine.toBindable,
+                      this.applyOpts, // CTC-127: forward-compat filter (auto) + warn-once drift signal.
+                    );
+                  }
+                });
+              },
+            );
+            this.applyBatchHistogram.record(rows.length, { [CATALYST_ATTR.tenant]: this.opts.account });
+          };
+
+          let rowCount = 0;
+          // The body stream rides the same abort seam: each chunk re-arms the idle deadline, and an
+          // abort (close() or the deadline) cancels the reader so a pending read() settles promptly.
+          for await (const line of iterateNdjson(res, { signal: abort.signal, onProgress: armIdle })) {
+            const rec = JSON.parse(line) as SnapshotLine;
+            if (typeof rec.cursor === "number") {
+              cursor = rec.cursor; // the FINAL line carries the cursor
+              continue;
+            }
+            batch.push(rec);
+            rowCount++;
+            if (batch.length >= SEED_BATCH_ROWS) flush();
+          }
+          flush();
+
+          // Same closed-engine guard before the final commit (see above) — an abort that raced the last
+          // chunk must not stamp a cursor over a truncated replica.
+          if (this.closed || abort.signal.aborted) throw abortError();
+          engine.transaction(() => setCursor(writeDb, cursor, engine.toBindable));
+          this.highWater = cursor;
+          this.lastAppliedAtMs = Date.now(); // a completed seed refreshes freshness_ms
+          span.setAttribute(CATALYST_ATTR.rowCount, rowCount);
+          span.setAttribute(CATALYST_ATTR.cursor, cursor);
+          this.log("info", `snapshot seeded (${rowCount} rows), cursor=${cursor}`);
+          try {
+            this.opts.onChange?.();
+          } catch (err) {
+            this.log("warn", "onChange handler threw", err);
+          }
+          return cursor;
         } catch (err) {
-          this.log("warn", "onChange handler threw", err);
+          // A close()-triggered abort is NORMAL teardown, not a failure: log at info and rethrow so
+          // the callers' existing recovery paths run (the resync catch logs-and-backs-off; the
+          // cold-start rejection is absorbed by the already-cleared live deferred). The interrupted
+          // seed self-heals on the next boot — the cursor row was deleted up front.
+          if (this.closed) {
+            this.log("info", "seed aborted by close() — normal during teardown (CTC-281)");
+          }
+          throw err;
+        } finally {
+          clearIdle();
+          if (this.seedAbort === abort) this.seedAbort = null;
         }
-        return cursor;
       },
     );
   }
@@ -877,30 +976,67 @@ export class CatalystReplica {
  * Iterate an NDJSON Response as non-empty lines. Streams `response.body` (chunked + partial-line
  * buffered) when present — the production path that never buffers the whole snapshot; falls back to a
  * buffered `await res.text()` when the body is absent (e.g. a test fetch stand-in).
+ *
+ * Cancellation (CTC-281): `opts.signal` bounds the read loop — on abort the reader is cancelled, which
+ * settles a pending `read()` promptly ({done:true}) EVEN when the Response was never wired to the
+ * signal (injected fetch stand-ins), and the loop then throws the abort reason. The `finally` ALWAYS
+ * cancels the reader: an abnormal exit in the CALLER (a JSON.parse throw, a closed-engine throw)
+ * previously ended the generator with the body still locked, leaving the connection referenced —
+ * a leaked handle that held process exit hostage after close(). `opts.onProgress` fires per chunk
+ * (the seed's idle-deadline refund).
  */
-async function* iterateNdjson(res: Response): AsyncGenerator<string> {
+async function* iterateNdjson(
+  res: Response,
+  opts?: { signal?: AbortSignal; onProgress?: () => void },
+): AsyncGenerator<string> {
+  const signal = opts?.signal;
+  const throwIfAborted = (): void => {
+    if (!signal?.aborted) return;
+    throw signal.reason instanceof Error ? signal.reason : new Error("snapshot read aborted");
+  };
   const body = res.body;
   if (body && typeof body.getReader === "function") {
     const reader = body.getReader();
+    const onAbort = (): void => {
+      void reader.cancel().catch(() => {
+        // already released/closed — the abort still surfaces via throwIfAborted
+      });
+    };
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
     const decoder = new TextDecoder();
     let buf = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let nl: number;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl);
-        buf = buf.slice(nl + 1);
-        if (line.length > 0) yield line;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        throwIfAborted(); // an abort settles read() via cancel — surface it as an error, not EOF
+        if (done) break;
+        opts?.onProgress?.();
+        buf += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line.length > 0) yield line;
+        }
       }
-    }
-    buf += decoder.decode();
-    if (buf.length > 0) {
-      for (const line of buf.split("\n")) if (line.length > 0) yield line;
+      buf += decoder.decode();
+      if (buf.length > 0) {
+        for (const line of buf.split("\n")) if (line.length > 0) yield line;
+      }
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+      try {
+        await reader.cancel(); // release the body/connection on EVERY exit path (no-op when done)
+      } catch {
+        // already released/closed
+      }
     }
     return;
   }
   const text = await res.text();
+  throwIfAborted();
   for (const line of text.split("\n")) if (line.length > 0) yield line;
 }
