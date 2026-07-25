@@ -714,3 +714,348 @@ describe("CatalystReplica gap detection + self-healing (CTL-1402)", () => {
     expect(replica.lastChangeFrameAt!).toBeGreaterThanOrEqual(before);
   });
 });
+
+// ── CTC-281: bounded teardown + seed abort ──
+// In the Jul 17-23 fleet incident an unbounded /snapshot seed produced two distinct failure shapes:
+// (a) close() resolved but the un-aborted fetch / un-cancelled body reader kept the connection
+// referenced — the event loop never drained and a supervised process's exit was held hostage; and
+// (b) without close(), a half-open /snapshot connection hung the reseed forever, wedging the
+// transport in 'resyncing' with no socket and no timers (restart-only — the W3 wedge). These tests
+// pin the contract: close() ALWAYS settles promptly and aborts the in-flight seed; a no-progress
+// seed aborts itself via snapshotIdleTimeoutMs; and neither path writes into a closed engine.
+describe("CatalystReplica bounded teardown + seed abort (CTC-281)", () => {
+  /** Fail the test if `p` does not settle within `ms` REAL milliseconds — the promptness contract. */
+  function settlesWithin(p: Promise<unknown>, ms: number, what: string): Promise<unknown> {
+    return Promise.race([
+      p,
+      new Promise((_resolve, reject) =>
+        setTimeout(() => reject(new Error(`${what} did not settle within ${ms}ms`)), ms),
+      ),
+    ]);
+  }
+
+  it("close() during an in-flight /snapshot fetch aborts it and settles promptly (no exit-hostage handle)", async () => {
+    const { sockets, factory } = recordingFactory();
+    const fetchState = { called: false, aborted: false, reason: undefined as unknown };
+    // A half-open server: the fetch never settles on its own. A REAL fetch rejects when its signal
+    // aborts — mirror that, and record the abort so the test can prove the handle was released.
+    const fetchImpl = ((_url: string, init?: { signal?: AbortSignal }) =>
+      new Promise<Response>((_resolve, reject) => {
+        fetchState.called = true;
+        init?.signal?.addEventListener("abort", () => {
+          fetchState.aborted = true;
+          fetchState.reason = init.signal?.reason;
+          reject(init.signal?.reason ?? new Error("aborted"));
+        });
+      })) as unknown as typeof fetch;
+
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl,
+        wsFactory: factory,
+      }),
+    );
+    const started = replica.start();
+    started.catch(() => {}); // rejects on close — asserted below; pre-register so vitest sees it handled
+    await vi.waitFor(() => expect(fetchState.called).toBe(true));
+    expect(sockets).toHaveLength(0); // cold path: mid-seed, no socket, no timers — the W3 wedge shape
+
+    await settlesWithin(replica.close(), 250, "close() with a pending /snapshot fetch");
+    expect(fetchState.aborted).toBe(true); // the fetch handle was aborted, not orphaned
+    await expect(started).rejects.toThrow(/closed before/);
+  });
+
+  it("close() during a STALLED /snapshot body stream cancels the reader and settles promptly", async () => {
+    const { sockets, factory } = recordingFactory();
+    const streamState = { firstChunkSent: false };
+    const fetchImpl = (async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              JSON.stringify({
+                accountId: "tenant-0",
+                entity: "issues",
+                op: "upsert",
+                row: { id: "i1", identifier: "CTC-1", title: "partial", updated_at: 1 },
+              }) + "\n",
+            ),
+          );
+          streamState.firstChunkSent = true;
+          // …then the connection half-opens: no more chunks, no close — reader.read() pends forever.
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl,
+        wsFactory: factory,
+      }),
+    );
+    const started = replica.start();
+    started.catch(() => {});
+    await vi.waitFor(() => expect(streamState.firstChunkSent).toBe(true));
+    expect(sockets).toHaveLength(0); // still seeding
+
+    await settlesWithin(replica.close(), 250, "close() with a stalled snapshot body");
+    await expect(started).rejects.toThrow(/closed before/);
+  });
+
+  it("close() resolves even when engine.close() throws (teardown never propagates)", async () => {
+    const { sockets, factory } = recordingFactory();
+    const seed = bufferedSnapshotFetch([], 0);
+    const real = await nodeSqliteEngine(":memory:");
+    // Same engine, hostile close — the contract is that close() absorbs it (it already try/catches).
+    const engine: ReplicaEngine = {
+      ...real,
+      close: () => {
+        throw new Error("engine close boom");
+      },
+    };
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine,
+        fetchImpl: seed.fetchImpl,
+        wsFactory: factory,
+      }),
+    );
+    await startToLive(replica, sockets);
+    await settlesWithin(replica.close(), 250, "close() with a throwing engine.close()");
+    expect(replica.status).toBe("stopped");
+    real.close(); // release the real handle the wrapper shadowed
+  });
+
+  it("snapshotIdleTimeoutMs: a no-progress /snapshot aborts the seed — start() fails fast instead of wedging in 'resyncing' forever (W3)", async () => {
+    vi.useFakeTimers();
+    const { sockets, factory } = recordingFactory();
+    const fetchImpl = (async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // One chunk of progress, then the incident profile: silence with the stream still open.
+          controller.enqueue(
+            new TextEncoder().encode(
+              JSON.stringify({
+                accountId: "tenant-0",
+                entity: "issues",
+                op: "upsert",
+                row: { id: "i1", identifier: "CTC-1", title: "stalls after this", updated_at: 1 },
+              }) + "\n",
+            ),
+          );
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl,
+        wsFactory: factory,
+        snapshotIdleTimeoutMs: 1000,
+      }),
+    );
+    const started = replica.start();
+    started.catch(() => {});
+
+    // One full idle window with zero progress → the deadline aborts the read → the seed REJECTS
+    // (pre-fix: reader.read() pended forever with nothing else scheduled — restart-only).
+    await vi.advanceTimersByTimeAsync(1000);
+    await expect(started).rejects.toThrow(/no progress/);
+    expect(sockets).toHaveLength(0); // it failed FAST; the supervisor owns the restart policy
+  });
+
+  it("snapshotIdleTimeoutMs is an IDLE bound, not a total-duration one: a slow-but-progressing seed completes", async () => {
+    vi.useFakeTimers();
+    const rows = [1, 2, 3, 4].map(
+      (i) =>
+        JSON.stringify({
+          accountId: "tenant-0",
+          entity: "issues",
+          op: "upsert",
+          row: { id: `i${i}`, identifier: `CTC-${i}`, title: `drip ${i}`, updated_at: i },
+        }) + "\n",
+    );
+    const fetchImpl = (async () => {
+      const enc = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // Drip one row every 800ms — each gap is UNDER the 1000ms idle window, but the whole seed
+          // takes 4s, far beyond it. A total-duration timeout would wrongly kill this big seed.
+          let idx = 0;
+          const tick = (): void => {
+            if (idx < rows.length) {
+              controller.enqueue(enc.encode(rows[idx] ?? ""));
+              idx += 1;
+              setTimeout(tick, 800);
+            } else {
+              controller.enqueue(enc.encode(JSON.stringify({ accountId: "tenant-0", cursor: 9 }) + "\n"));
+              controller.close();
+            }
+          };
+          setTimeout(tick, 800);
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const { sockets, factory } = recordingFactory();
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl,
+        wsFactory: factory,
+        snapshotIdleTimeoutMs: 1000,
+      }),
+    );
+    const started = replica.start();
+    await vi.advanceTimersByTimeAsync(800 * 5 + 1); // drive the drip past the final cursor line
+
+    expect(sockets).toHaveLength(1); // the seed COMPLETED and the transport moved on to /connect
+    sockets[0]!.fireOpen();
+    await started;
+    expect(replica.cursor).toBe(9);
+    expect(replica.issues().map((v) => v.id).sort()).toEqual(["i1", "i2", "i3", "i4"]);
+  });
+
+  // The finally-block reader.cancel() in iterateNdjson is the C1 guarantee for ABNORMAL CALLER exits:
+  // the two tests above only exercise the abort-driven paths (close() / the idle deadline), where the
+  // onAbort listener cancels the reader — delete the finally cancel and they still pass. These two pin
+  // the non-abort path: the CALLER throws (a malformed NDJSON line → JSON.parse), the for-await
+  // unwinds the generator, and the finally MUST still cancel the reader — otherwise the /snapshot body
+  // stays locked with its connection referenced (a leaked handle per retry, and after close() the
+  // accumulated handles hold the supervised process's exit hostage — the incident-chain mechanism).
+  it("a malformed NDJSON snapshot line rejects the cold seed AND cancels the body reader (the finally path — no abort involved)", async () => {
+    const { sockets, factory } = recordingFactory();
+    const cancelState = { cancelled: false };
+    const enc = new TextEncoder();
+    const fetchImpl = (async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            enc.encode(
+              JSON.stringify({
+                accountId: "tenant-0",
+                entity: "issues",
+                op: "upsert",
+                row: { id: "i1", identifier: "CTC-1", title: "good row", updated_at: 1 },
+              }) + "\n",
+            ),
+          );
+          controller.enqueue(enc.encode("!!this is not JSON!!\n"));
+          // The stream is deliberately left OPEN (no close, no error): only reader.cancel() can
+          // release the body lock, so the cancel flag below is proof the finally path ran.
+        },
+        cancel() {
+          cancelState.cancelled = true;
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl,
+        wsFactory: factory,
+      }),
+    );
+    const started = replica.start();
+    started.catch(() => {});
+    await expect(started).rejects.toThrow(/JSON/i); // the caller's JSON.parse throw surfaces, fast
+    expect(cancelState.cancelled).toBe(true); // the reader was cancelled although NOTHING aborted
+    expect(sockets).toHaveLength(0); // the failed cold seed never opened a socket
+  });
+
+  it("a malformed NDJSON line mid-RESYNC cancels the reader and re-enters backoff — the transport converges instead of wedging (warm-cursor variant)", async () => {
+    const { sockets, factory } = recordingFactory();
+    const cancelState = { cancelled: false };
+    const enc = new TextEncoder();
+    let snapshotCalls = 0;
+    const goodBody = snapshotBody(
+      [{ entity: "issues", row: { id: "i1", identifier: "CTC-1", title: "cold seed", updated_at: 1 } }],
+      5,
+    );
+    const fetchImpl = (async () => {
+      snapshotCalls += 1;
+      if (snapshotCalls === 1) {
+        // The cold seed succeeds (buffered stand-in) so the replica goes live with a warm cursor.
+        return { ok: true, status: 200, text: async () => goodBody } as unknown as Response;
+      }
+      // The RESYNC snapshot is corrupt after one valid row, and the stream never closes on its own.
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            enc.encode(
+              JSON.stringify({
+                accountId: "tenant-0",
+                entity: "issues",
+                op: "upsert",
+                row: { id: "i2", identifier: "CTC-2", title: "resync row", updated_at: 2 },
+              }) + "\n",
+            ),
+          );
+          controller.enqueue(enc.encode("%%corrupt line%%\n"));
+        },
+        cancel() {
+          cancelState.cancelled = true;
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const statuses: string[] = [];
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl,
+        wsFactory: factory,
+        backoffMs: 20, // keep the real-timer backoff wait negligible
+        onStatus: (s) => statuses.push(s),
+      }),
+    );
+    await startToLive(replica, sockets);
+
+    // Cursor underflow → reseed → the corrupt line makes the reseed THROW mid-stream.
+    sockets[0]!.deliver({ type: "resync", accountId: "tenant-0" });
+    await vi.waitFor(() => expect(cancelState.cancelled).toBe(true)); // reader released despite the throw
+    // The failed reseed re-enters the BACKOFF path (never a wedge, never a hot reopen): the transport
+    // retries /connect, and once the endpoint serves a clean snapshot again it converges to live.
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThanOrEqual(2));
+    expect(statuses).toContain("reconnecting");
+    sockets[sockets.length - 1]!.fireOpen();
+    await vi.waitFor(() => expect(statuses[statuses.length - 1]).toBe("live"));
+  });
+});

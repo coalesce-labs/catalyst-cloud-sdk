@@ -30,8 +30,9 @@
 // silence it sends the pinned `{"type":"ping"}` frame; the mirror answers via `setWebSocketAutoResponse`
 // (which replies WITHOUT waking a hibernated DO — ADR-0009's cost model is preserved). If no frame
 // arrives within `pongTimeoutMs`, the socket is force-reconnected through the existing backoff path.
-// Traffic postpones pings (no keepalive on a busy stream), and a 3-probe feature-detect disables the
-// watchdog against an old server that never pongs — so it degrades to exactly today's behavior.
+// Traffic postpones pings (no keepalive on a busy stream), and a 3-probe feature-detect DEGRADES the
+// watchdog against an old server that never pongs — re-probing at 10x the interval instead of never
+// (CTC-281: detection can be slowed, but never permanently lost).
 //
 // Gap detection (CTL-1402): the server's live push (`broadcastChange`) is at-most-once — a send into a
 // half-open socket is silently swallowed, and the dropped frame used to be sealed over permanently the
@@ -44,7 +45,29 @@
 // paginated and answers `{type:"resync"}` on underflow). Bounded: after `gapRetryLimit` no-PROGRESS
 // windows (the heal deadline re-arms on every delivered frame, so a big-but-advancing heal never
 // escalates) the client escalates to the full re-seed path rather than spinning — a gap is never
-// silently accepted. Every transition emits the `catalyst.replica.gap` log/counter signal, the
+// silently accepted.
+//
+// Wedge-proofing (CTC-281): the Jul 17-23 fleet incident (6 windows of server-side half-opens with no
+// FIN/RST; cursors frozen 28-215 min while clients said "live") exposed four restart-only states this
+// client could reach. The invariant now enforced: EVERY state that is not "stopped" holds either a
+// pending timer or a socket whose events re-enter the machine — there is no state only a process
+// restart clears. Concretely: (1) a connect attempt whose ws impl never fires open/close/error is
+// bounded by `openTimeoutMs`; (2) `onerror` without a follow-up `onclose` (real undici bugs #3697/
+// #3546) arms a one-shot fallback reconnect; (3) the watchdog feature-detect can only DEGRADE itself
+// (a slow re-probe every DEGRADED_PROBE_MULTIPLIER x pingIntervalMs), never disable itself outright —
+// and only while pong capability is UNPROVEN; once ANY pong has ever been observed, silence is always
+// treated as a liveness failure (during the incident, 3 open-then-silent sockets used to disable
+// detection for the client's lifetime ~6 min into a window — and because the pong latch is per-process,
+// a client RESTARTED mid-window would have re-latched the disable, so the degrade-not-disable shape is
+// what actually guarantees convergence); (4) a FAILED reseed re-enters the backoff path instead
+// of hot-reopening — and the reseed await itself is bounded by `reseedTimeoutMs` (the injected
+// callback is a trust boundary like the ws impl: the replica's seedFromSnapshot self-bounds via its
+// idle abort, but a consumer-supplied reseed — the browser's OPFS seed() over an unbounded fetch —
+// can hang, and "resyncing" holds no socket and suppresses scheduleReconnect, so without this bound
+// it was the one remaining zero-timer state; a timed-out reseed is ABANDONED, its late settle
+// discarded, and the client re-enters backoff); (5) closeSocket() escalates past `close()` to a duck-typed `terminate()` (Bun /
+// the 'ws' package expose one; undici does not — its close-handshake wait is why teardown must not
+// depend on a graceful close against a half-open peer). Every transition emits the `catalyst.replica.gap` log/counter signal, the
 // detector the per-frame apply telemetry is structurally blind to (an undelivered frame lands in no
 // apply bucket). Gaps are the STEADY-STATE path here — the mirror's reconcile pass appends change_log
 // rows it never broadcasts, so every pass punches a hole that heals via re-request — hence `detected`
@@ -132,7 +155,11 @@ export interface LiveSyncClientOptions {
    * Re-seed the consumer's store from a full snapshot and resolve to the FRESH cursor. Called on a
    * `{type:"resync"}` underflow frame and (optionally) before the first connect. The host pulls
    * /snapshot into bun:sqlite; the browser re-runs its OPFS seed(). The client closes the socket
-   * before calling this so no live frame interleaves with the seed.
+   * before calling this so no live frame interleaves with the seed. The await is bounded by
+   * {@link reseedTimeoutMs} (CTC-281) — a hanging reseed is abandoned (its late settle discarded)
+   * and the client re-enters the backoff path, so this callback can never wedge the transport; still,
+   * bound your own I/O (as the replica's seedFromSnapshot does) so a dead fetch fails fast, not at
+   * the backstop.
    */
   reseed: () => Promise<number>;
   /**
@@ -167,6 +194,26 @@ export interface LiveSyncClientOptions {
    * socket half-open and force-reconnecting through the normal backoff path. Default `15_000`.
    */
   pongTimeoutMs?: number;
+  /**
+   * Connect/open deadline (CTC-281): how long (ms) after constructing a socket to wait for `onopen`
+   * before treating the attempt as failed (tear the socket down, status "reconnecting", backoff
+   * reconnect). Without it, a TCP-connect or HTTP-upgrade stall that never fires open/close/error
+   * (undici sets no upgrade deadline; injected impls are trusted blindly) wedges the client in
+   * "connecting" with ZERO pending timers — restart-only. Default `20_000`; `0` disables.
+   */
+  openTimeoutMs?: number;
+  /**
+   * Re-seed deadline (CTC-281): how long (ms) to wait for the injected {@link reseed} callback to
+   * settle before abandoning the attempt (status "reconnecting", backoff reconnect; the abandoned
+   * reseed's late settle is discarded). While resyncing the client holds NO socket and suppresses
+   * scheduleReconnect, so an unbounded reseed hang was a zero-timer restart-only wedge — the exact
+   * ticket-ask-3 state. A TOTAL-duration backstop, deliberately generous: the replica's
+   * seedFromSnapshot already fails fast on a dead stream via its own IDLE abort
+   * (`snapshotIdleTimeoutMs`); this bound exists for reseed impls with no bound of their own (e.g. a
+   * browser OPFS seed over a default fetch). Raise it if a legitimate full seed can stream longer.
+   * Default `600_000` (10 min); `0` disables.
+   */
+  reseedTimeoutMs?: number;
   /**
    * Gap detection (CTL-1402): how long (ms) to wait for a `{type:"sync"}` gap re-request to finish
    * redelivering the detected hole before retrying (or, once {@link gapRetryLimit} re-requests have
@@ -239,11 +286,35 @@ export function buildConnectUrl(opts: {
 }
 
 /**
- * Consecutive opened-then-never-ponged connections after which the watchdog disables itself for the
- * client's lifetime (feature-detect for a server without auto-pong). Bounds worst-case reconnect
- * churn against an old server to exactly this many attempts, making mirror/SDK deploy order harmless.
+ * Consecutive opened-then-never-ponged connections after which the watchdog DEGRADES itself
+ * (feature-detect for a server without auto-pong). Bounds worst-case reconnect churn against an old
+ * server, making mirror/SDK deploy order harmless.
  */
 const PROBE_FAILURE_LIMIT = 3;
+
+/**
+ * Degraded-watchdog probe interval, as a multiple of `pingIntervalMs` (CTC-281). After
+ * {@link PROBE_FAILURE_LIMIT} never-ponged connections the watchdog does NOT turn off — it re-probes
+ * at this heavily backed-off cadence (stock: every 15 min instead of 90 s). A hard lifetime disable
+ * was the incident's restart-only residual: the `pongEverObserved` latch is per-PROCESS, so a client
+ * (re)started inside an incident window (supervisors restarted processes mid-window) came up
+ * unproven, burned its 3 probes against open-but-silent sockets, and went permanently blind — the
+ * next half-open then froze it as "live" forever, and only another restart (which repeats the cycle)
+ * cleared it. Degrading instead keeps a probe pending in EVERY non-stopped state: a half-open socket
+ * under a degraded watchdog is still detected within ~this multiple of the interval, and the first
+ * pong after recovery re-arms full-speed detection (and latches capability as proven). Against a
+ * genuinely old server the cost is one bounded reconnect per degraded window — churn, never wedge.
+ */
+const DEGRADED_PROBE_MULTIPLIER = 10;
+
+/**
+ * How long (ms) after `onerror` to wait for the spec-mandated follow-up `onclose` before forcing the
+ * reconnect ourselves (CTC-281). WHATWG requires close-after-error, but real impls have shipped
+ * violations (undici #3697 "close not emitted on error", #3546 "close not fired if the connection
+ * failed to be established") — and `WebSocketLike` is structural, so an injected impl is trusted
+ * blindly. Pre-open, a missing onclose used to be a ZERO-timer permanent-"error" wedge.
+ */
+const ERROR_CLOSE_GRACE_MS = 5_000;
 
 export class LiveSyncClient {
   private readonly baseUrl: string;
@@ -259,6 +330,8 @@ export class LiveSyncClient {
   private readonly maxBackoffMs: number;
   private readonly pingIntervalMs: number;
   private readonly pongTimeoutMs: number;
+  private readonly openTimeoutMs: number;
+  private readonly reseedTimeoutMs: number;
   private readonly gapTimeoutMs: number;
   private readonly gapRetryLimit: number;
   private readonly wsFactory: WebSocketFactory;
@@ -304,11 +377,34 @@ export class LiveSyncClient {
   private pingSentAt = 0;
   /** Client-lifetime: consecutive opened-then-never-ponged connections. Reset to 0 by ANY pong. */
   private probeFailures = 0;
-  /** Client-lifetime: after PROBE_FAILURE_LIMIT never-ponged connections we stop pinging for good
-   *  (an old server without auto-pong), degrading to close/error-only detection. */
-  private watchdogDisabled = false;
+  /** Client-lifetime until a pong: after PROBE_FAILURE_LIMIT never-ponged connections the watchdog
+   *  DEGRADES to a {@link DEGRADED_PROBE_MULTIPLIER}x-slower re-probe (an old server without auto-pong)
+   *  — it never turns off outright, so detection is never a restart-only casualty (CTC-281). Only
+   *  reachable while pong capability is UNPROVEN ({@link pongEverObserved}); the first pong clears it. */
+  private watchdogDegraded = false;
+  /** Client-lifetime pong latch (CTC-281): has ANY connection EVER answered a ping? Once true, the
+   *  server's auto-pong capability is PROVEN for good — a later never-ponged connection is a liveness
+   *  failure (the incident's open-but-silent socket), never feature-detect evidence, so the watchdog
+   *  can no longer even degrade itself. PER-PROCESS by design — which is exactly why the degrade must
+   *  be soft (see {@link DEGRADED_PROBE_MULTIPLIER}): a restart mid-incident resets this latch. */
+  private pongEverObserved = false;
   private pingTimer: ReturnType<typeof setTimeout> | null = null;
   private pongDeadline: ReturnType<typeof setTimeout> | null = null;
+  /** Per-CONNECTION connect/open deadline (CTC-281): armed when the socket is constructed, cleared on
+   *  open/close/teardown. The only timer pending between openSocket() and onopen — the guarantee that
+   *  a never-firing ws impl cannot leave the client wedged in "connecting" with nothing scheduled. */
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Per-CONNECTION onerror→onclose fallback (CTC-281): armed by onerror, fires forceReconnect once
+   *  if the impl never follows error with close (undici #3697/#3546). Cleared on open/close/teardown. */
+  private errorFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Per-CONNECTION: has THIS socket fired onopen? The connect-deadline's late-timer guard (a
+   *  throttled background tab can fire the deadline after onopen already ran and cleared it). */
+  private socketOpened = false;
+  /** The pending reseed deadline (CTC-281) — the timer that makes "resyncing" (no socket, reconnect
+   *  suppressed) a bounded state instead of a restart-only wedge. Cleared when the reseed settles in
+   *  time and by stop() (ask 4: stop() leaves NOTHING pending). At most one reseed is ever in flight
+   *  (`resyncing` guards the resync path; the boot seed runs before any socket exists). */
+  private reseedTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(opts: LiveSyncClientOptions) {
     this.baseUrl = stripTrailingSlashes(opts.baseUrl);
@@ -324,6 +420,8 @@ export class LiveSyncClient {
     this.maxBackoffMs = opts.maxBackoffMs ?? 30_000;
     this.pingIntervalMs = opts.pingIntervalMs ?? 90_000;
     this.pongTimeoutMs = opts.pongTimeoutMs ?? 15_000;
+    this.openTimeoutMs = opts.openTimeoutMs ?? 20_000;
+    this.reseedTimeoutMs = opts.reseedTimeoutMs ?? 600_000;
     this.gapTimeoutMs = opts.gapTimeoutMs ?? 10_000;
     this.gapRetryLimit = opts.gapRetryLimit ?? 3;
     this.wsFactory = opts.wsFactory ?? defaultWsFactory;
@@ -341,32 +439,47 @@ export class LiveSyncClient {
    * forever" contract) — the open WebSocket keeps the process alive between deltas. In a browser the
    * returned Promise is simply never awaited; call stop() on teardown.
    */
-  async start(): Promise<void> {
+  start(): Promise<void> {
     this.stopped = false;
-    // Resolve the OTel seam ONCE up front (before the first reseed, so the seed span exists on the
-    // cold-start path too). Keep the OFF path FULLY SYNCHRONOUS — no `await`, so a caller that opens
-    // the socket and inspects it in the same tick still sees it; only pay the async resolution (guarded
-    // dynamic import, or a CatalystReplica passing its already-resolved instance) when telemetry is on.
-    this.telemetry =
-      this.telemetryConfig === undefined || this.telemetryConfig === false
-        ? NOOP_TELEMETRY
-        : await createTelemetry(this.telemetryConfig, {
-            tracerName: DEFAULT_SCOPE_NAME,
-            meterName: DEFAULT_SCOPE_NAME,
-          });
-    this.gapCounter = this.telemetry.counter(REPLICA_METRIC.gaps, {
-      description: "Change-feed seq-gap lifecycle events (detected/healed/escalated).",
-      unit: "{gap}",
-    });
-    const saved = this.getCursor();
-    if (saved == null) {
-      this.setStatus("resyncing");
-      await this.reseed();
-    }
-    this.openSocket();
-    return new Promise<void>((resolve) => {
+    // The done deferred is created BEFORE the boot body runs (CTC-281 N2): stop() during the cold-seed
+    // await used to find resolveDone still null and leave the returned promise pending forever — a
+    // contract violation for a consumer awaiting start(). The boot body below is deliberately its OWN
+    // async task raced against this deferred, because an `async start()` suspended at `await reseed()`
+    // can never reach a `return done` — stop() must be able to resolve the caller regardless of the
+    // boot phase (openSocket() already no-ops on stopped, so a late-settling seed is harmless).
+    const done = new Promise<void>((resolve) => {
       this.resolveDone = resolve;
     });
+    const boot = (async () => {
+      // Resolve the OTel seam ONCE up front (before the first reseed, so the seed span exists on the
+      // cold-start path too). Keep the OFF path FULLY SYNCHRONOUS — no `await`, so a caller that opens
+      // the socket and inspects it in the same tick still sees it (the boot body runs synchronously up
+      // to its first await); only pay the async resolution (guarded dynamic import, or a
+      // CatalystReplica passing its already-resolved instance) when telemetry is on.
+      this.telemetry =
+        this.telemetryConfig === undefined || this.telemetryConfig === false
+          ? NOOP_TELEMETRY
+          : await createTelemetry(this.telemetryConfig, {
+              tracerName: DEFAULT_SCOPE_NAME,
+              meterName: DEFAULT_SCOPE_NAME,
+            });
+      this.gapCounter = this.telemetry.counter(REPLICA_METRIC.gaps, {
+        description: "Change-feed seq-gap lifecycle events (detected/healed/escalated).",
+        unit: "{gap}",
+      });
+      const saved = this.getCursor();
+      if (saved == null) {
+        this.setStatus("resyncing");
+        // Bounded like the resync-path reseed (CTC-281): a hanging COLD seed surfaces as a start()
+        // rejection (the boot arm rejects) instead of a silent forever-"resyncing" start().
+        await this.boundedReseed();
+      }
+      this.openSocket();
+    })();
+    // Settles when stop() resolves the deferred, OR rejects if the boot (cold seed) fails — a boot
+    // SUCCESS deliberately keeps waiting on `done` (the "runs forever" contract). Promise.race
+    // attaches handlers to both arms, so a boot rejection after stop() is never an unhandled one.
+    return Promise.race([done, boot.then(() => done)]);
   }
 
   /** Stop the client: close the socket, cancel any pending reconnect, resolve start(). Idempotent. */
@@ -376,6 +489,10 @@ export class LiveSyncClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    // Ask 4 (bounded teardown): the reseed deadline must not hold process exit for up to
+    // reseedTimeoutMs. With it cleared a still-hanging reseed simply never settles its (now
+    // irrelevant) await — every post-await path in handleResync/boot checks `stopped` first.
+    this.clearReseedTimer();
     this.closeSocket();
     this.setStatus("stopped");
     const done = this.resolveDone;
@@ -421,7 +538,27 @@ export class LiveSyncClient {
       return;
     }
     this.ws = ws;
+    this.socketOpened = false;
+    this.clearConnectTimers(); // never stack deadlines across attempts (every teardown clears too)
+    // Connect/open deadline (CTC-281): from here until onopen, THIS timer is the client's only
+    // guaranteed pending work (the reconnectTimer that led here was already nulled). If the impl
+    // never fires open/close/error — a stalled upgrade with no FIN/RST, or a buggy injected ws —
+    // this converts the dead attempt into an ordinary backoff retry instead of a permanent
+    // "connecting" wedge.
+    if (this.openTimeoutMs > 0) {
+      this.connectTimer = setTimeout(() => {
+        this.connectTimer = null;
+        // Late-timer guard (same discipline as onPongDeadline): a throttled tab can fire this after
+        // onopen already ran, or after this socket was already replaced/torn down.
+        if (this.stopped || this.ws !== ws || this.socketOpened) return;
+        this.log("warn", `ws open timed out after ${this.openTimeoutMs}ms; forcing reconnect`);
+        this.endConnectSpan(new Error("open timeout"));
+        this.forceReconnect();
+      }, this.openTimeoutMs);
+    }
     ws.onopen = () => {
+      this.socketOpened = true;
+      this.clearConnectTimers(); // the attempt succeeded — the open deadline + error fallback die here
       this.backoff = this.backoffMs; // a successful open resets the backoff ramp
       this.setStatus("live");
       this.endConnectSpan();
@@ -459,6 +596,18 @@ export class LiveSyncClient {
       } catch {
         // already closing/closed
       }
+      // Fallback (CTC-281): if the impl violates the spec and never follows error with close (undici
+      // #3697/#3546), force the reconnect ourselves after a short grace. One-shot per socket, guarded
+      // on identity — a spec-conforming onclose lands first, clears this timer, and reconnects
+      // normally (scheduleReconnect's reconnectTimer check also prevents any double-schedule).
+      if (this.errorFallbackTimer == null) {
+        this.errorFallbackTimer = setTimeout(() => {
+          this.errorFallbackTimer = null;
+          if (this.stopped || this.ws !== ws) return; // onclose (or a teardown) already handled it
+          this.log("warn", "ws error was never followed by close; forcing reconnect (CTC-281)");
+          this.forceReconnect();
+        }, ERROR_CLOSE_GRACE_MS);
+      }
     };
   }
 
@@ -488,6 +637,22 @@ export class LiveSyncClient {
       ws.close();
     } catch {
       // already closed
+    }
+    // Escalate past the graceful close (CTC-281): against a half-open peer the Close frame goes into
+    // a black hole, and undici waits on the never-answered handshake with NO timeout — the ref'd TCP
+    // handle then holds a supervised process's exit hostage for up to the OS retransmission timeout
+    // (~minutes). Bun's WebSocket and the node 'ws' package both expose a non-standard `terminate()`
+    // that destroys the connection immediately; duck-type it (structurally, never `as any`) and call
+    // it when present. Handlers are already detached above, so a hard kill is behaviorally safe;
+    // native/undici sockets simply lack the member and keep today's behavior (documented gap — on
+    // Node, inject a 'ws'-package wsFactory if bounded process exit matters).
+    const t = ws as WebSocketLike & { terminate?: () => void };
+    if (typeof t.terminate === "function") {
+      try {
+        t.terminate();
+      } catch {
+        // best-effort — already destroyed
+      }
     }
   }
 
@@ -520,7 +685,15 @@ export class LiveSyncClient {
       // capability and reset the feature-detect counter; a pong is NEVER surfaced to onFrame/onChange.
       // (lastFrameAt + the pending-deadline clear already happened synchronously in onInboundFrame.)
       this.pongObserved = true;
+      this.pongEverObserved = true; // CTC-281: capability proven for the client's LIFETIME
       this.probeFailures = 0;
+      if (this.watchdogDegraded) {
+        // The degraded slow re-probe just paid off (the server pongs after all — recovered mid-window
+        // or upgraded): re-arm full-speed detection immediately (CTC-281).
+        this.watchdogDegraded = false;
+        this.log("info", "pong observed on a degraded watchdog; full-speed liveness detection re-armed (CTC-281)");
+        this.armPing();
+      }
       return;
     }
     if (frame.type === "head") {
@@ -696,6 +869,49 @@ export class LiveSyncClient {
     this.clearGapTimer();
   }
 
+  private clearReseedTimer(): void {
+    if (this.reseedTimer != null) {
+      clearTimeout(this.reseedTimer);
+      this.reseedTimer = null;
+    }
+  }
+
+  /**
+   * Run the injected reseed() bounded by {@link LiveSyncClientOptions.reseedTimeoutMs} (CTC-281).
+   * The injected callback is a trust boundary like the ws impl: while it runs there is NO socket and
+   * scheduleReconnect is suppressed, so an unbounded await here was the last zero-timer wedge — the
+   * deadline below is the pending timer that upholds the header invariant for the "resyncing" state.
+   * On timeout the attempt is ABANDONED, not cancelled (the callback owns its own I/O bounds — the
+   * replica's seedFromSnapshot aborts its fetch itself): a late settle is discarded via the `settled`
+   * latch, and a late REJECTION is swallowed so it can never surface as an unhandled rejection.
+   */
+  private boundedReseed(): Promise<number> {
+    const seed = this.reseed();
+    if (this.reseedTimeoutMs <= 0) return seed;
+    void seed.catch(() => {}); // an abandoned attempt's late rejection must never go unhandled
+    return new Promise<number>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        if (this.reseedTimer === timer) this.reseedTimer = null;
+        reject(new Error(`reseed did not settle within ${this.reseedTimeoutMs}ms; abandoning (CTC-281)`));
+      }, this.reseedTimeoutMs);
+      this.reseedTimer = timer;
+      const finish = (fn: () => void): void => {
+        if (settled) return; // stale settle: the deadline already abandoned this attempt
+        settled = true;
+        clearTimeout(timer);
+        if (this.reseedTimer === timer) this.reseedTimer = null;
+        fn();
+      };
+      seed.then(
+        (cursor) => finish(() => resolve(cursor)),
+        (err: unknown) => finish(() => reject(err instanceof Error ? err : new Error(String(err)))),
+      );
+    });
+  }
+
   /**
    * Cursor underflow: the deltas we need were evicted from the service's retained change buffer. Close the socket
    * (so no live frame interleaves with the re-seed), re-seed via the injected callback, then reconnect
@@ -710,6 +926,7 @@ export class LiveSyncClient {
     this.clearGapState();
     this.setStatus("resyncing");
     this.closeSocket();
+    let reseeded = false;
     try {
       // The reseed runs inside an ACTIVE span so the replica's seed span (the injected reseed IS
       // seedFromSnapshot) auto-parents under this resync span.
@@ -717,16 +934,28 @@ export class LiveSyncClient {
         REPLICA_SPAN.resync,
         { [CATALYST_ATTR.tenant]: this.accountId },
         async () => {
-          const cursor = await this.reseed();
+          const cursor = await this.boundedReseed();
           this.log("info", `resynced, cursor=${cursor}`);
         },
       );
+      reseeded = true;
     } catch (err) {
       this.log("error", "resync reseed failed; will retry on reconnect", err);
     } finally {
       this.resyncing = false;
     }
-    if (!this.stopped) this.openSocket();
+    if (this.stopped) return;
+    if (reseeded) {
+      // A completed re-seed reopens immediately — the store is fresh and the endpoint just served us.
+      this.openSocket();
+      return;
+    }
+    // A FAILED reseed re-enters the BACKOFF path (CTC-281): the old unconditional reopen made each
+    // gap-escalate → /snapshot-fail → reopen cycle run hot (~30-40s of upgrade + replays + /snapshot
+    // per client, fleet-wide, backoff reset on every open) against exactly the sick server the ticket
+    // covers. scheduleReconnect converges identically once the endpoint recovers — just politely.
+    this.setStatus("reconnecting");
+    this.scheduleReconnect();
   }
 
   // ── Liveness watchdog (CTC-135) ──
@@ -756,19 +985,24 @@ export class LiveSyncClient {
     this.armPing();
   }
 
-  /** (Re)arm the idle-ping timer. No-op when the watchdog is disabled/off or there is no live socket,
-   *  so it is safe to call on every frame. A setTimeout chain (not setInterval): each frame resets it. */
+  /** (Re)arm the idle-ping timer. No-op when the watchdog is off or there is no live socket, so it is
+   *  safe to call on every frame. A setTimeout chain (not setInterval): each frame resets it. A
+   *  DEGRADED watchdog still arms — at {@link DEGRADED_PROBE_MULTIPLIER}x the interval — so detection
+   *  is never permanently off (CTC-281): every live socket always has a probe pending. */
   private armPing(): void {
     this.clearPingTimer();
-    if (this.watchdogDisabled || this.pingIntervalMs <= 0 || this.stopped || !this.ws) return;
-    this.pingTimer = setTimeout(() => this.sendPing(), this.pingIntervalMs);
+    if (this.pingIntervalMs <= 0 || this.stopped || !this.ws) return;
+    const interval = this.watchdogDegraded
+      ? this.pingIntervalMs * DEGRADED_PROBE_MULTIPLIER
+      : this.pingIntervalMs;
+    this.pingTimer = setTimeout(() => this.sendPing(), interval);
   }
 
   /** The feed has been idle for a full interval: send one liveness ping and start the pong deadline. A
    *  synchronous send throw means the socket is already dead — treat it as an unanswered probe now. */
   private sendPing(): void {
     this.pingTimer = null; // this timer just fired
-    if (this.stopped || this.watchdogDisabled || !this.ws) return;
+    if (this.stopped || !this.ws) return;
     this.pingSentAt = Date.now();
     try {
       this.ws.send(PING_FRAME);
@@ -794,19 +1028,33 @@ export class LiveSyncClient {
   }
 
   /** A ping went unanswered (deadline elapsed or the send threw). If this connection had already proven
-   *  pong capability it is a genuine liveness timeout; otherwise it counts toward the feature-detect —
-   *  after PROBE_FAILURE_LIMIT never-ponged connections the watchdog disables itself for good (an old
-   *  server without auto-pong). Either way, force-reconnect through the existing backoff path. */
+   *  pong capability it is a genuine liveness timeout. If pong capability was proven EARLIER in this
+   *  client's lifetime (CTC-281), a never-ponged connection is the incident signature — a half-open
+   *  socket against a server we KNOW auto-pongs — so it too is a liveness failure and must NEVER count
+   *  toward the feature-detect (during the Jul 17-23 windows, 3 such sockets permanently disabled
+   *  detection). Only while capability is UNPROVEN does the failure count toward the DEGRADE — after
+   *  PROBE_FAILURE_LIMIT never-ponged connections the watchdog backs its probes off to
+   *  DEGRADED_PROBE_MULTIPLIER x pingIntervalMs (an old server without auto-pong costs one bounded
+   *  reconnect per degraded window; a mid-incident restart — per-process latch reset — still detects
+   *  the next half-open within one degraded window, never restart-only; CTC-281). Every path
+   *  force-reconnects through the existing backoff. */
   private onProbeUnanswered(): void {
     if (this.pongObserved) {
       this.log("warn", "liveness timeout: no frame within the pong deadline; reconnecting");
+    } else if (this.pongEverObserved) {
+      // A distinct signal from the plain liveness timeout: a PROVEN-pong server delivered zero frames
+      // on a whole connection — the fleet-incident shape (server accepts upgrades, feed is dead).
+      this.log(
+        "warn",
+        "liveness timeout on a never-ponged connection against a proven-pong server (half-open or dead feed); reconnecting — watchdog stays armed (CTC-281)",
+      );
     } else {
       this.probeFailures += 1;
-      if (this.probeFailures >= PROBE_FAILURE_LIMIT) {
-        this.watchdogDisabled = true;
+      if (this.probeFailures >= PROBE_FAILURE_LIMIT && !this.watchdogDegraded) {
+        this.watchdogDegraded = true;
         this.log(
           "warn",
-          `liveness watchdog disabled after ${PROBE_FAILURE_LIMIT} unanswered probes (server lacks auto-pong); relying on close/error detection`,
+          `liveness watchdog degraded after ${PROBE_FAILURE_LIMIT} unanswered probes (server may lack auto-pong); re-probing every ${DEGRADED_PROBE_MULTIPLIER}x pingIntervalMs (CTC-281)`,
         );
       }
     }
@@ -842,6 +1090,21 @@ export class LiveSyncClient {
     // A pending gap re-request dies with its socket: the timer must not fire against the next one
     // (whose onopen re-baselines and re-requests from the durable cursor anyway).
     this.clearGapTimer();
+    // The connect deadline + onerror fallback are per-connection too (CTC-281) — they die with the
+    // socket on both teardown routes (closeSocket and the server-close path), same as the pair above.
+    this.clearConnectTimers();
+  }
+
+  /** Clear the per-connection connect/open deadline + onerror→onclose fallback (CTC-281). */
+  private clearConnectTimers(): void {
+    if (this.connectTimer != null) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+    if (this.errorFallbackTimer != null) {
+      clearTimeout(this.errorFallbackTimer);
+      this.errorFallbackTimer = null;
+    }
   }
 }
 

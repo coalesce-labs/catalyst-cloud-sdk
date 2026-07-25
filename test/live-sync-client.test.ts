@@ -20,6 +20,8 @@ import {
 class FakeWebSocket implements WebSocketLike {
   sent: string[] = [];
   closed = false;
+  /** CTC-281: was the non-standard hard-kill surface invoked? (Bun / the 'ws' package expose it.) */
+  terminated = false;
   /** When set, the next send() throws — simulates writing to an already-dead socket (CTC-135). */
   throwOnSend = false;
   onopen: ((ev: unknown) => void) | null = null;
@@ -34,10 +36,18 @@ class FakeWebSocket implements WebSocketLike {
   close(): void {
     this.closed = true;
   }
+  /** Non-standard hard-kill (Bun WebSocket / node 'ws') — closeSocket must duck-type it (CTC-281). */
+  terminate(): void {
+    this.terminated = true;
+  }
 
   // ── test drivers (simulate the server side) ──
   fireOpen(): void {
     this.onopen?.({});
+  }
+  /** Fire onerror WITHOUT a follow-up onclose — the undici #3697/#3546 spec violation (CTC-281). */
+  fireError(err?: unknown): void {
+    this.onerror?.(err ?? {});
   }
   deliver(frame: unknown): void {
     this.onmessage?.({ data: JSON.stringify(frame) });
@@ -585,7 +595,7 @@ describe("LiveSyncClient liveness watchdog (CTC-135)", () => {
     client.stop();
   });
 
-  it("disables the watchdog after 3 consecutive unanswered probes (old server)", () => {
+  it("degrades the watchdog to a 10x-slower re-probe after 3 consecutive unanswered probes (old server) — never a permanent disable", () => {
     useFakeClock();
     const { client, sockets } = makeClient({ pingIntervalMs: 1000, pongTimeoutMs: 200 });
     void client.start();
@@ -603,13 +613,67 @@ describe("LiveSyncClient liveness watchdog (CTC-135)", () => {
     expect(sockets).toHaveLength(2);
     probeFailAndReopen(); // failure 2 → conn3
     expect(sockets).toHaveLength(3);
-    probeFailAndReopen(); // failure 3 → watchdog disabled → conn4
+    probeFailAndReopen(); // failure 3 → watchdog DEGRADED → conn4
     expect(sockets).toHaveLength(4);
 
-    // conn4 opened with the watchdog disabled: it never pings and never reconnects again.
-    vi.advanceTimersByTime(10_000);
+    // conn4 opened with the watchdog degraded: no probe at the normal cadence (churn is bounded)…
+    vi.advanceTimersByTime(10_000 - 1);
     expect(pingsOn(sockets[3]!)).toHaveLength(0);
-    expect(sockets).toHaveLength(4); // bounded to exactly 3 reconnects against an old server
+    expect(sockets).toHaveLength(4);
+    // …but the slow re-probe still fires at 10x the interval — detection is NEVER permanently off
+    // (CTC-281: a hard lifetime disable was itself a restart-only wedge for a client that came up
+    // unproven inside an incident window). Against a genuinely old server this costs one bounded
+    // reconnect per degraded window.
+    vi.advanceTimersByTime(1);
+    expect(pingsOn(sockets[3]!)).toHaveLength(1);
+    vi.advanceTimersByTime(200); // unanswered again → reconnect (still degraded)
+    vi.advanceTimersByTime(1000); // backoff → conn5
+    expect(sockets).toHaveLength(5);
+
+    client.stop();
+  });
+
+  it("CTC-281: a client restarted mid-incident (no pong latch) that degrades on 3 silent-open sockets STILL detects the next half-open via the slow re-probe, and re-arms full speed on recovery", () => {
+    useFakeClock();
+    // This is the reviewer's residual for the pongEverObserved fix: the latch is per-PROCESS, so a
+    // supervisor restart inside an incident window comes up UNPROVEN, burns its 3 probes against
+    // open-then-silent sockets, and — pre-fix — went permanently blind: the 4th half-open socket had
+    // no pending timer and no event that would ever fire → "live" with a frozen cursor, restart-only.
+    const { client, sockets, statuses } = makeClient({ pingIntervalMs: 1000, pongTimeoutMs: 200 });
+    void client.start();
+
+    // Connections 1-3: the incident shape — the upgrade succeeds, then ZERO frames (no pong, no
+    // change, no close). Each burns one feature-detect probe; the 3rd degrades the watchdog.
+    for (let conn = 1; conn <= 3; conn++) {
+      sockets[sockets.length - 1]!.fireOpen();
+      vi.advanceTimersByTime(1000); // full-speed probe
+      vi.advanceTimersByTime(200); // unanswered
+      vi.advanceTimersByTime(1000); // backoff → next conn
+    }
+    expect(sockets).toHaveLength(4);
+
+    // Connection 4 half-opens the same way. The DEGRADED watchdog still probes at 10x the interval,
+    // so the half-open is detected within ~10x pingIntervalMs + pongTimeoutMs — never restart-only.
+    sockets[3]!.fireOpen();
+    vi.advanceTimersByTime(10_000);
+    expect(pingsOn(sockets[3]!)).toHaveLength(1);
+    vi.advanceTimersByTime(200); // unanswered → torn down
+    expect(sockets[3]!.closed).toBe(true);
+    expect(statuses).toContain("reconnecting");
+
+    // The endpoint recovers: connection 5 pongs the (degraded) probe → capability latched, watchdog
+    // re-armed at FULL speed — the next probe on the SAME socket fires after one normal interval.
+    vi.advanceTimersByTime(1000); // backoff → conn5
+    const recovered = sockets[4]!;
+    recovered.fireOpen();
+    vi.advanceTimersByTime(10_000); // still degraded until proven
+    expect(pingsOn(recovered)).toHaveLength(1);
+    recovered.deliver({ type: "pong" });
+    vi.advanceTimersByTime(1000); // full-speed cadence restored
+    expect(pingsOn(recovered)).toHaveLength(2);
+    recovered.deliver({ type: "pong" });
+    expect(recovered.closed).toBe(false);
+    expect(sockets).toHaveLength(5); // converged — no restart involved anywhere (ask 3)
 
     client.stop();
   });
@@ -1230,5 +1294,448 @@ describe("LiveSyncClient gap detection + self-healing re-request (CTL-1402)", ()
     expect(syncsSent(sockets[0]!)).toEqual([{ type: "sync", after: 7 }]); // nothing re-requested
     expect(gapLines(logs)).toEqual([]);
     client.stop();
+  });
+});
+
+// ── CTC-281 fleet-incident hardening: detection proof, wedge convergence, bounded teardown ──
+// Jul 17-23: 6 windows in which every tenant-0 client's WebSocket half-opened server-side (no
+// FIN/RST) — cursors froze 28-215 min while the clients reported "live" (they were 0.4.x, pre
+// ping/pong). These tests pin the guarantees the incident demanded:
+//   (2) DETECTION — an established-live client on a silent half-open socket flips to "reconnecting"
+//       within pingIntervalMs+pongTimeoutMs (105s on defaults), never 80+ minutes;
+//   (3) CONVERGENCE — a "reconnecting" client ALWAYS converges once the endpoint recovers; there is
+//       no state (disabled watchdog, hung connect, error-without-close, hot resync loop) that only a
+//       process restart clears;
+//   (4) BOUNDED TEARDOWN — closeSocket escalates past the graceful close to a duck-typed terminate()
+//       so a half-open socket cannot hold a supervised process's exit hostage.
+describe("LiveSyncClient fleet-incident hardening (CTC-281)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function useFakeClock(): void {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+  }
+
+  function makeClient(opts: {
+    pingIntervalMs?: number;
+    pongTimeoutMs?: number;
+    openTimeoutMs?: number;
+    backoffMs?: number;
+    maxBackoffMs?: number;
+    initialCursor?: number | null;
+  }) {
+    const store = makeStore(opts.initialCursor ?? 7);
+    const { sockets, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(100),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      onStatus: (s) => statuses.push(s),
+      backoffMs: opts.backoffMs ?? 1000,
+      maxBackoffMs: opts.maxBackoffMs ?? 30_000,
+      pingIntervalMs: opts.pingIntervalMs,
+      pongTimeoutMs: opts.pongTimeoutMs,
+      openTimeoutMs: opts.openTimeoutMs,
+      wsFactory: factory,
+    });
+    return { client, sockets, statuses, store };
+  }
+
+  it("INCIDENT SIGNATURE (ask 2): an established-live, pong-proven client on a silently half-open socket flips to 'reconnecting' within pingIntervalMs+pongTimeoutMs (105s stock) — not 80+ min", () => {
+    useFakeClock();
+    const { client, sockets, statuses } = makeClient({}); // STOCK defaults: 90s ping, 15s pong
+    void client.start();
+    sockets[0]!.fireOpen(); // 'live'
+
+    // Steady state, with pong capability PROVEN once (idle ping at t=90s is answered).
+    vi.advanceTimersByTime(90_000);
+    expect(sockets[0]!.sent).toContain(PING_FRAME);
+    sockets[0]!.deliver({ type: "pong" }); // last inbound frame: t=90_000
+
+    // The socket half-opens NOW — no more frames, and (the incident's defining property) no FIN/RST,
+    // so onclose/onerror never fire. Detection must NOT fire before a full idle interval…
+    vi.advanceTimersByTime(90_000 - 1); // t=179_999
+    expect(statuses).not.toContain("reconnecting");
+    expect(sockets[0]!.closed).toBe(false);
+
+    // …the idle ping goes out at t=180s (buffered into the dead socket without an error), and the
+    // pong deadline expires at t=195s = lastFrame + pingIntervalMs + pongTimeoutMs. That is the bound.
+    vi.advanceTimersByTime(1); // ping sent at t=180_000
+    vi.advanceTimersByTime(15_000 - 1); // t=194_999 — still within the pong deadline
+    expect(statuses).not.toContain("reconnecting");
+    vi.advanceTimersByTime(1); // t=195_000 → detected
+    expect(statuses).toContain("reconnecting");
+    expect(sockets[0]!.closed).toBe(true);
+    expect(sockets[0]!.terminated).toBe(true); // teardown escalated past the graceful close (ask 4)
+
+    // Convergence (ask 3): the endpoint recovers → the backoff reconnect goes live again.
+    vi.advanceTimersByTime(1000);
+    expect(sockets).toHaveLength(2);
+    sockets[1]!.fireOpen();
+    expect(statuses[statuses.length - 1]).toBe("live");
+    client.stop();
+  });
+
+  it("W2: once a pong was EVER observed, open-then-silent connections can NEVER disable the watchdog — the 4th, 5th… half-open is still detected (pre-fix: lifetime blackout after 3)", () => {
+    useFakeClock();
+    const { client, sockets } = makeClient({ pingIntervalMs: 1000, pongTimeoutMs: 200 });
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    // Capability proven ONCE, early in the client's life.
+    vi.advanceTimersByTime(1000);
+    sockets[0]!.deliver({ type: "pong" });
+
+    // The incident begins: every subsequent connection OPENS, then delivers nothing — the exact
+    // feature-detect shape that used to consume its 3 probes and set watchdogDisabled forever.
+    sockets[0]!.fireServerClose();
+    vi.advanceTimersByTime(1000); // backoff → conn2
+    for (let halfOpenConn = 1; halfOpenConn <= 4; halfOpenConn++) {
+      const ws = sockets[sockets.length - 1]!;
+      ws.fireOpen();
+      vi.advanceTimersByTime(1000); // the watchdog MUST still be pinging (probe > PROBE_FAILURE_LIMIT)
+      expect(ws.sent).toContain(PING_FRAME);
+      vi.advanceTimersByTime(200); // unanswered → detected as half-open → torn down
+      expect(ws.closed).toBe(true);
+      vi.advanceTimersByTime(1000); // backoff → next conn
+    }
+
+    // The 5th incident socket is STILL probed (the lifetime latch keeps the watchdog armed), and once
+    // the server recovers the same socket stays live — full convergence, no restart needed.
+    const recovered = sockets[sockets.length - 1]!;
+    recovered.fireOpen();
+    vi.advanceTimersByTime(1000);
+    expect(recovered.sent).toContain(PING_FRAME);
+    recovered.deliver({ type: "pong" });
+    const socketCount = sockets.length;
+    vi.advanceTimersByTime(1000); // next idle ping on the SAME socket
+    recovered.deliver({ type: "pong" });
+    expect(recovered.closed).toBe(false);
+    expect(sockets).toHaveLength(socketCount);
+    client.stop();
+  });
+
+  it("W1: a socket whose impl never fires open/close/error is torn down after openTimeoutMs and retried — never a permanent 'connecting'", () => {
+    useFakeClock();
+    const { client, sockets, statuses } = makeClient({
+      openTimeoutMs: 500,
+      pingIntervalMs: 1000,
+      pongTimeoutMs: 200,
+    });
+    void client.start();
+    expect(sockets).toHaveLength(1); // conn1 constructed; the impl then goes catatonic (upgrade stall)
+
+    vi.advanceTimersByTime(499);
+    expect(sockets[0]!.closed).toBe(false); // not before the deadline
+    vi.advanceTimersByTime(1); // open deadline → the attempt is failed, not waited on forever
+    expect(sockets[0]!.closed).toBe(true);
+    expect(sockets[0]!.terminated).toBe(true);
+    expect(statuses).toContain("reconnecting");
+
+    vi.advanceTimersByTime(1000); // backoff → conn2, which opens fine → live (ask 3)
+    expect(sockets).toHaveLength(2);
+    sockets[1]!.fireOpen();
+    expect(statuses[statuses.length - 1]).toBe("live");
+    client.stop();
+  });
+
+  it("W4: onerror never followed by onclose (undici #3697/#3546) still reconnects — exactly once", () => {
+    useFakeClock();
+    const { client, sockets, statuses } = makeClient({ pingIntervalMs: 0, openTimeoutMs: 0 });
+    void client.start();
+    expect(sockets).toHaveLength(1);
+
+    // Pre-open failure: error fires; the impl never emits the spec-mandated follow-up close. Pre-fix
+    // this was a ZERO-timer permanent-'error' wedge (nothing pending, nothing to fire, restart-only).
+    sockets[0]!.fireError(new Error("connect refused"));
+    expect(statuses).toContain("error");
+    expect(sockets).toHaveLength(1); // nothing scheduled yet — the grace window is pending
+
+    vi.advanceTimersByTime(5000); // ERROR_CLOSE_GRACE_MS → the fallback forces the reconnect
+    expect(statuses).toContain("reconnecting");
+    vi.advanceTimersByTime(1000); // backoff
+    expect(sockets).toHaveLength(2);
+
+    // Exactly once — no double-schedule from a late timer.
+    vi.advanceTimersByTime(60_000);
+    expect(sockets).toHaveLength(2);
+    sockets[1]!.fireOpen();
+    expect(statuses[statuses.length - 1]).toBe("live");
+    client.stop();
+  });
+
+  it("CONVERGENCE (ask 3): repeated dead connect attempts back off 1s,2s,4s,4s (capped at maxBackoffMs) and go 'live' the moment the endpoint recovers", () => {
+    useFakeClock();
+    const { client, sockets, statuses } = makeClient({
+      openTimeoutMs: 500,
+      backoffMs: 1000,
+      maxBackoffMs: 4000,
+    });
+    void client.start();
+
+    // Every attempt stalls (never opens): the open deadline fails it at +500ms, then the backoff
+    // doubles per FAILED attempt — no onopen ever resets it — and caps at maxBackoffMs.
+    const expectedDelays = [1000, 2000, 4000, 4000];
+    for (const delay of expectedDelays) {
+      const before = sockets.length;
+      vi.advanceTimersByTime(500); // open deadline kills the pending attempt
+      vi.advanceTimersByTime(delay - 1);
+      expect(sockets).toHaveLength(before); // not before the full backoff
+      vi.advanceTimersByTime(1);
+      expect(sockets).toHaveLength(before + 1);
+    }
+
+    // Recovery: the next attempt opens → live. No restart, no operator, no wedge.
+    sockets[sockets.length - 1]!.fireOpen();
+    expect(statuses[statuses.length - 1]).toBe("live");
+    client.stop();
+  });
+
+  it("W3/N1: a FAILING reseed re-enters the backoff path (status 'reconnecting', no hot reopen) and converges once /snapshot recovers", async () => {
+    vi.useFakeTimers();
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
+    let reseedCalls = 0;
+    let reseedFailuresLeft = 2;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      // /snapshot is down for the first two attempts — the incident's sick-server profile. A REJECTING
+      // reseed is the contract the replica layer now upholds (its fetch aborts instead of hanging).
+      reseed: async () => {
+        reseedCalls += 1;
+        if (reseedFailuresLeft > 0) {
+          reseedFailuresLeft -= 1;
+          throw new Error("/snapshot 522");
+        }
+        store.setCursor(50);
+        return 50;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      onStatus: (s) => statuses.push(s),
+      backoffMs: 1000,
+      maxBackoffMs: 30_000,
+      pingIntervalMs: 0,
+      openTimeoutMs: 0,
+      wsFactory: factory,
+    });
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    sockets[0]!.deliver({ type: "resync", accountId: "tenant-0" }); // → reseed #1 (fails)
+    await vi.advanceTimersByTimeAsync(0); // flush the async reseed rejection
+    expect(reseedCalls).toBe(1);
+    expect(sockets).toHaveLength(1); // NO immediate hot reopen (pre-fix: instant reopen, backoff reset)
+    expect(statuses[statuses.length - 1]).toBe("reconnecting"); // and the status tells the truth
+
+    await vi.advanceTimersByTimeAsync(1000); // backoff → conn2
+    expect(sockets).toHaveLength(2);
+    sockets[1]!.fireOpen();
+    sockets[1]!.deliver({ type: "resync", accountId: "tenant-0" }); // → reseed #2 (fails)
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sockets).toHaveLength(2); // still no hot reopen
+    await vi.advanceTimersByTimeAsync(1000); // backoff → conn3
+    expect(sockets).toHaveLength(3);
+
+    sockets[2]!.fireOpen();
+    sockets[2]!.deliver({ type: "resync", accountId: "tenant-0" }); // → reseed #3 SUCCEEDS
+    await vi.advanceTimersByTimeAsync(0); // a successful reseed reopens immediately (fresh store)
+    expect(reseedCalls).toBe(3);
+    expect(sockets).toHaveLength(4);
+    sockets[3]!.fireOpen();
+    expect(sockets[3]!.lastSent()).toEqual({ type: "sync", after: 50 }); // synced from the fresh cursor
+    expect(statuses[statuses.length - 1]).toBe("live"); // converged — no restart ever required
+    client.stop();
+  });
+
+  it("W3 (transport layer): a HANGING reseed is bounded by reseedTimeoutMs — flips to 'reconnecting', backoff-reconnects, and the abandoned reseed's late settle is discarded", async () => {
+    vi.useFakeTimers();
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
+    let reseedCalls = 0;
+    let hungResolve: ((n: number) => void) | null = null;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      // Attempt #1 NEVER SETTLES — a consumer-level reseed with no bound of its own (the browser's
+      // OPFS seed over a default fetch), half-opened by the incident's network profile. The replica
+      // layer's idle abort does not exist at this layer — only reseedTimeoutMs stands between this
+      // and the restart-only wedge. Attempt #2 completes normally.
+      reseed: () =>
+        new Promise<number>((resolve) => {
+          reseedCalls += 1;
+          if (reseedCalls === 1) {
+            hungResolve = resolve; // parked — the test settles it LATE, after abandonment
+          } else {
+            store.setCursor(50);
+            resolve(50);
+          }
+        }),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      onStatus: (s) => statuses.push(s),
+      backoffMs: 1000,
+      maxBackoffMs: 30_000,
+      pingIntervalMs: 0,
+      openTimeoutMs: 0,
+      reseedTimeoutMs: 5000,
+      wsFactory: factory,
+    });
+    void client.start();
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver({ type: "resync", accountId: "tenant-0" }); // → reseed #1 (hangs)
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reseedCalls).toBe(1);
+    expect(statuses[statuses.length - 1]).toBe("resyncing"); // socket closed, reseed in flight
+
+    // Pre-fix this state held ZERO timers with scheduleReconnect suppressed — restart-only (the
+    // header invariant was false here). Now the reseed deadline is the pending timer.
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(statuses[statuses.length - 1]).toBe("resyncing"); // not a moment early
+    expect(sockets).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1); // deadline: abandon → backoff path
+    expect(statuses[statuses.length - 1]).toBe("reconnecting");
+    expect(sockets).toHaveLength(1); // no hot reopen
+
+    await vi.advanceTimersByTimeAsync(1000); // backoff → conn2
+    expect(sockets).toHaveLength(2);
+    sockets[1]!.fireOpen();
+    sockets[1]!.deliver({ type: "resync", accountId: "tenant-0" }); // → reseed #2 SUCCEEDS
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reseedCalls).toBe(2);
+    expect(sockets).toHaveLength(3); // a completed reseed reopens immediately
+    sockets[2]!.fireOpen();
+    expect(sockets[2]!.lastSent()).toEqual({ type: "sync", after: 50 }); // synced from the fresh cursor
+    expect(statuses[statuses.length - 1]).toBe("live"); // converged — no restart required (ask 3)
+
+    // The ABANDONED attempt settles late: discarded — no state clobber, no extra socket, no cursor rewind.
+    hungResolve!(999);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sockets).toHaveLength(3);
+    expect(statuses[statuses.length - 1]).toBe("live");
+    expect(store.getCursor()).toBe(50);
+    client.stop();
+  });
+
+  it("W3 (cold boot): a HANGING first seed rejects start() at reseedTimeoutMs instead of pending forever in 'resyncing'", async () => {
+    vi.useFakeTimers();
+    const { factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: () => new Promise<number>(() => {}), // the cold seed never settles
+      getCursor: () => null, // no cursor → start() must seed first
+      onChange: () => {},
+      pingIntervalMs: 0,
+      reseedTimeoutMs: 5000,
+      wsFactory: factory,
+    });
+    const started = client.start();
+    const outcome = expect(started).rejects.toThrow(/reseed did not settle within 5000ms/);
+    await vi.advanceTimersByTimeAsync(5000);
+    await outcome; // the boot arm rejected — the caller learns, instead of awaiting forever
+  });
+
+  it("BOUNDED TEARDOWN (ask 4): stop() during a HANGING reseed clears the reseed deadline — no timer holds process exit", async () => {
+    vi.useFakeTimers();
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: () => new Promise<number>(() => {}), // never settles
+      getCursor: () => 7,
+      onChange: () => {},
+      pingIntervalMs: 0,
+      openTimeoutMs: 0,
+      reseedTimeoutMs: 5000,
+      wsFactory: factory,
+    });
+    void client.start();
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver({ type: "resync", accountId: "tenant-0" }); // → hanging reseed, deadline armed
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(1); // the reseed deadline is the ONE pending timer
+    client.stop();
+    expect(vi.getTimerCount()).toBe(0); // stop() leaves NOTHING pending (ask 4)
+  });
+
+  it("BOUNDED TEARDOWN (ask 4): stop() escalates close() with the duck-typed terminate()", () => {
+    const { client, sockets } = makeClient({});
+    void client.start();
+    sockets[0]!.fireOpen();
+    client.stop();
+    expect(sockets[0]!.closed).toBe(true);
+    expect(sockets[0]!.terminated).toBe(true); // the half-open handle is destroyed, not handshake-waited
+  });
+
+  it("BOUNDED TEARDOWN (ask 4): a ws impl with NO terminate() (native/undici surface) closes without throwing", () => {
+    const state = { closed: false };
+    const bare: WebSocketLike = {
+      send: () => {},
+      close: () => {
+        state.closed = true;
+      },
+      onopen: null,
+      onmessage: null,
+      onclose: null,
+      onerror: null,
+    };
+    const store = makeStore(7);
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(0),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: () => bare,
+    });
+    void client.start();
+    bare.onopen?.({});
+    client.stop(); // must not throw despite the absent terminate member
+    expect(state.closed).toBe(true);
+  });
+
+  it("N2: stop() during the cold seed resolves the pending start() promise, and the late seed never opens a socket", async () => {
+    const { sockets, factory } = recordingFactory();
+    const seedGate: { release: () => void; started: boolean } = { release: () => {}, started: false };
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: () =>
+        new Promise<number>((resolve) => {
+          seedGate.started = true;
+          seedGate.release = () => resolve(5);
+        }),
+      getCursor: () => null, // cold → start() awaits the reseed before any socket exists
+      onChange: () => {},
+      wsFactory: factory,
+    });
+    const started = client.start();
+    await vi.waitFor(() => expect(seedGate.started).toBe(true));
+    client.stop(); // mid-seed: pre-fix, `started` stayed pending forever (resolveDone was still null)
+    await Promise.race([
+      started,
+      new Promise((_resolve, reject) =>
+        setTimeout(() => reject(new Error("start() still pending after stop()")), 250),
+      ),
+    ]);
+    seedGate.release(); // the seed settles late…
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sockets).toHaveLength(0); // …and the stopped client correctly never opens a socket
   });
 });
