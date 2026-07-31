@@ -127,6 +127,56 @@ void client.start(); // never await in the browser
 
 Requires a platform `WebSocket` (browser, Bun, or Node ≥22). On older Node, inject a `wsFactory` that wraps the [`ws`](https://www.npmjs.com/package/ws) package.
 
+### Browser — managed OPFS replica (`/browser`)
+
+`BrowserReplica` is the browser twin of `/node`'s `CatalystReplica`: an OPFS-persisted SQLite replica
+in a dedicated Web Worker, seeded from `/snapshot` in bounded streamed batches, kept live off the same
+change feed, and read through the same `@catalyst-cloud/read-model` views — no hand-written worker,
+apply, or seeding code in your app.
+
+```ts
+import {
+  BrowserReplica,
+  isBrowserReplicaSupported,
+} from "@catalyst-cloud/sdk/browser";
+
+if (isBrowserReplicaSupported()) {
+  const replica = new BrowserReplica(
+    {
+      onChanged: () => void refreshList(), // after the seed and after every applied delta drain
+      onStatus: (s) => setBadge(s), // "loading" | "live" | "reconnecting" | "error" | "secondary" | …
+    },
+    { baseUrl: "/api/v1" }, // same-origin, cookie-authed; accountId optional
+  );
+  void replica.start(); // resolves once seeded (or immediately with status "secondary")
+
+  const rows = await replica.queryIssues(); // read-model IssueView[], served locally
+  // replica.close() on teardown — cooperatively releases the OPFS handles, then terminates the worker
+}
+```
+
+Built in, because browsers need them:
+
+- **Single-owner election** (Web Locks): OPFS SAHPool is single-connection-per-origin, so exactly one
+  tab boots the replica; every other tab gets status `"secondary"` (a clean state, not an error) and
+  should read via its normal fetch path.
+- **Backpressure**: live deltas are coalesced into batched, single-flight applies with a bounded
+  buffer; a backlog too deep to replay escalates to a fresh snapshot instead of growing.
+
+**Peer dependency**: install [`@sqlite.org/sqlite-wasm`](https://www.npmjs.com/package/@sqlite.org/sqlite-wasm)
+yourself — the SDK never bundles the wasm.
+
+**Bundlers**: the worker is created with `new Worker(new URL("./db.worker.js", import.meta.url),
+{ type: "module" })`, which Vite, webpack 5, and Rollup detect statically and split into its own chunk
+(nothing wasm-related touches your main bundle; `/node` consumers never see it at all). Notes:
+
+- **Vite**: works out of the box in `build`. In dev, if pre-bundling interferes with the worker URL,
+  add `optimizeDeps: { exclude: ["@catalyst-cloud/sdk"] }`.
+- **webpack 5 / Rollup**: the `new Worker(new URL(...))` syntax is supported natively (Rollup needs
+  worker support in your config, e.g. `@surma/rollup-plugin-off-main-thread` or equivalent).
+- **Exotic bundlers**: pass `createWorker` in `BrowserReplicaOptions` and construct the worker
+  however your toolchain requires — it must run this package's `db.worker` module.
+
 ## API
 
 | Export | What it is |
