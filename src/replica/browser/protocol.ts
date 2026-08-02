@@ -9,7 +9,11 @@
 // sync-client.ts consumes; the read results are the SAME read-model view types the DO + daemon return.
 // Nothing here imports sqlite-wasm or bun:sqlite, so it stays runtime-agnostic and tree-shakes cleanly.
 
-import type { IssueView, IssueDetailView, PullView } from "@catalyst-cloud/read-model";
+import type {
+  IssueView,
+  IssueDetailView,
+  PullView,
+} from "@catalyst-cloud/read-model";
 
 /** A change-feed record as it rides the wire — the shape both /snapshot data lines and /changes rows
  *  decode to (accountId/seq are bookkeeping the worker tracks separately). Mirrors host-sync's
@@ -31,6 +35,20 @@ export interface OpenRequest {
   dbPath: string;
   /** OPFS directory the SAHPool VFS manages (one per app to avoid cross-engine collisions). */
   directory: string;
+  /**
+   * Opaque TENANT FENCE for the persisted database (CTC-114 review).
+   *
+   * `dbPath`/`directory` default to constants, so every tenant on an origin opens the SAME OPFS
+   * database. The warm-start path skips `/snapshot` whenever the persisted cursor is non-null — so
+   * after the cookie user changes, or the app starts a replica for a different `accountId`, the
+   * previous tenant's rows stayed queryable and no delta could ever remove them (deltas only carry
+   * changes, never "forget everything you knew").
+   *
+   * The worker compares this against the value stored in `sync_meta` and, on a mismatch, truncates
+   * the replica and clears the cursor so the client cold-starts into a fresh snapshot. Comparing at
+   * OPEN is what makes it a fence: it happens before any read can be served.
+   */
+  identity: string;
 }
 
 /**

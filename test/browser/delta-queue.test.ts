@@ -15,7 +15,13 @@ import {
 // into the next batch, and the caller is notified ONCE per drain rather than once per frame.
 
 function change(seq: number): SeqChange {
-  return { seq, entity: "issues", op: "upsert", row: { id: `i${seq}` }, entityId: `i${seq}` };
+  return {
+    seq,
+    entity: "issues",
+    op: "upsert",
+    row: { id: `i${seq}` },
+    entityId: `i${seq}`,
+  };
 }
 
 /** A controllable apply: each call parks until the test releases it. */
@@ -25,7 +31,9 @@ function deferredApply() {
   const apply = (changes: SeqChange[]): Promise<{ cursor: number }> => {
     batches.push(changes);
     return new Promise((resolve) => {
-      releases.push(() => resolve({ cursor: changes[changes.length - 1]?.seq ?? 0 }));
+      releases.push(() =>
+        resolve({ cursor: changes[changes.length - 1]?.seq ?? 0 }),
+      );
     });
   };
   return { apply, batches, releases };
@@ -61,7 +69,12 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
 
   it("caps a batch at maxBatch so one clone cannot carry a whole replay", async () => {
     const { apply, batches, releases } = deferredApply();
-    const q = new DeltaQueue({ apply, onDrained: vi.fn(), onError: vi.fn(), maxBatch: 10 });
+    const q = new DeltaQueue({
+      apply,
+      onDrained: vi.fn(),
+      onError: vi.fn(),
+      maxBatch: 10,
+    });
 
     // The first push applies immediately with whatever is queued at that instant — just itself. That
     // is deliberate: an idle tab must not wait for a batch to fill.

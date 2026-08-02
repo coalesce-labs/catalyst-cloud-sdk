@@ -9,12 +9,28 @@
 // seed session at a time, reads deferred mid-seed (SeedReadGate), and the ok/err envelope discipline
 // (the worker never throws across the boundary).
 
-import { buildIssuesView, buildIssueDetail, buildPullsView } from "@catalyst-cloud/read-model";
+import {
+  buildIssuesView,
+  buildIssueDetail,
+  buildPullsView,
+} from "@catalyst-cloud/read-model";
 import type { OpenedReplica } from "./ports.js";
-import { applyChange, setCursor, getCursor, truncateReplica } from "./apply.js";
+import {
+  applyChange,
+  setCursor,
+  getCursor,
+  truncateReplica,
+  getIdentity,
+  setIdentity,
+  clearCursor,
+} from "./apply.js";
 import { SeedSession } from "./seed-session.js";
 import { SeedReadGate } from "./seed-read-gate.js";
-import type { OpenRequest, ReplicaRequest, ApplyChangesResult } from "./protocol.js";
+import type {
+  OpenRequest,
+  ReplicaRequest,
+  ApplyChangesResult,
+} from "./protocol.js";
 
 /** The one OPFS-specific dependency, injected: how to open the replica for an `open` request. */
 export type ReplicaOpener = (request: OpenRequest) => Promise<OpenedReplica>;
@@ -37,7 +53,8 @@ export function createWorkerCore(open: ReplicaOpener): WorkerCore {
 
   /** Narrow `replica` to non-null or throw a message the client surfaces (never a raw undefined deref). */
   function requireReplica(): OpenedReplica {
-    if (!replica) throw new Error("replica not open — send an 'open' request first");
+    if (!replica)
+      throw new Error("replica not open — send an 'open' request first");
     return replica;
   }
 
@@ -46,6 +63,22 @@ export function createWorkerCore(open: ReplicaOpener): WorkerCore {
       case "open": {
         if (!replica) {
           replica = await open(request);
+          // TENANT FENCE (CTC-114 review). dbPath/directory default to constants, so every tenant on
+          // an origin shares one OPFS database. Enforce the fence HERE, before any read can be served:
+          // on a mismatch wipe the entity tables and delete the cursor, which makes the client's
+          // warm-start check (`getCursor() != null`) read cold and take the /snapshot path. Without
+          // this, a cookie-user change left the previous tenant's rows both readable and unremovable —
+          // deltas carry changes, never "forget everything".
+          const stored = getIdentity(replica.write);
+          if (stored !== request.identity) {
+            replica.write.transaction(() => {
+              if (stored !== null) {
+                truncateReplica(replica!.write);
+                clearCursor(replica!.write);
+              }
+              setIdentity(replica!.write, request.identity);
+            });
+          }
         }
         return undefined;
       }
@@ -59,7 +92,8 @@ export function createWorkerCore(open: ReplicaOpener): WorkerCore {
         // nested, and the replica is unusable until the Worker terminates. Seeds are serialized by
         // design (start() awaits its reseed; the SDK awaits its reseed callback), so this only ever
         // fires on a genuine double-drive, and rejecting keeps the first seed intact.
-        if (session) throw new Error("seedBegin while a seed is already in progress");
+        if (session)
+          throw new Error("seedBegin while a seed is already in progress");
         const r = requireReplica();
         session = new SeedSession(r.write, {
           truncate: truncateReplica,
@@ -114,7 +148,11 @@ export function createWorkerCore(open: ReplicaOpener): WorkerCore {
       // complete DB. When no seed is open this awaits an already-resolved promise — no added latency.
       case "queryIssues":
         await readGate.whenReadable(session !== null);
-        return buildIssuesView(requireReplica().read, request.limit, request.offset);
+        return buildIssuesView(
+          requireReplica().read,
+          request.limit,
+          request.offset,
+        );
 
       case "queryIssueDetail":
         await readGate.whenReadable(session !== null);
@@ -122,7 +160,11 @@ export function createWorkerCore(open: ReplicaOpener): WorkerCore {
 
       case "queryPulls":
         await readGate.whenReadable(session !== null);
-        return buildPullsView(requireReplica().read, request.limit, request.offset);
+        return buildPullsView(
+          requireReplica().read,
+          request.limit,
+          request.offset,
+        );
 
       case "getCursor":
         return getCursor(requireReplica().write);

@@ -23,8 +23,17 @@
 // with an exotic bundler can inject `createWorker` instead.
 
 import { LiveSyncClient } from "../../live-sync-client.js";
-import type { IssueView, IssueDetailView, PullView } from "@catalyst-cloud/read-model";
-import type { Envelope, ReplicaRequest, ReplicaResponse, ResultMap } from "./protocol.js";
+import type {
+  IssueView,
+  IssueDetailView,
+  PullView,
+} from "@catalyst-cloud/read-model";
+import type {
+  Envelope,
+  ReplicaRequest,
+  ReplicaResponse,
+  ResultMap,
+} from "./protocol.js";
 import { streamSnapshotBatches } from "./snapshot-stream.js";
 import { DeltaQueue } from "./delta-queue.js";
 import { acquireReplicaLock, type ReplicaLockHandle } from "./browser-lock.js";
@@ -45,12 +54,7 @@ const CLOSE_GRACE_MS = 250;
  *   • "unsupported" — the engine lacks OPFS/worker support (see isBrowserReplicaSupported).
  */
 export type ReplicaStatus =
-  | "loading"
-  | "live"
-  | "reconnecting"
-  | "error"
-  | "unsupported"
-  | "secondary";
+  "loading" | "live" | "reconnecting" | "error" | "unsupported" | "secondary";
 
 /** Handlers the consumer supplies to react to replica state changes. */
 export interface ReplicaHandlers {
@@ -69,6 +73,18 @@ export interface BrowserReplicaOptions {
   baseUrl: string;
   /** Target a specific account the user is a member of; omit for the session's own tenant. */
   accountId?: string;
+  /**
+   * Who this replica belongs to — REQUIRED (CTC-114 review).
+   *
+   * The persisted OPFS database is shared by every replica on the origin (`dbPath`/`directory` default
+   * to constants), and the warm-start path skips `/snapshot` whenever a cursor is persisted. Without a
+   * fence, a change of signed-in user left the PREVIOUS tenant's rows readable — and unremovable,
+   * since deltas only carry changes. Pass a stable per-user (or per-user-per-tenant) string, e.g. the
+   * WorkOS user id. It is compared at `open`, and a mismatch wipes the replica and forces a re-seed.
+   *
+   * It is opaque and never sent to the server — only compared against the value in `sync_meta`.
+   */
+  identity: string;
   /** Override the OPFS db path (absolute, leading slash required). */
   dbPath?: string;
   /** Override the OPFS directory the SAHPool manages. */
@@ -85,7 +101,8 @@ export interface BrowserReplicaOptions {
 /** Resolve `${base}/snapshot` preserving an absolute base's path (mirror of the reads' apiUrl). */
 function snapshotUrl(baseUrl: string, account?: string): string {
   const isAbsolute = /^https?:\/\//i.test(baseUrl);
-  const origin = typeof location !== "undefined" ? location.origin : "http://localhost";
+  const origin =
+    typeof location !== "undefined" ? location.origin : "http://localhost";
   const base = isAbsolute ? new URL(baseUrl) : new URL(baseUrl, origin);
   const basePath = base.pathname.replace(/\/$/, "");
   const url = new URL(base.toString());
@@ -114,7 +131,8 @@ export async function streamSeedIntoWorker(
     await call({ type: "seedBegin" });
     let cursor = 0;
     for await (const item of streamSnapshotBatches(body, batchSize)) {
-      if (item.kind === "batch") await call({ type: "seedBatch", rows: item.rows });
+      if (item.kind === "batch")
+        await call({ type: "seedBatch", rows: item.rows });
       else cursor = item.cursor;
     }
     await call({ type: "seedCommit", cursor });
@@ -193,11 +211,25 @@ export class BrowserReplica {
         void this.reseed()
           .then(() => this.deltas.resume())
           .catch((err: unknown) => {
-            console.error("[replica] re-seed after backlog overflow failed:", err);
+            console.error(
+              "[replica] re-seed after backlog overflow failed:",
+              err,
+            );
             if (!this.disposed) this.handlers.onStatus("error");
           });
       },
     });
+  }
+
+  /**
+   * The tenant fence sent with `open`.
+   *
+   * `accountId` is folded in alongside `identity` so a TENANT SWITCHER cannot reuse another account's
+   * rows even when the consumer's `identity` only identifies the signed-in user. NUL-joined because it
+   * cannot occur in either component, so no pair of values can collide by concatenation.
+   */
+  private identityKey(): string {
+    return `${this.options.identity}\0${this.options.accountId ?? ""}`;
   }
 
   /** Send a typed request to the Worker and resolve with its result (cast by the ResultMap entry). */
@@ -250,20 +282,26 @@ export class BrowserReplica {
     try {
       this.worker = this.options.createWorker
         ? this.options.createWorker()
-        : new Worker(new URL("./db.worker.js", import.meta.url), { type: "module" });
-      this.worker.addEventListener("message", (e: MessageEvent<ReplicaResponse>) => {
-        const reply = e.data;
-        const slot = this.pending.get(reply.id);
-        if (!slot) return;
-        this.pending.delete(reply.id);
-        if (reply.ok) slot.resolve(reply.result);
-        else slot.reject(new Error(reply.error));
-      });
+        : new Worker(new URL("./db.worker.js", import.meta.url), {
+            type: "module",
+          });
+      this.worker.addEventListener(
+        "message",
+        (e: MessageEvent<ReplicaResponse>) => {
+          const reply = e.data;
+          const slot = this.pending.get(reply.id);
+          if (!slot) return;
+          this.pending.delete(reply.id);
+          if (reply.ok) slot.resolve(reply.result);
+          else slot.reject(new Error(reply.error));
+        },
+      );
 
       await this.call({
         type: "open",
         dbPath: this.options.dbPath ?? DEFAULT_DB_PATH,
         directory: this.options.directory ?? DEFAULT_OPFS_DIR,
+        identity: this.identityKey(),
       });
       // Prime the cursors from the PERSISTED OPFS cursor (a prior session survives reloads — SAHPool
       // clearOnInit:false). The SDK reads this via getCursor on its first connect so a warm replica
@@ -294,16 +332,22 @@ export class BrowserReplica {
   /** Pull a fresh snapshot, replace the replica (seed), and return the snapshot cursor. Used on first
    *  start (cold OPFS) and on every SDK resync (cursor underflow). */
   private async reseed(): Promise<number> {
-    const res = await fetch(snapshotUrl(this.options.baseUrl, this.options.accountId), {
-      headers: { accept: "application/x-ndjson" },
-    });
+    const res = await fetch(
+      snapshotUrl(this.options.baseUrl, this.options.accountId),
+      {
+        headers: { accept: "application/x-ndjson" },
+      },
+    );
     if (!res.ok) throw new Error(`/snapshot ${res.status}`);
     if (!res.body) throw new Error("/snapshot returned no body stream");
     // Stream the body into the worker in bounded batches — no whole-body buffer anywhere (CTC-132).
     // `req as never`: `this.call` is generic over the request `type` discriminant, so a widened
     // `ReplicaRequest` isn't assignable to its `Extract<…, {type:K}>` parameter; the worker dispatches
     // on `request.type` at runtime, and every request the helper builds is a genuine ReplicaRequest.
-    const cursor = await streamSeedIntoWorker((req) => this.call(req as never), res.body);
+    const cursor = await streamSeedIntoWorker(
+      (req) => this.call(req as never),
+      res.body,
+    );
     this.lastSeq = cursor;
     // The snapshot IS the new baseline for both cursors — anything accepted before it is superseded.
     this.acceptedSeq = cursor;
@@ -323,8 +367,11 @@ export class BrowserReplica {
     if (typeof WebSocket === "undefined") return; // SSR/tests — no live feed.
 
     const isAbsolute = /^https?:\/\//i.test(this.options.baseUrl);
-    const origin = typeof location !== "undefined" ? location.origin : "http://localhost";
-    const base = isAbsolute ? new URL(this.options.baseUrl) : new URL(this.options.baseUrl, origin);
+    const origin =
+      typeof location !== "undefined" ? location.origin : "http://localhost";
+    const base = isAbsolute
+      ? new URL(this.options.baseUrl)
+      : new URL(this.options.baseUrl, origin);
     const baseUrl = `${base.origin}${base.pathname.replace(/\/$/, "")}`;
     // The DO scopes a cookie-authed socket to the session user's own tenant; an explicit account is the
     // tenant-switcher path (the SDK sends it as ?account=). Default to the session tenant.

@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { BrowserReplica, type ReplicaStatus } from "../../src/replica/browser/browser-replica.js";
-import type { Envelope, ReplicaResponse } from "../../src/replica/browser/protocol.js";
+import {
+  BrowserReplica,
+  type ReplicaStatus,
+} from "../../src/replica/browser/browser-replica.js";
+import type {
+  Envelope,
+  ReplicaResponse,
+} from "../../src/replica/browser/protocol.js";
 
 // CTC-114 — the main-thread client shell, driven against a FAKE worker (the real worker logic is
 // covered by worker-core.test.ts over real sqlite-wasm). What is pinned here is the client's own
@@ -14,7 +20,10 @@ class FakeWorker {
   received: Envelope[] = [];
   terminated = false;
   constructor(private readonly answers: Record<string, unknown>) {}
-  addEventListener(_type: string, fn: (e: MessageEvent<ReplicaResponse>) => void): void {
+  addEventListener(
+    _type: string,
+    fn: (e: MessageEvent<ReplicaResponse>) => void,
+  ): void {
     this.listeners.push(fn);
   }
   postMessage(envelope: Envelope): void {
@@ -23,7 +32,8 @@ class FakeWorker {
     const reply: ReplicaResponse = { id: envelope.id, ok: true, result };
     // Deliver async, like a real worker.
     queueMicrotask(() => {
-      for (const fn of this.listeners) fn({ data: reply } as MessageEvent<ReplicaResponse>);
+      for (const fn of this.listeners)
+        fn({ data: reply } as MessageEvent<ReplicaResponse>);
     });
   }
   terminate(): void {
@@ -65,6 +75,7 @@ describe("BrowserReplica (CTC-114)", () => {
     const c = collect();
     const replica = new BrowserReplica(c.handlers, {
       baseUrl: "/api/v1",
+      identity: "test-identity",
       createWorker: () => {
         constructed++;
         return new FakeWorker({}) as unknown as Worker;
@@ -81,15 +92,23 @@ describe("BrowserReplica (CTC-114)", () => {
     vi.stubGlobal("WebSocket", undefined); // node 22+ HAS a global WebSocket — keep subscribe() out
     const fetchSpy = vi.fn();
     vi.stubGlobal("fetch", fetchSpy);
-    const worker = new FakeWorker({ open: undefined, getCursor: 42, close: undefined });
+    const worker = new FakeWorker({
+      open: undefined,
+      getCursor: 42,
+      close: undefined,
+    });
     const c = collect();
     const replica = new BrowserReplica(c.handlers, {
       baseUrl: "/api/v1",
+      identity: "test-identity",
       createWorker: () => worker as unknown as Worker,
     });
     await replica.start();
 
-    expect(worker.received.map((e) => e.request.type)).toEqual(["open", "getCursor"]);
+    expect(worker.received.map((e) => e.request.type)).toEqual([
+      "open",
+      "getCursor",
+    ]);
     expect(fetchSpy).not.toHaveBeenCalled(); // warm replica must NOT re-download /snapshot
     expect(c.statuses).toEqual(["loading", "live"]);
     expect(c.changedCount()).toBe(1);
@@ -99,10 +118,15 @@ describe("BrowserReplica (CTC-114)", () => {
   it("close() sends a cooperative close RPC, then terminates on the reply", async () => {
     vi.stubGlobal("navigator", {});
     vi.stubGlobal("WebSocket", undefined);
-    const worker = new FakeWorker({ open: undefined, getCursor: 42, close: undefined });
+    const worker = new FakeWorker({
+      open: undefined,
+      getCursor: 42,
+      close: undefined,
+    });
     const c = collect();
     const replica = new BrowserReplica(c.handlers, {
       baseUrl: "/api/v1",
+      identity: "test-identity",
       createWorker: () => worker as unknown as Worker,
     });
     await replica.start();
@@ -117,10 +141,15 @@ describe("BrowserReplica (CTC-114)", () => {
   it("a query after close rejects instead of hanging", async () => {
     vi.stubGlobal("navigator", {});
     vi.stubGlobal("WebSocket", undefined);
-    const worker = new FakeWorker({ open: undefined, getCursor: 42, close: undefined });
+    const worker = new FakeWorker({
+      open: undefined,
+      getCursor: 42,
+      close: undefined,
+    });
     const c = collect();
     const replica = new BrowserReplica(c.handlers, {
       baseUrl: "/api/v1",
+      identity: "test-identity",
       createWorker: () => worker as unknown as Worker,
     });
     await replica.start();
@@ -130,7 +159,10 @@ describe("BrowserReplica (CTC-114)", () => {
 
   it("a query before start rejects instead of hanging", async () => {
     const c = collect();
-    const replica = new BrowserReplica(c.handlers, { baseUrl: "/api/v1" });
+    const replica = new BrowserReplica(c.handlers, {
+      baseUrl: "/api/v1",
+      identity: "test-identity",
+    });
     await expect(replica.queryIssues()).rejects.toThrow(/closed/);
   });
 });
