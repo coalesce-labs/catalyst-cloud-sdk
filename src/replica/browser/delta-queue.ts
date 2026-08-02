@@ -52,22 +52,47 @@ export const MAX_APPLY_BATCH_ROWS = 500;
  */
 export const MAX_INBOX_DEPTH = 20_000;
 
+/**
+ * Consecutive apply rejections tolerated before the queue stops retrying and asks for a re-seed.
+ *
+ * Bounded deliberately. A transient OPFS/SQLite error deserves a retry, but `applyChanges` can also
+ * reject DETERMINISTICALLY (schema drift, a row the current schema cannot accept) — and an unbounded
+ * retry on that is a hot loop that never converges. After this many failures the batch is no longer
+ * replayable in place, so escalating to a snapshot is both the correct answer and the terminating one.
+ */
+export const MAX_APPLY_RETRIES = 3;
+
+/** Base delay between apply retries; grows linearly with the failure count. */
+export const APPLY_RETRY_DELAY_MS = 250;
+
+/** Why the owner is being asked to re-seed. */
+export type OverflowReason = "depth" | "apply-failed";
+
 /** What the queue needs from its owner. `apply` resolves with the worker's post-apply cursor. */
 export interface DeltaQueueOptions {
   apply: (changes: SeqChange[]) => Promise<{ cursor: number }>;
   /** Called ONCE per completed drain (not per batch, and never per frame) with the highest cursor. */
   onDrained: (cursor: number) => void;
-  /** Called when an apply rejects. Whatever is still queued is left in place for the next push. */
+  /** Called when an apply rejects. The failed batch is REQUEUED, so this is a warning, not a loss. */
   onError: (err: unknown) => void;
   /**
-   * Called ONCE when the buffer passes {@link MAX_INBOX_DEPTH} — the backlog is deeper than it is
-   * worth replaying, so the owner should drop the socket and re-seed from /snapshot. The queue drops
-   * what it is holding at that point: those frames are about to be superseded by the snapshot, and
-   * keeping them is exactly the retention this bound exists to prevent.
+   * Called ONCE when the owner must drop the socket and re-seed from /snapshot, with the depth at the
+   * moment of escalation and the reason:
+   *
+   *   • `"depth"`        — the buffer passed {@link MAX_INBOX_DEPTH}. The backlog is deeper than it is
+   *     worth replaying, so the queue drops what it holds: those frames are about to be superseded by
+   *     the snapshot, and keeping them is exactly the retention this bound exists to prevent.
+   *   • `"apply-failed"` — {@link MAX_APPLY_RETRIES} consecutive applies rejected. The buffered rows
+   *     cannot be written, so the cursor cannot advance past them safely; only a re-seed recovers.
+   *
+   * `reason` is a SECOND parameter rather than a changed first one so existing one-arg handlers keep
+   * working unchanged.
    */
-  onOverflow?: (depth: number) => void;
+  onOverflow?: (depth: number, reason: OverflowReason) => void;
   maxBatch?: number;
   maxDepth?: number;
+  maxApplyRetries?: number;
+  retryDelayMs?: number;
 }
 
 export class DeltaQueue {
@@ -78,11 +103,18 @@ export class DeltaQueue {
   private readonly opts: DeltaQueueOptions;
   private readonly maxBatch: number;
   private readonly maxDepth: number;
+  private readonly maxApplyRetries: number;
+  private readonly retryDelayMs: number;
+  /** Consecutive apply rejections. Reset by any successful batch and by resume(). */
+  private applyFailures = 0;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(opts: DeltaQueueOptions) {
     this.opts = opts;
     this.maxBatch = opts.maxBatch ?? MAX_APPLY_BATCH_ROWS;
     this.maxDepth = opts.maxDepth ?? MAX_INBOX_DEPTH;
+    this.maxApplyRetries = opts.maxApplyRetries ?? MAX_APPLY_RETRIES;
+    this.retryDelayMs = opts.retryDelayMs ?? APPLY_RETRY_DELAY_MS;
   }
 
   /** How many deltas are buffered but not yet applied (observability + tests). */
@@ -100,7 +132,8 @@ export class DeltaQueue {
       this.overflowed = true;
       const depth = this.inbox.length;
       this.inbox.length = 0;
-      this.opts.onOverflow?.(depth);
+      this.clearRetry();
+      this.opts.onOverflow?.(depth, "depth");
       return;
     }
     void this.drain();
@@ -110,6 +143,32 @@ export class DeltaQueue {
   resume(): void {
     if (this.stopped) return;
     this.overflowed = false;
+    // The re-seed supersedes whatever could not be applied, so the failure streak starts over.
+    this.applyFailures = 0;
+  }
+
+  /** Cancel a pending self-retry. */
+  private clearRetry(): void {
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+  }
+
+  /**
+   * Re-enter the drain on a timer after a failed apply.
+   *
+   * Self-driven on purpose: `push()` is the only other thing that starts a drain, so on a quiet feed a
+   * requeued batch would otherwise sit in the inbox indefinitely — while `acceptedSeq` on the socket
+   * has already advanced past it, meaning a reconnect would never replay it either.
+   */
+  private scheduleRetry(): void {
+    if (this.stopped || this.overflowed || this.retryTimer !== null) return;
+    const delay = this.retryDelayMs * this.applyFailures;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      void this.drain();
+    }, delay);
   }
 
   /**
@@ -122,19 +181,40 @@ export class DeltaQueue {
     this.draining = true;
     let applied = false;
     let highest = 0;
-    try {
-      while (this.inbox.length > 0 && !this.stopped) {
-        const batch = this.inbox.splice(0, this.maxBatch);
+    while (this.inbox.length > 0 && !this.stopped) {
+      // `splice` REMOVES the batch before the await, so the failure path below must put it back. It
+      // previously did not, and the loss was silent and permanent: worker-core.applyChanges advances
+      // the durable OPFS cursor to the highest seq it has SEEN, so the next successful batch sealed
+      // the hole below the cursor. A reload does not heal that, and the socket's high-water mark
+      // stops a reconnect from replaying it — up to maxBatch rows simply ceased to exist locally.
+      const batch = this.inbox.splice(0, this.maxBatch);
+      try {
         const { cursor } = await this.opts.apply(batch);
         if (cursor > highest) highest = cursor;
         for (const c of batch) if (c.seq > highest) highest = c.seq;
         applied = true;
+        this.applyFailures = 0;
+      } catch (err) {
+        this.draining = false;
+        if (this.stopped) return;
+        // Back at the FRONT: these seqs are strictly older than anything still queued behind them,
+        // and the worker applies in order.
+        this.inbox.unshift(...batch);
+        this.applyFailures += 1;
+        this.opts.onError(err);
+        if (this.applyFailures >= this.maxApplyRetries) {
+          // Not replayable in place. Drop the backlog and let the owner re-seed — same contract as a
+          // depth overflow, so the owner needs no new branch.
+          this.overflowed = true;
+          const depth = this.inbox.length;
+          this.inbox.length = 0;
+          this.clearRetry();
+          this.opts.onOverflow?.(depth, "apply-failed");
+        } else {
+          this.scheduleRetry();
+        }
+        return;
       }
-    } catch (err) {
-      // Leave whatever is still queued in place — the next push() re-enters the drain.
-      this.draining = false;
-      if (!this.stopped) this.opts.onError(err);
-      return;
     }
     this.draining = false;
     // ONE notification per drain rather than one per frame. The caller's reaction is a full view
@@ -147,6 +227,7 @@ export class DeltaQueue {
    *  parsed row, so leaving them behind would pin that memory until the queue itself is collected. */
   stop(): void {
     this.stopped = true;
+    this.clearRetry();
     this.inbox.length = 0;
   }
 }

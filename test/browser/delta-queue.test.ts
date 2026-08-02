@@ -118,32 +118,39 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
     await vi.waitFor(() => expect(onDrained).toHaveBeenCalledWith(42));
   });
 
-  it("surfaces an apply failure and leaves the rest queued for the next push", async () => {
+  it("surfaces an apply failure and REQUEUES the failed batch, losing nothing", async () => {
     const onError = vi.fn();
     const onDrained = vi.fn();
+    const applied: number[] = [];
     let calls = 0;
     const q = new DeltaQueue({
       apply: (c) => {
         calls++;
-        return calls === 1
-          ? Promise.reject(new Error("boom"))
-          : Promise.resolve({ cursor: c[0]!.seq });
+        if (calls === 1) return Promise.reject(new Error("boom"));
+        for (const ch of c) applied.push(ch.seq);
+        return Promise.resolve({ cursor: c[c.length - 1]!.seq });
       },
       onDrained,
       onError,
       maxBatch: 1,
+      // Keep the self-retry inert so this test observes the requeue directly rather than racing it.
+      retryDelayMs: 10_000,
     });
 
     q.push(change(1));
     q.push(change(2));
     await vi.waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
-    // The un-applied frame is still buffered — the failure did not silently drop data.
-    expect(q.depth).toBe(1);
+    // BOTH frames are buffered: the failed batch went back to the front, and #2 is still behind it.
+    // This previously read `1` — the failed batch had been spliced out and dropped, and the assertion
+    // was pinning that loss while its comment claimed the opposite.
+    expect(q.depth).toBe(2);
 
     // …and the next arrival re-enters the drain rather than wedging forever.
     q.push(change(3));
     await vi.waitFor(() => expect(q.depth).toBe(0));
     expect(onDrained).toHaveBeenCalled();
+    // The whole point: seq 1 is APPLIED, in order, not skipped. A depth-only assertion cannot see this.
+    expect(applied).toEqual([1, 2, 3]);
   });
 
   it("stop() drops the buffer and refuses further work", async () => {
@@ -240,5 +247,51 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
     // CHANGE_LOG_MAX_ROWS is 200,000; at ~19.5 KB of parsed row per issues frame an unbounded buffer
     // would be multi-GB. 20k caps it around 390 MB worst case.
     expect(MAX_INBOX_DEPTH).toBe(20_000);
+  });
+
+  it("escalates to a re-seed when apply keeps rejecting — it does not retry forever", async () => {
+    // `applyChanges` can reject DETERMINISTICALLY (schema drift, a row this schema cannot accept).
+    // An unbounded requeue-and-retry on that is a hot loop that never converges, so the queue gives up
+    // after MAX_APPLY_RETRIES and asks the owner to re-seed — the same contract as a depth overflow.
+    const onError = vi.fn();
+    const onOverflow = vi.fn();
+    const q = new DeltaQueue({
+      apply: () => Promise.reject(new Error("schema drift")),
+      onDrained: vi.fn(),
+      onError,
+      onOverflow,
+      maxBatch: 1,
+      retryDelayMs: 1,
+    });
+
+    q.push(change(1));
+
+    await vi.waitFor(() => expect(onOverflow).toHaveBeenCalledTimes(1));
+    expect(onOverflow.mock.calls[0]?.[1]).toBe("apply-failed");
+    expect(onError).toHaveBeenCalledTimes(3);
+    // Latched: the queue refuses further work until the owner's re-seed calls resume().
+    expect(q.depth).toBe(0);
+    q.push(change(2));
+    expect(q.depth).toBe(0);
+
+    q.resume();
+    expect(q.depth).toBe(0);
+  });
+
+  it("a depth overflow reports its reason too", async () => {
+    const onOverflow = vi.fn();
+    const { apply } = deferredApply();
+    const q = new DeltaQueue({
+      apply,
+      onDrained: vi.fn(),
+      onError: vi.fn(),
+      onOverflow,
+      maxDepth: 3,
+    });
+
+    for (let i = 1; i <= 5; i++) q.push(change(i));
+
+    expect(onOverflow).toHaveBeenCalledTimes(1);
+    expect(onOverflow.mock.calls[0]?.[1]).toBe("depth");
   });
 });
