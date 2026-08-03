@@ -40,7 +40,7 @@ const NOOP_HANDLE: ReplicaLockHandle = { held: false, release: () => {} };
 
 /** One `ifAvailable` probe: resolve a handle when the lock is ours, else null. Never queues. */
 function tryAcquire(name: string): Promise<ReplicaLockHandle | null> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     // The held-lock idiom: the lock lives exactly as long as the promise the callback returns. We
     // resolve the OUTER promise from inside the callback (so the caller learns the outcome), and park
     // the callback's own promise until release() settles it.
@@ -62,7 +62,15 @@ function tryAcquire(name: string): Promise<ReplicaLockHandle | null> {
           });
         });
       })
-      .catch(() => resolve(null)); // a throwing lock manager reads as "not acquired", never as a crash.
+      // A REJECTING lock manager is not contention (CTC-114 review round 5). Collapsing it to the same
+      // `null` that `ifAvailable` uses for "another tab holds it" made a denied or malfunctioning Web
+      // Locks API resolve start() as "secondary" — a clean, terminal, NON-error state — when in fact no
+      // other tab owned the replica and the documented boot-error path was never reached. The consumer
+      // silently sat on the fallback path forever with nothing to diagnose from. Propagate instead, so
+      // the caller can tell "someone else has it" (null) from "the lock API is broken" (throw).
+      .catch((err: unknown) =>
+        reject(err instanceof Error ? err : new Error(String(err))),
+      );
   });
 }
 
@@ -70,6 +78,12 @@ function tryAcquire(name: string): Promise<ReplicaLockHandle | null> {
  * Claim sole ownership of the origin's OPFS replica. Resolves a held handle when THIS tab should boot
  * the replica; `null` when another live tab owns it (caller should surface "secondary", not an error);
  * a no-op handle (`held: false`) when the runtime has no Web Locks API at all.
+ *
+ * REJECTS when the Web Locks API is present but throws — denied by policy, or malfunctioning. That is
+ * a boot failure, NOT contention, and the caller must not report it as "secondary": no other tab owns
+ * the replica, so "secondary" would be both wrong and terminal, leaving the consumer on the fallback
+ * path with nothing to diagnose. Not retried either — a denied API does not recover, and retrying only
+ * delays the diagnosis (CTC-114 review round 5).
  */
 export async function acquireReplicaLock(
   name: string,

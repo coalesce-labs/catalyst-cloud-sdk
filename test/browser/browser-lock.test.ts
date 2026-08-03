@@ -77,11 +77,18 @@ describe("acquireReplicaLock (CTC-118)", () => {
     handle?.release(); // must not throw
   });
 
-  it("a throwing lock manager reads as not-acquired, never as a crash", async () => {
+  it("PROPAGATES a throwing lock manager rather than reporting it as contention", async () => {
+    // INVERTED in CTC-114 review round 5. This used to assert `null` — the very same value
+    // `ifAvailable` returns for "another live tab holds the lock". Collapsing the two meant a Web
+    // Locks API that was denied by policy or simply malfunctioning resolved BrowserReplica.start()
+    // into "secondary": a clean, terminal, non-error state claiming another tab owned the replica when
+    // none did. The consumer then sat on the fallback path for the life of the document with nothing
+    // to diagnose from. A throw is a boot failure and must reach the documented boot-error path.
     vi.stubGlobal("navigator", {
       locks: { request: () => Promise.reject(new Error("boom")) },
     });
-    const handle = await acquireReplicaLock("catalyst-replica:test", { retries: 0 });
-    expect(handle).toBeNull();
+    await expect(
+      acquireReplicaLock("catalyst-replica:test", { retries: 0 }),
+    ).rejects.toThrow("boom");
   });
 });

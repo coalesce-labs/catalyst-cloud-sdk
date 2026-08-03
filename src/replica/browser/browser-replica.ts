@@ -444,9 +444,21 @@ export class BrowserReplica {
     this.handlers.onStatus("loading");
     // The lock comes FIRST — before the worker, before the wasm chunk — so a losing tab pays nothing.
     if (!this.options.disableLock) {
-      const lock = await acquireReplicaLock(
-        `catalyst-replica:${this.options.directory ?? DEFAULT_OPFS_DIR}`,
-      );
+      let lock: ReplicaLockHandle | null;
+      try {
+        lock = await acquireReplicaLock(
+          `catalyst-replica:${this.options.directory ?? DEFAULT_OPFS_DIR}`,
+        );
+      } catch (err) {
+        // A REJECTING lock manager is a BOOT FAILURE, not contention (CTC-114 review round 5). It used
+        // to be folded into the same `null` that means "another tab owns the replica", so start()
+        // resolved with the clean, terminal "secondary" state and the consumer sat on the fallback
+        // path forever with nothing to diagnose. Route it to the documented boot-error path instead.
+        // Nothing to release: the lock is claimed BEFORE the worker, so none exists yet.
+        console.error("[replica] boot failed: the Web Locks API rejected:", err);
+        if (!this.disposed) this.handlers.onStatus("error");
+        throw err;
+      }
       if (this.disposed) {
         lock?.release();
         return;
@@ -588,6 +600,34 @@ export class BrowserReplica {
       return this.call(req as never);
     };
 
+    /**
+     * The idle bound measures the NETWORK, and only the network (CTC-114 review round 5).
+     *
+     * It re-armed on body chunks alone, so it stayed armed across every `seedBatch` RPC and — the
+     * sharp case — across the final `seedCommit`, which runs after the body is fully consumed and so
+     * can never be re-armed by progress. A commit of a ~100 MB snapshot on slow or background-
+     * throttled OPFS that crossed the 30s bound aborted a seed whose stream was perfectly healthy;
+     * the post-stream re-check then reported a snapshot that had ALREADY COMMITTED as "seed
+     * superseded", so the client threw it away and re-fetched. On a big corpus that can fail to
+     * converge at all. This restores what DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS already documents: "this
+     * only fires when the server has genuinely stopped sending."
+     *
+     * KNOWN GAP, deliberately not closed here: `call()` has no timeout of its own, so while this
+     * timer is down a worker that never replies is unbounded. That was never a designed bound — it
+     * was a side effect of measuring the wrong thing — and inventing an RPC deadline under review,
+     * one that could abort a commit about to succeed, is the more dangerous change to make against a
+     * release candidate. Filed separately.
+     */
+    const seedCall = async (req: ReplicaRequest): Promise<unknown> => {
+      clearIdle();
+      try {
+        return await guardedCall(req);
+      } finally {
+        // Back to waiting on the body — start a FRESH window rather than resuming a partly-spent one.
+        armIdle();
+      }
+    };
+
     try {
       armIdle();
       const res = await fetch(
@@ -609,7 +649,7 @@ export class BrowserReplica {
       // `ReplicaRequest` isn't assignable to its `Extract<…, {type:K}>` parameter; the worker dispatches
       // on `request.type` at runtime, and every request the helper builds is a genuine ReplicaRequest.
       const cursor = await streamSeedIntoWorker(
-        guardedCall,
+        seedCall,
         res.body,
         undefined,
         armIdle,

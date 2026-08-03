@@ -211,7 +211,15 @@ export class DeltaQueue {
    * next batch.
    */
   async drain(): Promise<void> {
-    if (this.draining || this.stopped) return;
+    // A PENDING RETRY owns the next attempt (CTC-114 review round 5). `push()` calls drain() on every
+    // incoming frame and only `draining` was checked — but the failure path clears `draining` before
+    // arming the backoff, so the very next live frame re-entered immediately and the 250/500 ms delay
+    // never elapsed. On a busy feed three frames could burn the whole `maxApplyRetries` budget in
+    // milliseconds and escalate to a full /snapshot re-seed for a transient OPFS error that the
+    // documented delay would have ridden out. Frames arriving meanwhile are NOT lost — they buffer in
+    // the inbox, and the retry drains the whole of it. scheduleRetry()'s own timer nulls this field
+    // before calling drain(), so the retry itself is never blocked by this guard.
+    if (this.draining || this.stopped || this.retryTimer !== null) return;
     this.draining = true;
     let applied = false;
     let highest = 0;

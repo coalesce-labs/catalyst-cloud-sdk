@@ -36,7 +36,12 @@ class FakeWorker {
   /** When true, never answer — models a worker that loaded but is wedged. */
   silent = false;
 
-  constructor(private readonly answers: Record<string, unknown> = {}) {}
+  constructor(
+    private readonly answers: Record<string, unknown> = {},
+    /** Per-request-type reply delay in ms — models a SLOW worker (e.g. an OPFS commit on throttled
+     *  storage) as distinct from a wedged one (`silent`). */
+    private readonly delays: Record<string, number> = {},
+  ) {}
 
   addEventListener(type: string, fn: (e: unknown) => void): void {
     const list = this.listeners.get(type) ?? [];
@@ -57,9 +62,12 @@ class FakeWorker {
       answer instanceof Error
         ? { id: envelope.id, ok: false, error: answer.message }
         : { id: envelope.id, ok: true, result: answer };
-    queueMicrotask(() => {
+    const send = (): void => {
       this.emit("message", { data: reply } as MessageEvent<ReplicaResponse>);
-    });
+    };
+    const delay = this.delays[envelope.request.type] ?? 0;
+    if (delay > 0) setTimeout(send, delay);
+    else queueMicrotask(send);
   }
 
   /** A module-script load failure: a BARE Event, no `.message`, no `.error`. */
@@ -825,6 +833,72 @@ describe("a queue overflow quiesces the socket and never stays latched (CTC-114 
     );
     replica.close();
   }, 15_000);
+
+  it("a SLOW worker commit does not trip the snapshot idle bound", async () => {
+    // CTC-114 review round 5. The idle timer re-armed on body chunks only, so it stayed armed across
+    // every seedBatch RPC and — the sharp case — across the final seedCommit, which runs AFTER the
+    // body is fully consumed and so can never be re-armed by progress. A ~100 MB commit on slow or
+    // background-throttled OPFS that crossed the bound aborted a seed whose stream was perfectly
+    // healthy, and the post-stream re-check then reported an ALREADY-COMMITTED snapshot as "seed
+    // superseded" — so the client discarded it and re-fetched, potentially never converging.
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("WebSocket", undefined);
+    stubFetch(() => okSnapshot([{ entity: "issues", op: "upsert", row: { id: "a" } }], 77));
+    const worker = new FakeWorker(
+      {
+        open: undefined,
+        getCursor: null, // cold → take the seed path
+        seedBegin: undefined,
+        seedBatch: undefined,
+        seedCommit: 77,
+        seedAbort: undefined,
+        close: undefined,
+      },
+      // The commit takes far longer than the idle bound below, with the stream long since finished.
+      { seedCommit: 120 },
+    );
+    const c = collect();
+    const replica = new BrowserReplica(
+      c.handlers,
+      opts({
+        snapshotIdleTimeoutMs: 30,
+        createWorker: () => worker as unknown as Worker,
+      }),
+    );
+
+    // THE OUTCOME: the seed completes. Unfixed, the timer fires mid-commit and start() rejects.
+    await expect(replica.start()).resolves.toBeUndefined();
+    expect(c.statuses).toContain("live");
+    expect(worker.received.map((e) => e.request.type)).not.toContain("seedAbort");
+    replica.close();
+  }, 15_000);
+
+  it("a THROWING lock manager boots to 'error', never to 'secondary'", async () => {
+    // CTC-114 review round 5. A denied / malfunctioning Web Locks API was collapsed into the same
+    // `null` that means "another tab owns the replica", so start() resolved into the clean, terminal
+    // "secondary" state — the consumer stayed on the fallback path for the life of the document,
+    // believing a sibling tab held the lock when none did, with nothing to diagnose.
+    vi.stubGlobal("navigator", {
+      locks: { request: () => Promise.reject(new Error("locks denied")) },
+    });
+    vi.stubGlobal("WebSocket", undefined);
+    let constructed = 0;
+    const c = collect();
+    const replica = new BrowserReplica(
+      c.handlers,
+      opts({
+        createWorker: () => {
+          constructed++;
+          return new FakeWorker({}) as unknown as Worker;
+        },
+      }),
+    );
+
+    await expect(replica.start()).rejects.toThrow("locks denied");
+    expect(c.statuses).toContain("error");
+    expect(c.statuses).not.toContain("secondary");
+    expect(constructed).toBe(0); // the lock is claimed before any worker/wasm cost
+  });
 
   it("still sends seedAbort to the worker when the idle timeout fires", async () => {
     // The idle bound aborts the FETCH — but the worker has already run `seedBegin`, so it is sitting

@@ -335,6 +335,36 @@ describe("requestResync() — the consumer-driven resync entry point (CTC-114 re
     client.stop();
   });
 
+  it("is a no-op BEFORE start() — no reseed, no orphaned socket", async () => {
+    // CTC-114 review round 5. `stopped` is false on a client that has never started, so it could not
+    // carry this guard by itself: requestResync() ran the reseed and opened a socket with no lifecycle
+    // deferred and no telemetry resolved. The real damage came next — openSocket() overwrites
+    // `this.ws`, so the later genuine start() orphaned that first socket: it kept delivering duplicate
+    // frames and stop() could no longer reach it.
+    const store = makeStore(7); // warm cursor → a real start() goes straight to the socket
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(12),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+    });
+
+    await client.requestResync();
+    expect(store.reseedCalls.count).toBe(0);
+    expect(sockets).toHaveLength(0);
+
+    // And the real start() still opens EXACTLY one socket.
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    expect(sockets).toHaveLength(1);
+    client.stop();
+  });
+
   it("never rejects when the re-seed fails", async () => {
     const { sockets, factory } = recordingFactory();
     const client = new LiveSyncClient({

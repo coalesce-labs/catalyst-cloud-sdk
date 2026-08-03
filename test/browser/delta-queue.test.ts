@@ -132,38 +132,57 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
   });
 
   it("surfaces an apply failure and REQUEUES the failed batch, losing nothing", async () => {
-    const onError = vi.fn();
-    const onDrained = vi.fn();
-    const applied: number[] = [];
-    let calls = 0;
-    const q = new DeltaQueue({
-      apply: (c) => {
-        calls++;
-        if (calls === 1) return Promise.reject(new Error("boom"));
-        for (const ch of c) applied.push(ch.seq);
-        return Promise.resolve({ cursor: c[c.length - 1]!.seq });
-      },
-      onDrained,
-      onError,
-      maxBatch: 1,
-      // Keep the self-retry inert so this test observes the requeue directly rather than racing it.
-      retryDelayMs: 10_000,
-    });
+    // Driven on FAKE timers since CTC-114 review round 5. The second half used to rely on
+    // `q.push(change(3))` re-entering the drain — "the next arrival re-enters the drain rather than
+    // wedging forever" — which is exactly the behaviour the review flagged: push() bypassed the armed
+    // backoff entirely, so on a busy feed a handful of frames could burn the whole maxApplyRetries
+    // budget in milliseconds and escalate to a full /snapshot for a transient error the delay would
+    // have ridden out. The OUTCOME this test exists for — nothing is lost, and 1/2/3 apply IN ORDER —
+    // is unchanged and still asserted; only the mechanism that resumes the drain moves, from "any
+    // incoming frame" to "the scheduled retry".
+    vi.useFakeTimers();
+    try {
+      const onError = vi.fn();
+      const onDrained = vi.fn();
+      const applied: number[] = [];
+      let calls = 0;
+      const q = new DeltaQueue({
+        apply: (c) => {
+          calls++;
+          if (calls === 1) return Promise.reject(new Error("boom"));
+          for (const ch of c) applied.push(ch.seq);
+          return Promise.resolve({ cursor: c[c.length - 1]!.seq });
+        },
+        onDrained,
+        onError,
+        maxBatch: 1,
+        retryDelayMs: 1000,
+      });
 
-    q.push(change(1));
-    q.push(change(2));
-    await vi.waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
-    // BOTH frames are buffered: the failed batch went back to the front, and #2 is still behind it.
-    // This previously read `1` — the failed batch had been spliced out and dropped, and the assertion
-    // was pinning that loss while its comment claimed the opposite.
-    expect(q.depth).toBe(2);
+      q.push(change(1));
+      q.push(change(2));
+      await vi.advanceTimersByTimeAsync(0); // let the failing apply settle
+      expect(onError).toHaveBeenCalledTimes(1);
+      // BOTH frames are buffered: the failed batch went back to the front, and #2 is still behind it.
+      // This previously read `1` — the failed batch had been spliced out and dropped, and the
+      // assertion was pinning that loss while its comment claimed the opposite.
+      expect(q.depth).toBe(2);
 
-    // …and the next arrival re-enters the drain rather than wedging forever.
-    q.push(change(3));
-    await vi.waitFor(() => expect(q.depth).toBe(0));
-    expect(onDrained).toHaveBeenCalled();
-    // The whole point: seq 1 is APPLIED, in order, not skipped. A depth-only assertion cannot see this.
-    expect(applied).toEqual([1, 2, 3]);
+      // A new arrival must NOT bypass the armed backoff — it buffers and waits its turn.
+      q.push(change(3));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(q.depth).toBe(3);
+      expect(calls).toBe(1); // no second apply attempt yet: the delay is still running
+
+      // The scheduled RETRY is what resumes the drain.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(q.depth).toBe(0);
+      expect(onDrained).toHaveBeenCalled();
+      // The whole point: seq 1 is APPLIED, in order, not skipped. Depth alone cannot see this.
+      expect(applied).toEqual([1, 2, 3]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("stop() drops the buffer and refuses further work", async () => {

@@ -358,6 +358,15 @@ export class LiveSyncClient {
 
   private ws: WebSocketLike | null = null;
   private stopped = false;
+  /**
+   * Has start() been entered? `stopped` alone cannot answer this — it is false BEFORE the first
+   * start() as well as during a run, so every "am I running?" guard read true on a client that had
+   * never booted. Only the public `requestResync()` can reach that window (CTC-114 review round 5):
+   * it would reseed and open a socket with no lifecycle deferred and no telemetry resolved, and the
+   * later real start() would then openSocket() again — overwriting `this.ws`, so the first socket
+   * kept delivering duplicate frames and could no longer be closed through the stored reference.
+   */
+  private started = false;
   private resyncing = false;
   private backoff: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -470,6 +479,7 @@ export class LiveSyncClient {
    */
   start(): Promise<void> {
     this.stopped = false;
+    this.started = true;
     // The done deferred is created BEFORE the boot body runs (CTC-281 N2): stop() during the cold-seed
     // await used to find resolveDone still null and leave the returned promise pending forever — a
     // contract violation for a consumer awaiting start(). The boot body below is deliberately its OWN
@@ -989,6 +999,16 @@ export class LiveSyncClient {
    */
   async requestResync(): Promise<void> {
     if (this.stopped) return;
+    // BEFORE start() there is nothing to resync (CTC-114 review round 5). `stopped` is false on a
+    // never-started client, so it cannot carry this guard by itself. Reseeding here would run with no
+    // lifecycle deferred and no telemetry resolved, and — worse — open a socket that the later real
+    // start() would orphan: openSocket() overwrites `this.ws`, so the first socket keeps delivering
+    // frames and stop() can no longer reach it. Ignore rather than throw: the contract above is that
+    // this never rejects, and it is called from `void` contexts.
+    if (!this.started) {
+      this.log("warn", "requestResync() before start() — ignored");
+      return;
+    }
     // Unlike the frame path, this entry point can be called MID-BACKOFF: the queue overflowed while the
     // client was already waiting to reconnect. handleResync would then reopen the socket itself and the
     // pending timer would open a second one on top of it.
