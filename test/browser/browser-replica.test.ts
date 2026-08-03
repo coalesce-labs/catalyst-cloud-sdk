@@ -910,6 +910,49 @@ describe("a queue overflow quiesces the socket and never stays latched (CTC-114 
     expect(worker.terminated).toBe(true);
   }, 15_000);
 
+  it("a WEDGED applyChanges is bounded instead of freezing the delta queue", async () => {
+    // CTC-114 review round 7. Round 6 bounded only the SEED RPCs, leaving the live path with the same
+    // hole: a worker that accepts an `applyChanges` and never replies (an OPFS/SQLite op wedging
+    // without firing a worker `error`) left the promise pending forever, so the queue stayed
+    // permanently `draining` and could reach NEITHER its retry nor its overflow recovery — the two
+    // paths that exist for exactly this. Worse, arriving frames kept advancing `acceptedSeq`, so a
+    // reconnect resumed ABOVE changes that were never committed and sealed the hole.
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("location", { origin: "https://app.example" });
+    const Sock = recordingSocketGlobal();
+    stubFetch(() => okSnapshot([], 42));
+    const worker = new FakeWorker(
+      { open: undefined, getCursor: 42, close: undefined }, // WARM: no seed needed
+      {},
+      ["applyChanges"], // accepted, never answered
+    );
+    const c = collect();
+    const replica = new BrowserReplica(c.handlers, {
+      baseUrl: "https://app.example/api/v1",
+      identity: "u1",
+      workerRpcTimeoutMs: 40,
+      createWorker: () => worker as unknown as Worker,
+    });
+    await replica.start();
+    Sock.sockets[0]!.fireOpen();
+    Sock.sockets[0]!.deliver({
+      type: "change",
+      seq: 43,
+      entity: "issues",
+      entityId: "i1",
+      op: "upsert",
+      row: { id: "i1" },
+    });
+
+    // THE OUTCOME: the wedge surfaces. Unfixed, nothing ever happens — no error, no overflow, no
+    // retry; the replica just silently stops applying while still reporting itself connected.
+    await vi.waitFor(() => expect(worker.terminated).toBe(true), {
+      timeout: 4000,
+    });
+    expect(c.statuses).toContain("error");
+    replica.close();
+  }, 15_000);
+
   it("a THROWING lock manager boots to 'error', never to 'secondary'", async () => {
     // CTC-114 review round 5. A denied / malfunctioning Web Locks API was collapsed into the same
     // `null` that means "another tab owns the replica", so start() resolved into the clean, terminal

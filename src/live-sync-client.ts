@@ -367,6 +367,12 @@ export class LiveSyncClient {
    * kept delivering duplicate frames and could no longer be closed through the stored reference.
    */
   private started = false;
+  /** The in-flight boot task, or null once it settles — `requestResync()` serializes behind it. */
+  private bootTask: Promise<void> | null = null;
+  /** Settles an in-flight `boundedReseed` wrapper on stop(), so an awaited resync cannot hang. */
+  private abandonReseed: (() => void) | null = null;
+  /** Did the boot this request waited on perform a COLD re-seed? Only then may it be absorbed. */
+  private bootColdSeeded = false;
   private resyncing = false;
   private backoff: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -506,11 +512,16 @@ export class LiveSyncClient {
       // Until this release the invariant held for free — a resync could only be driven by a server
       // frame, and a frame needs a socket, which does not exist until openSocket() below.
       //
-      // ABSORBING the request (rather than queueing it) is right on both arms. Cold: this boot IS a
-      // full re-seed from /snapshot, exactly what the caller wants. Warm: the boot opens with
-      // `{type:"sync", after:<cursor>}`, which is itself the catch-up mechanism — and if the server
-      // can no longer serve that range it answers `{type:"resync"}` and we reseed anyway. So a resync
-      // requested here is at worst a heavier version of what the boot already does.
+      // The latch makes the request WAIT; whether it is then absorbed or honoured is decided in
+      // requestResync() from `bootColdSeeded`, once this task has settled.
+      //
+      // Round 6 absorbed it on BOTH arms, arguing that a warm boot's `{type:"sync", after:<cursor>}`
+      // is itself the catch-up. That was wrong (round 7), and wrong against this method's whole
+      // reason for existing: a consumer calls requestResync() when it has discovered ON ITS OWN SIDE
+      // that deltas can no longer catch its store up — the browser replica's dropped overflow buffer
+      // is the motivating case. Replaying from the cursor cannot rebuild rows the consumer already
+      // lost, so silently swallowing the request left it permanently inconsistent. Only a COLD boot
+      // may absorb it, because that boot really is a full re-seed from /snapshot.
       this.resyncing = true;
       try {
         // Resolve the OTel seam ONCE up front (before the first reseed, so the seed span exists on the
@@ -535,6 +546,9 @@ export class LiveSyncClient {
           // Bounded like the resync-path reseed (CTC-281): a hanging COLD seed surfaces as a start()
           // rejection (the boot arm rejects) instead of a silent forever-"resyncing" start().
           await this.boundedReseed();
+          // Only NOW may a request that waited on this boot be absorbed — this really was a full
+          // re-seed from /snapshot. A warm boot sets nothing, so the waiter is honoured instead.
+          this.bootColdSeeded = true;
         }
       } finally {
         // Must clear on the FAILURE arm too, or a failed boot latches the client into a state where
@@ -543,6 +557,14 @@ export class LiveSyncClient {
       }
       this.openSocket();
     })();
+    this.bootTask = boot;
+    // Clear the handle once boot settles, so a resync arriving LONG after startup is never mistaken
+    // for one that raced it — otherwise `bootColdSeeded` would absorb legitimate later requests
+    // forever. The catch keeps a boot rejection from surfacing as an unhandled one on this arm; the
+    // race below is what actually reports it.
+    void boot.catch(() => undefined).then(() => {
+      if (this.bootTask === boot) this.bootTask = null;
+    });
     // Settles when stop() resolves the deferred, OR rejects if the boot (cold seed) fails — a boot
     // SUCCESS deliberately keeps waiting on `done` (the "runs forever" contract). Promise.race
     // attaches handlers to both arms, so a boot rejection after stop() is never an unhandled one.
@@ -565,6 +587,12 @@ export class LiveSyncClient {
     const done = this.resolveDone;
     this.resolveDone = null;
     done?.();
+    // AFTER resolving start()'s deferred, so the race below settles on `done` and a boot arm that
+    // rejects from this abandon lands on an already-settled race rather than surfacing as the
+    // outcome of start(). Settles a `requestResync()` a consumer is awaiting — see boundedReseed.
+    const abandon = this.abandonReseed;
+    this.abandonReseed = null;
+    abandon?.();
   }
 
   /** The ws(s):// URL this client opens, for diagnostics/tests. Re-derived from the options. */
@@ -980,8 +1008,17 @@ export class LiveSyncClient {
         settled = true;
         clearTimeout(timer);
         if (this.reseedTimer === timer) this.reseedTimer = null;
+        this.abandonReseed = null;
         fn();
       };
+      // stop() settles this wrapper (CTC-114 review round 7). Clearing the deadline is not enough:
+      // if the injected reseed() never settles, nothing else ever settles THIS promise, and while
+      // that was merely "an irrelevant await nobody holds" when boundedReseed was internal, the
+      // public `requestResync()` is now awaited by consumers — so teardown or recovery code holding
+      // that await hung forever on stop(). Rejecting rather than resolving keeps the outcome honest;
+      // requestResync() catches it and still upholds its never-rejects contract.
+      this.abandonReseed = () =>
+        finish(() => reject(new Error("client stopped while re-seeding")));
       seed.then(
         (cursor) => finish(() => resolve(cursor)),
         (err: unknown) => finish(() => reject(err instanceof Error ? err : new Error(String(err)))),
@@ -1017,6 +1054,21 @@ export class LiveSyncClient {
     if (!this.started) {
       this.log("warn", "requestResync() before start() — ignored");
       return;
+    }
+    // SERIALIZE behind an in-flight boot (CTC-114 review rounds 6 + 7). Running concurrently with it
+    // meant two reseeds and two openSocket() calls, the second overwriting `this.ws` and orphaning the
+    // first socket. Waiting — rather than dropping — is what keeps the WARM path correct: a warm boot
+    // performs no re-seed, and this method's whole purpose is a consumer that has discovered its store
+    // can no longer be caught up by deltas, which replaying from the cursor cannot fix.
+    const boot = this.bootTask;
+    if (boot) {
+      await boot.catch(() => undefined);
+      if (this.stopped) return;
+      // A COLD boot re-seeded from /snapshot while we waited, which IS what was being asked for.
+      if (this.bootColdSeeded) {
+        this.log("info", "requestResync() absorbed by the boot's cold seed");
+        return;
+      }
     }
     // Unlike the frame path, this entry point can be called MID-BACKOFF: the queue overflowed while the
     // client was already waiting to reconnect. handleResync would then reopen the socket itself and the

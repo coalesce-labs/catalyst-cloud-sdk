@@ -339,7 +339,20 @@ export class BrowserReplica {
     };
     this.options = options;
     this.deltas = new DeltaQueue({
-      apply: (changes) => this.call({ type: "applyChanges", changes }),
+      // BOUNDED like the seed RPCs (CTC-114 review round 7). Round 6 wrapped only the seed, which left
+      // the live path with the same hole: a worker that accepts an `applyChanges` and never replies
+      // (an OPFS/SQLite op wedging without firing a worker `error`) left this promise pending forever,
+      // so the queue stayed permanently `draining` and could reach NEITHER its retry nor its overflow
+      // recovery — the two paths that exist for exactly this. Meanwhile arriving frames kept advancing
+      // `acceptedSeq`, so a reconnect resumed ABOVE changes that were never committed, sealing the
+      // hole. Safe to bound here, unlike the read RPCs: `applyChanges` does not wait on the
+      // SeedReadGate, so its duration is the worker's actual work and nothing else. Tearing the worker
+      // down on expiry also rejects every pending read, so a wedge surfaces on those too.
+      apply: (changes) =>
+        this.withWorkerDeadline(
+          "applyChanges",
+          this.call({ type: "applyChanges", changes }),
+        ),
       onDrained: (cursor) => {
         this.lastSeq = Math.max(this.lastSeq, cursor);
         if (this.disposed) return;

@@ -410,6 +410,74 @@ describe("requestResync() — the consumer-driven resync entry point (CTC-114 re
     client.stop();
   });
 
+  it("HONOURS a resync requested during a WARM boot instead of absorbing it", async () => {
+    // CTC-114 review round 7 — round 6 got this wrong. The whole-boot latch absorbed the request on
+    // BOTH arms, on the argument that a warm boot's `{type:"sync", after:<cursor>}` is itself the
+    // catch-up. That defeats the method's entire purpose: a consumer calls requestResync() when it
+    // has discovered ON ITS OWN SIDE that deltas can no longer catch its store up — the browser
+    // replica's dropped overflow buffer is the motivating case — and replaying from the cursor cannot
+    // rebuild rows the consumer has already lost. A warm boot performs no re-seed, so swallowing the
+    // request left the store permanently inconsistent with nothing to signal it.
+    const store = makeStore(7); // WARM: the boot opens a socket and does NOT re-seed
+    const { sockets, factory } = recordingFactory();
+    let seeds = 0;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        seeds += 1;
+        store.setCursor(12);
+        return 12;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      telemetry: true, // parks the boot at the telemetry await, as in the round-6 test
+    });
+
+    void client.start();
+    const pending = client.requestResync(); // lands inside the boot window
+    expect(seeds).toBe(0);
+
+    await pending;
+    // THE OUTCOME: honoured, not swallowed — and serialized, so it did not race the boot.
+    expect(seeds).toBe(1);
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThanOrEqual(2));
+    expect(sockets[0]!.closed).toBe(true); // the resync closed the boot's socket before re-seeding
+    client.stop();
+  });
+
+  it("settles an awaited requestResync() when stop() lands mid-reseed", async () => {
+    // CTC-114 review round 7. stop() cleared the reseed DEADLINE but never settled the wrapper
+    // promise, so if the injected reseed() stays pending nothing ever settles it. That was merely "an
+    // irrelevant await nobody holds" while boundedReseed was internal; `requestResync()` is public and
+    // awaited, so teardown or recovery code holding it hung forever.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: () => new Promise<number>(() => {}), // never settles
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 600_000, // long, so ONLY stop() can settle this
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+
+    const pending = client.requestResync();
+    await new Promise((r) => setTimeout(r, 0));
+    client.stop();
+
+    // THE OUTCOME: it settles. Unfixed, this await never returns and the test times out.
+    await expect(pending).resolves.toBeUndefined();
+  });
+
   it("never rejects when the re-seed fails", async () => {
     const { sockets, factory } = recordingFactory();
     const client = new LiveSyncClient({
