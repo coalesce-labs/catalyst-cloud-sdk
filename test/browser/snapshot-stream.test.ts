@@ -146,4 +146,24 @@ describe("streamSnapshotBatches", () => {
     expect(cursor).toBe(9);
     expect(cancelled()).toBe(false); // fully drained → releaseLock only, no cancel
   });
+
+  it("REJECTS a non-finite batchSize before reading a byte", async () => {
+    // CTC-114 review round 12. This helper is exported from `@catalyst-cloud/sdk/browser`, so
+    // `batchSize` is consumer-supplied. `NaN`/`Infinity` make `batch.length >= batchSize` permanently
+    // false, so NO batch is ever yielded: every parsed row of a ~100 MB snapshot accumulates and is
+    // finally structured-cloned across the worker boundary in one message. The bounded-memory
+    // guarantee this module exists for would be silently gone — and an OOM is exactly what CTC-132
+    // introduced streaming to prevent. Third instance of the same class (maxBatch r5, maxDepth r10),
+    // hence the shared validator rather than another local guard.
+    for (const bad of [NaN, Infinity, 0, -1, 1.5]) {
+      const gen = streamSnapshotBatches(streamOf(["{}\n"]), bad);
+      await expect(gen.next()).rejects.toThrow(/batchSize must be a positive integer/);
+    }
+    // Negative control: a legal size still streams.
+    const ok = streamSnapshotBatches(
+      streamOf([`{"accountId":"a","cursor":3}\n`]),
+      10,
+    );
+    await expect(ok.next()).resolves.toBeDefined();
+  });
 });

@@ -12,6 +12,7 @@
 // cleanly, and is fully covered in vitest/jsdom (test/snapshot-stream.test.ts).
 
 import type { WireChange } from "./protocol.js";
+import { requirePositiveInt } from "./validate.js";
 
 /** One server /snapshot page; the memory/round-trip knob (mirrors the server-side PAGE_SIZE, CTC-63). */
 export const SEED_BATCH_ROWS = 1000;
@@ -54,6 +55,13 @@ export async function* streamSnapshotBatches(
    *  from a stalled one. Optional, so every existing caller compiles unchanged. */
   onChunk?: () => void,
 ): AsyncGenerator<SnapshotItem> {
+  // Validate BEFORE reading a byte (CTC-114 review round 12). This helper is exported from
+  // `@catalyst-cloud/sdk/browser`, so `batchSize` is consumer-supplied. `NaN`/`Infinity` make
+  // `batch.length >= batchSize` permanently false, so no batch is ever yielded: every parsed row of a
+  // ~100 MB snapshot accumulates and is finally structured-cloned across the worker boundary in one
+  // message. The bounded-memory guarantee this module exists for would be gone, silently — and an OOM
+  // is exactly what CTC-132 introduced streaming to prevent.
+  requirePositiveInt("streamSnapshotBatches", "batchSize", batchSize);
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = "";

@@ -91,4 +91,28 @@ describe("acquireReplicaLock (CTC-118)", () => {
       acquireReplicaLock("catalyst-replica:test", { retries: 0 }),
     ).rejects.toThrow("boom");
   });
+
+  it("REJECTS a non-finite retries count instead of probing forever", async () => {
+    // CTC-114 review round 12. Exported from `@catalyst-cloud/sdk/browser`, so `retries` is
+    // consumer-supplied. With `NaN`/`Infinity` the `attempt >= retries` termination test never
+    // succeeds, so ORDINARY contention — another tab simply holding the lock — probes forever instead
+    // of resolving null, and start() never settles. Same class as the snapshot batchSize and the
+    // queue's maxDepth; all three now share one validator.
+    const mgr = fakeLockManager();
+    vi.stubGlobal("navigator", { locks: mgr });
+    // Put the lock under genuine contention — the condition that would otherwise loop forever.
+    const owner = await acquireReplicaLock("catalyst-replica:test", { retries: 0 });
+    expect(owner?.held).toBe(true);
+
+    for (const bad of [NaN, Infinity, -1, 1.5]) {
+      await expect(
+        acquireReplicaLock("catalyst-replica:test", { retries: bad }),
+      ).rejects.toThrow(/retries must be a non-negative integer/);
+    }
+    // Negative control: 0 retries is legitimate (probe once) and still resolves null under contention
+    // rather than throwing — so the guard rejects only the values that break termination.
+    await expect(
+      acquireReplicaLock("catalyst-replica:test", { retries: 0 }),
+    ).resolves.toBeNull();
+  });
 });

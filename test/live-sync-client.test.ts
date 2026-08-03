@@ -738,6 +738,46 @@ describe("requestResync() — the consumer-driven resync entry point (CTC-114 re
     client.stop();
   });
 
+  it("WAITS for the cancelled seed to unwind before settling", async () => {
+    // CTC-114 review round 12 (P1). Round 10 made the deadline SIGNAL the seed, but settled straight
+    // afterwards — and `abort()` only *initiates* the consumer's cleanup. The browser seed still has
+    // to abort its fetch, trip the supersede guard, post `seedAbort` and run the `finally` that
+    // resumes its delta queue. Settling immediately let runResync() reconnect after one backoff while
+    // that queue was still PAUSED, so arriving frames were counted as delivered and then discarded:
+    // the same hole the queue's discard/rollback pairing closes, re-opened from the transport side.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let cleanupDone = false;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      // One-arg, so it can observe the signal — and unwinds ASYNCHRONOUSLY, like the real seed.
+      reseed: (signal) =>
+        new Promise<number>((_resolve, rejectSeed) => {
+          signal?.addEventListener("abort", () => {
+            setTimeout(() => {
+              cleanupDone = true;
+              rejectSeed(new Error("seed cancelled"));
+            }, 30);
+          });
+        }),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 20,
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+
+    await client.requestResync();
+    // THE OUTCOME: by the time the transport is free to reconnect, the consumer has finished unwinding.
+    expect(cleanupDone).toBe(true);
+    client.stop();
+  });
+
   it("never rejects when the re-seed fails", async () => {
     const { sockets, factory } = recordingFactory();
     const client = new LiveSyncClient({

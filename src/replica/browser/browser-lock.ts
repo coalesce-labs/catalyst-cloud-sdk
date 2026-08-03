@@ -22,6 +22,11 @@
 // Wrapped so a runtime without Web Locks (or a non-browser test runtime) degrades to a no-op handle:
 // the caller proceeds exactly as pre-CTC-114, where the worker-side collision is the only guard.
 
+import {
+  requireNonNegativeFinite,
+  requireNonNegativeInt,
+} from "./validate.js";
+
 /** A held (or no-op) replica lock. `release()` is idempotent. */
 export interface ReplicaLockHandle {
   /** False when Web Locks is unavailable and the gate degraded to a no-op (no exclusion happened). */
@@ -92,8 +97,21 @@ export async function acquireReplicaLock(
   if (typeof navigator === "undefined" || typeof navigator.locks?.request !== "function") {
     return NOOP_HANDLE;
   }
-  const retries = options.retries ?? 1;
-  const delayMs = options.retryDelayMs ?? 1000;
+  // Validate before entering the loop (CTC-114 review round 12). This helper is exported from
+  // `@catalyst-cloud/sdk/browser`, so both values are consumer-supplied. With `retries: NaN` or
+  // `Infinity` the `attempt >= retries` termination test never succeeds, so ordinary contention —
+  // another tab simply holding the lock — makes this probe FOREVER instead of resolving `null`, and
+  // `start()` never settles. Zero retries is legitimate (probe once), hence non-negative.
+  const retries = requireNonNegativeInt(
+    "acquireReplicaLock",
+    "retries",
+    options.retries ?? 1,
+  );
+  const delayMs = requireNonNegativeFinite(
+    "acquireReplicaLock",
+    "retryDelayMs",
+    options.retryDelayMs ?? 1000,
+  );
   for (let attempt = 0; ; attempt++) {
     const handle = await tryAcquire(name);
     if (handle) return handle;

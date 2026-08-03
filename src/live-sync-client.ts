@@ -270,6 +270,17 @@ export interface LiveSyncClientOptions {
   telemetry?: TelemetryConfig | Telemetry;
 }
 
+/**
+ * How long a CANCELLED reseed gets to unwind before the transport settles anyway.
+ *
+ * Cancelling is asynchronous on the consumer's side — the browser seed aborts a fetch, trips its
+ * supersede guard, posts `seedAbort` and resumes its delta queue — and the transport reconnects the
+ * moment it settles, so it must wait for that unwind or it reconnects into a still-paused consumer.
+ * Bounded because the deadline that triggered this exists precisely for an unresponsive callback: a
+ * cleanup that also hangs must not wedge the transport (CTC-114 review round 12).
+ */
+const CANCEL_CLEANUP_GRACE_MS = 500;
+
 /** Resolve the runtime global WebSocket, or fail with an actionable message. */
 function defaultWsFactory(url: string): WebSocketLike {
   const Ctor = (globalThis as { WebSocket?: new (u: string) => WebSocketLike }).WebSocket;
@@ -1063,12 +1074,41 @@ export class LiveSyncClient {
         this.abandonReseed = null;
         fn();
       };
-      /** Give up on this attempt: TELL IT TO STOP first, then settle. Order matters — the transport
-       *  reconnects the moment it settles, so the seed must already know it has been cancelled. */
+      /**
+       * Give up on this attempt: tell it to stop, WAIT for it to unwind, then settle.
+       *
+       * Signalling alone was not enough (CTC-114 review round 12, P1). `abort()` only *initiates* the
+       * consumer's cleanup — the browser seed still has to abort its fetch, let the supersede guard
+       * trip, post its `seedAbort`, and run the `finally` that resumes its delta queue. Settling
+       * immediately let `runResync()` reconnect after one backoff while that queue was still PAUSED,
+       * so arriving frames were counted as delivered and then discarded: exactly the hole the queue's
+       * discard/rollback pairing exists to prevent, re-opened from the other side.
+       *
+       * Bounded, because the whole point of this deadline is that the callback may be unresponsive: a
+       * cleanup that itself hangs must not wedge the transport, so we settle anyway after a grace.
+       */
       const giveUp = (err: Error): void => {
         if (settled) return;
         cancel.abort();
-        finish(() => reject(err));
+        // Only WAIT for a callback that can actually act on the signal. Arity is the honest test:
+        // a zero-arg `reseed` (the node replica's `() => this.seedFromSnapshot()`, and every consumer
+        // written before 0.8.0) cannot observe the abort, so there is no unwind to wait for and
+        // pausing here would only add latency to the failure path. This also keeps the pre-round-12
+        // behaviour exactly for those consumers.
+        if (this.reseed.length === 0) {
+          finish(() => reject(err));
+          return;
+        }
+        const grace = setTimeout(
+          () => finish(() => reject(err)),
+          CANCEL_CLEANUP_GRACE_MS,
+        );
+        void seed
+          .catch(() => undefined)
+          .then(() => {
+            clearTimeout(grace);
+            finish(() => reject(err));
+          });
       };
       if (this.reseedTimeoutMs > 0) {
         timer = setTimeout(

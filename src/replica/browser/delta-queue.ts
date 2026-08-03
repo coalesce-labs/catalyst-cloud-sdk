@@ -22,6 +22,10 @@
 // batching is unit-testable without the wasm/OPFS worker.
 
 import type { WireChange } from "./protocol.js";
+import {
+  requireNonNegativeFinite,
+  requirePositiveInt,
+} from "./validate.js";
 
 /** A live delta as it rides into the worker: the wire record plus its change_log seq. */
 export type SeqChange = WireChange & { seq: number };
@@ -99,6 +103,22 @@ export interface DeltaQueueOptions {
    * is no install base to break.
    */
   onOverflow: (depth: number, reason: OverflowReason) => void;
+  /**
+   * Called whenever the queue THROWS ACCEPTED FRAMES AWAY, for any reason, before they were applied.
+   *
+   * The owner's obligation is to roll its transport high-water back to its durable cursor: those seqs
+   * were accepted off the socket and are now in neither the store nor this buffer, so a reconnect
+   * resuming above them seals a hole that nothing ever re-requests and the next applied batch carries
+   * the durable cursor past.
+   *
+   * PAIRED WITH THE DISCARD, not with a reason (CTC-114 review round 12, P1). That rollback used to
+   * live in the owner's `onOverflow` handler, which covered exactly ONE of this queue's discard sites
+   * — so round 9's `pause()` introduced a second discard with no rollback, and a gap- or server-driven
+   * reseed that began with frames still buffered and then FAILED lost them permanently. Routing every
+   * discard through one notification makes the pairing structural: a future discard site cannot forget
+   * the compensation, because emptying the inbox IS the notification.
+   */
+  onDiscard: () => void;
   maxBatch?: number;
   maxDepth?: number;
   maxApplyRetries?: number;
@@ -142,25 +162,12 @@ export class DeltaQueue {
     //     re-seed instead of retrying at all.
     //
     // Fail at construction rather than degrade silently at the first delta.
-    const positiveInt: [string, number, unknown][] = [
-      ["maxBatch", this.maxBatch, opts.maxBatch],
-      ["maxDepth", this.maxDepth, opts.maxDepth],
-      ["maxApplyRetries", this.maxApplyRetries, opts.maxApplyRetries],
-    ];
-    for (const [name, value, raw] of positiveInt) {
-      if (!Number.isInteger(value) || value < 1) {
-        throw new Error(
-          `DeltaQueue: ${name} must be a positive integer (got ${String(raw)})`,
-        );
-      }
-    }
+    requirePositiveInt("DeltaQueue", "maxBatch", this.maxBatch);
+    requirePositiveInt("DeltaQueue", "maxDepth", this.maxDepth);
+    requirePositiveInt("DeltaQueue", "maxApplyRetries", this.maxApplyRetries);
     // Delay may legitimately be 0 (retry on the next tick) but must be finite and non-negative — NaN
     // makes setTimeout fire immediately, turning the bounded backoff into a hot loop.
-    if (!Number.isFinite(this.retryDelayMs) || this.retryDelayMs < 0) {
-      throw new Error(
-        `DeltaQueue: retryDelayMs must be a non-negative finite number (got ${String(opts.retryDelayMs)})`,
-      );
-    }
+    requireNonNegativeFinite("DeltaQueue", "retryDelayMs", this.retryDelayMs);
     // Same reasoning, at RUNTIME, for the same reason (CTC-114 review round 6): the type now requires
     // `onOverflow`, but an untyped-JS consumer of the public export gets no help from that — which is
     // exactly the case the maxBatch guard above exists for. Omitting it is silently TERMINAL: the
@@ -178,6 +185,21 @@ export class DeltaQueue {
   /** How many deltas are buffered but not yet applied (observability + tests). */
   get depth(): number {
     return this.inbox.length;
+  }
+
+  /**
+   * THE ONE WAY buffered frames are thrown away (CTC-114 review round 12).
+   *
+   * There are five sites that empty the inbox — depth overflow, apply-failed overflow, `pause()`,
+   * `resume()` and `stop()` — and the owner's compensating high-water rollback was wired to exactly
+   * one of them. Routing every discard through here pairs the compensation with the act by
+   * construction, so a future site cannot forget it. Fires only when something was really dropped, so
+   * it is safe to call unconditionally.
+   */
+  private discardInbox(): void {
+    if (this.inbox.length === 0) return;
+    this.inbox.length = 0;
+    this.notify("onDiscard", () => this.opts.onDiscard());
   }
 
   /**
@@ -202,7 +224,7 @@ export class DeltaQueue {
       // a burst raises exactly one escalation rather than one per subsequent frame.
       this.overflowed = true;
       const depth = this.inbox.length;
-      this.inbox.length = 0;
+      this.discardInbox();
       this.clearRetry();
       this.notify("onOverflow", () => this.opts.onOverflow(depth, "depth"));
       // This frame went into the discarded backlog, so it was NOT kept either.
@@ -230,7 +252,7 @@ export class DeltaQueue {
   pause(): void {
     if (this.stopped) return;
     this.overflowed = true;
-    this.inbox.length = 0;
+    this.discardInbox();
     this.clearRetry();
   }
 
@@ -242,7 +264,7 @@ export class DeltaQueue {
     // Dropping it is the same reasoning the overflow paths already apply to the backlog they discard;
     // resuming without it would let a stale batch be applied on top of the fresh DB by the next live
     // push, where an old delete removes a row the snapshot legitimately has.
-    this.inbox.length = 0;
+    this.discardInbox();
     this.overflowed = false;
     // The re-seed supersedes whatever could not be applied, so the failure streak starts over.
     this.applyFailures = 0;
@@ -331,6 +353,10 @@ export class DeltaQueue {
         // removes a row the snapshot legitimately has. Drop it, and do not escalate again: the owner
         // has already been told to re-seed.
         if (this.overflowed) {
+          // The SIXTH discard site, and the one `discardInbox()` cannot see: this batch was spliced
+          // OUT of the inbox before the await, so dropping it here loses frames that are no longer in
+          // the buffer to discard. Same obligation on the owner, so the same notification.
+          this.notify("onDiscard", () => this.opts.onDiscard());
           this.notify("onError", () => this.opts.onError(err));
           return;
         }
@@ -344,7 +370,7 @@ export class DeltaQueue {
           // depth overflow, so the owner needs no new branch.
           this.overflowed = true;
           const depth = this.inbox.length;
-          this.inbox.length = 0;
+          this.discardInbox();
           this.clearRetry();
           this.notify("onOverflow", () => this.opts.onOverflow(depth, "apply-failed"));
         } else {
@@ -366,6 +392,6 @@ export class DeltaQueue {
   stop(): void {
     this.stopped = true;
     this.clearRetry();
-    this.inbox.length = 0;
+    this.discardInbox();
   }
 }

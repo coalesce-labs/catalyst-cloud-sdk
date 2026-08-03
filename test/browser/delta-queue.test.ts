@@ -43,7 +43,7 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
   it("coalesces every frame that arrives while an apply is in flight into ONE next batch", async () => {
     const { apply, batches, releases } = deferredApply();
     const onDrained = vi.fn();
-    const q = new DeltaQueue({ apply, onDrained, onError: vi.fn(), onOverflow: vi.fn() });
+    const q = new DeltaQueue({ apply, onDrained, onError: vi.fn(), onOverflow: vi.fn(), onDiscard: vi.fn() });
 
     // First push starts an apply immediately — an idle tab pays no added latency.
     q.push(change(1));
@@ -74,6 +74,7 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
       onDrained: vi.fn(),
       onError: vi.fn(),
       onOverflow: vi.fn(),
+      onDiscard: vi.fn(),
       maxBatch: 10,
     });
 
@@ -111,6 +112,7 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
       onDrained,
       onError: vi.fn(),
       onOverflow: vi.fn(),
+      onDiscard: vi.fn(),
       maxBatch: 10,
     });
 
@@ -129,6 +131,7 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
       onDrained,
       onError: vi.fn(),
       onOverflow: vi.fn(),
+      onDiscard: vi.fn(),
     });
     q.push(change(42));
     await vi.waitFor(() => expect(onDrained).toHaveBeenCalledWith(42));
@@ -159,6 +162,7 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
         onDrained,
         onError,
         onOverflow: vi.fn(),
+        onDiscard: vi.fn(),
         maxBatch: 1,
         retryDelayMs: 1000,
       });
@@ -192,7 +196,7 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
   it("stop() drops the buffer and refuses further work", async () => {
     const onDrained = vi.fn();
     const { apply, releases } = deferredApply();
-    const q = new DeltaQueue({ apply, onDrained, onError: vi.fn(), onOverflow: vi.fn() });
+    const q = new DeltaQueue({ apply, onDrained, onError: vi.fn(), onOverflow: vi.fn(), onDiscard: vi.fn() });
 
     q.push(change(1));
     await Promise.resolve();
@@ -226,6 +230,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
       onDrained: vi.fn(),
       onError: vi.fn(),
       onOverflow,
+      onDiscard: vi.fn(),
       maxDepth: 10,
     });
 
@@ -252,6 +257,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
       onDrained: vi.fn(),
       onError: vi.fn(),
       onOverflow,
+      onDiscard: vi.fn(),
       maxDepth: 2,
     });
 
@@ -273,6 +279,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
       onDrained: vi.fn(),
       onError: vi.fn(),
       onOverflow: vi.fn(),
+      onDiscard: vi.fn(),
     });
     q.stop();
     q.resume();
@@ -297,6 +304,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
       onDrained: vi.fn(),
       onError,
       onOverflow,
+      onDiscard: vi.fn(),
       maxBatch: 1,
       retryDelayMs: 1,
     });
@@ -323,6 +331,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
       onDrained: vi.fn(),
       onError: vi.fn(),
       onOverflow,
+      onDiscard: vi.fn(),
       maxDepth: 3,
     });
 
@@ -335,7 +344,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
     // `splice(0, 0)` removes nothing, so `while (inbox.length > 0)` never advances: awaiting
     // `apply([])` and iterating forever, an unbounded stream of empty worker transactions that never
     // applies the queued change. Both types are public exports of `./browser`, so this is reachable.
-    const base = { apply: vi.fn(), onDrained: vi.fn(), onError: vi.fn(), onOverflow: vi.fn() };
+    const base = { apply: vi.fn(), onDrained: vi.fn(), onError: vi.fn(), onOverflow: vi.fn(), onDiscard: vi.fn() };
     expect(() => new DeltaQueue({ ...base, maxBatch: 0 })).toThrow(
       /maxBatch must be a positive integer/,
     );
@@ -370,6 +379,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
         onDrained: vi.fn(),
         onError: vi.fn(),
         onOverflow,
+        onDiscard: vi.fn(),
         maxBatch: 1,
         retryDelayMs: 1000,
       });
@@ -412,6 +422,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
       onDrained: vi.fn(),
       onError: vi.fn(),
       onOverflow: vi.fn(),
+      onDiscard: vi.fn(),
       maxDepth: 2,
     });
 
@@ -440,6 +451,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
       onDrained: vi.fn(),
       onError: vi.fn(),
       onOverflow,
+      onDiscard: vi.fn(),
       maxDepth: 2,
       maxBatch: 1,
     });
@@ -453,6 +465,66 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
     expect(q.depth).toBe(0);
   });
 
+  it("fires onDiscard from EVERY site that throws accepted frames away", async () => {
+    // CTC-114 review round 12 (P1). The owner's compensating high-water rollback was wired to
+    // `onOverflow`, which is ONE of six discard sites — so round 9's `pause()` dropped accepted frames
+    // with no rollback, and a gap- or server-driven reseed that began with frames still buffered and
+    // then FAILED lost them permanently: the reconnect resumed above seqs that were never applied.
+    // Pairing the notification with the ACT rather than with a reason is what makes it unforgettable.
+    const onDiscard = vi.fn();
+    const mk = (over: Record<string, unknown> = {}) =>
+      new DeltaQueue({
+        apply: () => new Promise(() => {}), // park, so frames stay buffered
+        onDrained: vi.fn(),
+        onError: vi.fn(),
+        onOverflow: vi.fn(),
+        onDiscard,
+        maxBatch: 1,
+        ...over,
+      });
+
+    // 1. pause() — the site round 9 added with no compensation.
+    onDiscard.mockClear();
+    const a = mk();
+    a.push(change(1)); // spliced into the parked apply
+    a.push(change(2)); // buffered
+    a.pause();
+    expect(onDiscard).toHaveBeenCalledTimes(1);
+
+    // 2. resume() — drops whatever is still pre-snapshot.
+    onDiscard.mockClear();
+    const b = mk();
+    b.push(change(1));
+    b.push(change(2));
+    b.resume(); // not latched, but it still empties the inbox
+    expect(onDiscard).toHaveBeenCalledTimes(1);
+
+    // 3. stop() — teardown drops the buffer too.
+    onDiscard.mockClear();
+    const c = mk();
+    c.push(change(1));
+    c.push(change(2));
+    c.stop();
+    expect(onDiscard).toHaveBeenCalledTimes(1);
+
+    // 4. depth overflow.
+    onDiscard.mockClear();
+    const d = mk({ maxDepth: 1 });
+    d.push(change(1));
+    d.push(change(2));
+    d.push(change(3)); // crosses maxDepth
+    expect(onDiscard).toHaveBeenCalledTimes(1);
+
+    // NEGATIVE CONTROL: an empty inbox must NOT notify — a spurious rollback would re-request frames
+    // for no reason on every idle pause.
+    onDiscard.mockClear();
+    const e = mk();
+    e.pause();
+    e.resume();
+    e.stop();
+    expect(onDiscard).not.toHaveBeenCalled();
+  });
+
   it("validates EVERY public numeric option, not just maxBatch", async () => {
     // CTC-114 review round 10. maxBatch was guarded in round 5 and maxDepth was not, though it comes
     // from the same public options object. Its failure modes are worse: 0/negative/fractional makes
@@ -464,6 +536,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
       onDrained: vi.fn(),
       onError: vi.fn(),
       onOverflow: vi.fn(),
+      onDiscard: vi.fn(),
     };
     for (const bad of [0, -1, 1.5, NaN]) {
       expect(() => new DeltaQueue({ ...base, maxDepth: bad })).toThrow(
@@ -515,6 +588,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
           onDrained: vi.fn(),
           onError: vi.fn(),
           onOverflow: vi.fn(),
+          onDiscard: vi.fn(),
         }),
     ).not.toThrow();
   });
@@ -545,6 +619,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
       onDrained: vi.fn(),
       onError,
       onOverflow,
+      onDiscard: vi.fn(),
       maxBatch: 1,
       maxDepth: 3,
     });
@@ -585,6 +660,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
       onDrained: vi.fn(),
       onError: vi.fn(),
       onOverflow: vi.fn(),
+      onDiscard: vi.fn(),
       maxBatch: 1,
       maxDepth: 100,
     });
@@ -622,6 +698,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
         throw new Error("consumer setState blew up");
       },
       onOverflow: vi.fn(),
+      onDiscard: vi.fn(),
       maxBatch: 10,
       retryDelayMs: 5,
     });
@@ -643,6 +720,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
         throw new Error("consumer setState blew up");
       },
       onOverflow,
+      onDiscard: vi.fn(),
       maxBatch: 10,
       maxApplyRetries: 2,
       retryDelayMs: 5,
@@ -671,6 +749,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
       },
       onError: vi.fn(),
       onOverflow: vi.fn(),
+      onDiscard: vi.fn(),
       maxBatch: 10,
     });
     q.push(change(1));

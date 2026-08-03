@@ -387,6 +387,23 @@ export class BrowserReplica {
         console.error("[replica] applying live deltas failed:", err);
         this.handlers.onStatus("error");
       },
+      // THE COMPENSATION FOR A DISCARD, paired with it at the queue's seam (CTC-114 review round 12).
+      //
+      // Whatever the queue just dropped was accepted off the socket and is now in neither the store
+      // nor the buffer. `acceptedSeq` still describes it and `getCursor()` reports the max of the two,
+      // so without this the next `{type:"sync", after}` resumes ABOVE those frames, the gap detector
+      // re-baselines from the same poisoned value and sees contiguity, and the next applied batch
+      // carries the durable cursor past the hole — permanent, re-seed-only recovery.
+      //
+      // This lived in `onOverflow` and therefore covered ONE of the queue's six discard sites. Round
+      // 9's `pause()` was the second, and it lost data on every failed re-seed that began with frames
+      // still buffered. Rolling back to the DURABLE cursor is deliberately conservative: an apply
+      // still in flight may re-deliver rows the worker already has, and worker-core's
+      // `rec.seq <= maxSeq` stale-guard drops those. Re-requesting a few frames is free; missing one
+      // is not.
+      onDiscard: () => {
+        this.acceptedSeq = this.lastSeq;
+      },
       // The queue has given up on what it holds and needs the owner to replace the DB wholesale —
       // either the backlog outgrew replaying it ("depth") or applies kept rejecting ("apply-failed").
       onOverflow: (depth, reason) => {
