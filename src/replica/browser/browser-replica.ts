@@ -76,18 +76,22 @@ const DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_WORKER_RPC_TIMEOUT_MS = 120_000;
 
 /**
- * Request types deliberately EXEMPT from {@link DEFAULT_WORKER_RPC_TIMEOUT_MS}.
+ * Request types whose deadline PAUSES while a seed is in flight — the reads.
  *
- * Only the reads. They are the one family whose pending time is not the worker's own work: the
- * `SeedReadGate` defers a read for as long as an open seed lasts (CTC-132), and a legitimate ~100 MB
- * snapshot streams for minutes — so a deadline here would abort healthy reads during exactly the
- * operation the gate exists to protect them from.
+ * They are the one family whose pending time is not all the worker's own work: the `SeedReadGate`
+ * defers a read for as long as an open seed lasts (CTC-132), and a legitimate ~100 MB snapshot
+ * streams for minutes, so a flat deadline would abort healthy reads during exactly the operation the
+ * gate exists to protect them from.
  *
- * They are not left defenceless. Every other RPC IS bounded, and a deadline expiry runs `failWorker`,
- * which rejects every pending entry — so a genuinely wedged worker still surfaces on the reads, via
- * whichever bounded request notices first.
+ * Round 9 EXEMPTED them outright, on the reasoning that some other bounded RPC would notice a dead
+ * worker first. Round 10 showed that to be unfounded: on a quiet feed no apply and no seed need ever
+ * follow, so a UI awaiting `queryIssues()` hung forever. The exemption is gone — reads are bounded
+ * like everything else, but their window only counts time in which the worker could actually have
+ * answered. This is the same principle the snapshot idle bound already follows: measure the time the
+ * operation is able to progress, not wall-clock. We can do it precisely because THIS client drives
+ * the seed, so it knows exactly when a read is legitimately gated.
  */
-const UNBOUNDED_WORKER_RPCS: ReadonlySet<string> = new Set([
+const SEED_GATED_WORKER_RPCS: ReadonlySet<string> = new Set([
   "queryIssues",
   "queryIssueDetail",
   "queryPulls",
@@ -223,6 +227,17 @@ export interface BrowserReplicaOptions {
    * WEDGED worker into a diagnosable error, and is not meant to police slow-but-progressing storage.
    */
   workerRpcTimeoutMs?: number;
+  /**
+   * Total deadline the TRANSPORT allows one re-seed before cancelling it. Default: the SDK's 600s;
+   * `0` disables.
+   *
+   * Distinct again from the two bounds above, which watch the network and each worker RPC. This one
+   * bounds the whole operation, and since round 10 it CANCELS rather than merely abandons — the
+   * signal is forwarded into the seed, which aborts its fetch and rolls the worker transaction back.
+   * Exposed because the right value depends on corpus size: a very large snapshot on slow storage can
+   * legitimately outlive the default, and before cancellation was linked that produced two writers.
+   */
+  reseedTimeoutMs?: number;
 }
 
 /** Resolve `${base}/snapshot` preserving an absolute base's path (mirror of the reads' apiUrl). */
@@ -457,7 +472,8 @@ export class BrowserReplica {
    * "secondary" and no worker `error` event to notice. Bounding at the seam instead makes that class
    * of miss structural: a new request type is bounded by construction, not by remembering.
    *
-   * READS are the deliberate exemption ({@link UNBOUNDED_WORKER_RPCS}) — see that constant.
+   * EVERY type is bounded, reads included. Their window merely pauses while a seed is in flight —
+   * see {@link SEED_GATED_WORKER_RPCS}.
    */
   private call<K extends ReplicaRequest["type"]>(
     request: Extract<ReplicaRequest, { type: K }>,
@@ -484,7 +500,6 @@ export class BrowserReplica {
       });
       worker.postMessage(envelope);
     });
-    if (UNBOUNDED_WORKER_RPCS.has(request.type)) return sent;
     return this.withWorkerDeadline(request.type, sent);
   }
 
@@ -616,7 +631,7 @@ export class BrowserReplica {
    * or post another worker message — a late `seedCommit` from an abandoned seed can otherwise persist
    * a stale cursor over a truncated DB, which the next cold start reads as WARM and goes live over.
    */
-  private async reseed(): Promise<number> {
+  private async reseed(cancel?: AbortSignal): Promise<number> {
     // QUIESCE THE DELTA QUEUE FIRST (CTC-114 review round 9) — before anything can open the worker's
     // seed transaction. A reseed can begin while the queue still holds buffered work (a gap escalating
     // mid-replay is the concrete case), and a live queue across `seedBegin` posts `applyChanges` into
@@ -640,6 +655,24 @@ export class BrowserReplica {
 
     const gen = ++this.seedGeneration;
     const abort = new AbortController();
+    // LINK the transport's cancellation to this seed (CTC-114 review round 10, P1).
+    //
+    // LiveSyncClient bounds the reseed callback with a TOTAL deadline (default 10 min) that this
+    // integration never overrode, while the seed's own bounds — network idleness and per-RPC worker
+    // deadlines — are both satisfied indefinitely by a legitimately slow ~100 MB snapshot. So the
+    // transport could declare the attempt over and RECONNECT while this method kept streaming into
+    // the worker: two writers, with the socket resuming from a cursor the seed was still moving.
+    // Frames past that point were accepted by the transport and then dropped by our own paused queue,
+    // and if the abandoned seed later committed, the socket sat advanced over a hole that the next
+    // delta sealed permanently — unrecoverable without another full re-seed.
+    //
+    // Honouring the signal is what makes the transport's "give up" mean something here. It aborts the
+    // fetch and trips `guardedCall`, so the streaming stops and the cleanup `seedAbort` rolls the
+    // worker transaction back. `{ once: true }` because this controller is per-attempt.
+    if (cancel) {
+      if (cancel.aborted) abort.abort();
+      else cancel.addEventListener("abort", () => abort.abort(), { once: true });
+    }
     this.seedAbort = abort;
 
     const idleMs =
@@ -791,7 +824,11 @@ export class BrowserReplica {
       getCursor: () => Math.max(this.acceptedSeq, this.lastSeq),
       // reseed re-runs the snapshot→OPFS seed and returns the fresh (post-reseed) cursor, which the SDK
       // uses for the next {type:"sync"} — so a resync resumes from the fresh head, never 0.
-      reseed: () => this.reseed(),
+      // Forward the transport's cancellation signal — see reseed()'s preamble (round 10 P1).
+      reseed: (signal) => this.reseed(signal),
+      ...(this.options.reseedTimeoutMs === undefined
+        ? {}
+        : { reseedTimeoutMs: this.options.reseedTimeoutMs }),
       // Buffer + single-flight drain (CTC-318) — NOT a per-frame apply, which had no backpressure and
       // turned each of up to 200k replayed rows into its own clone, RPC, OPFS transaction and full
       // view rebuild.
@@ -895,14 +932,24 @@ export class BrowserReplica {
   private withWorkerDeadline<T>(label: string, call: Promise<T>): Promise<T> {
     const ms = this.options.workerRpcTimeoutMs ?? DEFAULT_WORKER_RPC_TIMEOUT_MS;
     if (ms <= 0) return call;
+    const seedGated = SEED_GATED_WORKER_RPCS.has(label);
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      let timer: ReturnType<typeof setTimeout>;
+      const expire = (): void => {
+        // A READ legitimately waits behind the SeedReadGate for as long as a seed runs. Re-arm rather
+        // than fire, so the window measures time the worker could actually have answered in. The seed
+        // itself is bounded (network idle + its own RPC deadlines), so this cannot re-arm forever.
+        if (seedGated && this.seedAbort) {
+          timer = setTimeout(expire, ms);
+          return;
+        }
         const err = new Error(
           `replica worker did not answer '${label}' within ${ms}ms — treating it as wedged`,
         );
         this.failWorker(err);
         reject(err);
-      }, ms);
+      };
+      timer = setTimeout(expire, ms);
       call.then(
         (v) => {
           clearTimeout(timer);

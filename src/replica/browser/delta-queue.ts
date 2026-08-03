@@ -122,14 +122,43 @@ export class DeltaQueue {
   constructor(opts: DeltaQueueOptions) {
     this.opts = opts;
     this.maxBatch = opts.maxBatch ?? MAX_APPLY_BATCH_ROWS;
-    // `DeltaQueue` and `DeltaQueueOptions` are both public exports of `./browser`, so these values are
-    // consumer-supplied. A non-positive maxBatch is not merely degenerate — `splice(0, 0)` removes
-    // NOTHING, so the drain loop's `while (inbox.length > 0)` never advances: it awaits `apply([])`
-    // and immediately iterates again, an unbounded stream of empty worker transactions that never
-    // applies the queued change. Fail at construction rather than hang at the first delta.
-    if (!Number.isInteger(this.maxBatch) || this.maxBatch < 1) {
+    this.maxDepth = opts.maxDepth ?? MAX_INBOX_DEPTH;
+    this.maxApplyRetries = opts.maxApplyRetries ?? MAX_APPLY_RETRIES;
+    this.retryDelayMs = opts.retryDelayMs ?? APPLY_RETRY_DELAY_MS;
+
+    // `DeltaQueue` and `DeltaQueueOptions` are both public exports of `./browser`, so every one of
+    // these is consumer-supplied and may arrive from unchecked runtime config. Validate them ALL —
+    // not just the one that happened to be reported (CTC-114 review round 10). `maxBatch` was guarded
+    // in round 5 and `maxDepth` was not, though it is the same kind of value from the same object,
+    // and its failure modes are worse. Fixing the class rather than the instance is the point.
+    //
+    //   • maxBatch        — `splice(0, 0)` removes NOTHING, so the drain loop's `while (length > 0)`
+    //     never advances: it awaits `apply([])` and iterates again forever, an unbounded stream of
+    //     empty worker transactions that never applies the queued change.
+    //   • maxDepth        — 0/negative/fractional makes the FIRST frame overflow and force a
+    //     snapshot; `NaN` makes `inbox.length > maxDepth` permanently FALSE, so the inbox grows
+    //     without bound and the OOM backstop this whole module exists for is silently gone.
+    //   • maxApplyRetries — below 1, the first transient apply error escalates straight to a full
+    //     re-seed instead of retrying at all.
+    //
+    // Fail at construction rather than degrade silently at the first delta.
+    const positiveInt: [string, number, unknown][] = [
+      ["maxBatch", this.maxBatch, opts.maxBatch],
+      ["maxDepth", this.maxDepth, opts.maxDepth],
+      ["maxApplyRetries", this.maxApplyRetries, opts.maxApplyRetries],
+    ];
+    for (const [name, value, raw] of positiveInt) {
+      if (!Number.isInteger(value) || value < 1) {
+        throw new Error(
+          `DeltaQueue: ${name} must be a positive integer (got ${String(raw)})`,
+        );
+      }
+    }
+    // Delay may legitimately be 0 (retry on the next tick) but must be finite and non-negative — NaN
+    // makes setTimeout fire immediately, turning the bounded backoff into a hot loop.
+    if (!Number.isFinite(this.retryDelayMs) || this.retryDelayMs < 0) {
       throw new Error(
-        `DeltaQueue: maxBatch must be a positive integer (got ${String(opts.maxBatch)})`,
+        `DeltaQueue: retryDelayMs must be a non-negative finite number (got ${String(opts.retryDelayMs)})`,
       );
     }
     // Same reasoning, at RUNTIME, for the same reason (CTC-114 review round 6): the type now requires
@@ -144,9 +173,6 @@ export class DeltaQueue {
           "the owner must re-seed and call resume(); without it an overflow stops syncing silently.",
       );
     }
-    this.maxDepth = opts.maxDepth ?? MAX_INBOX_DEPTH;
-    this.maxApplyRetries = opts.maxApplyRetries ?? MAX_APPLY_RETRIES;
-    this.retryDelayMs = opts.retryDelayMs ?? APPLY_RETRY_DELAY_MS;
   }
 
   /** How many deltas are buffered but not yet applied (observability + tests). */

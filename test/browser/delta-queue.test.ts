@@ -397,6 +397,46 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
     }
   });
 
+  it("validates EVERY public numeric option, not just maxBatch", async () => {
+    // CTC-114 review round 10. maxBatch was guarded in round 5 and maxDepth was not, though it comes
+    // from the same public options object. Its failure modes are worse: 0/negative/fractional makes
+    // the FIRST frame overflow and force a snapshot, and `NaN` makes `inbox.length > maxDepth`
+    // permanently false — so the inbox grows without bound and the OOM backstop this module exists
+    // for is silently gone. Guarding the class, not the reported instance.
+    const base = {
+      apply: vi.fn(),
+      onDrained: vi.fn(),
+      onError: vi.fn(),
+      onOverflow: vi.fn(),
+    };
+    for (const bad of [0, -1, 1.5, NaN]) {
+      expect(() => new DeltaQueue({ ...base, maxDepth: bad })).toThrow(
+        /maxDepth must be a positive integer/,
+      );
+      expect(() => new DeltaQueue({ ...base, maxApplyRetries: bad })).toThrow(
+        /maxApplyRetries must be a positive integer/,
+      );
+    }
+    // NaN is the sharp one for maxDepth — it silently disables the bound rather than degrading.
+    expect(() => new DeltaQueue({ ...base, maxDepth: NaN })).toThrow();
+
+    // retryDelayMs may legitimately be 0, but not NaN or negative (NaN makes setTimeout fire at once,
+    // turning the bounded backoff into a hot loop).
+    expect(() => new DeltaQueue({ ...base, retryDelayMs: 0 })).not.toThrow();
+    expect(() => new DeltaQueue({ ...base, retryDelayMs: -1 })).toThrow(
+      /retryDelayMs must be a non-negative finite number/,
+    );
+    expect(() => new DeltaQueue({ ...base, retryDelayMs: NaN })).toThrow(
+      /retryDelayMs must be a non-negative finite number/,
+    );
+
+    // Negative control: the legal values still construct, and the defaults are untouched.
+    expect(
+      () => new DeltaQueue({ ...base, maxDepth: 1, maxApplyRetries: 1 }),
+    ).not.toThrow();
+    expect(() => new DeltaQueue({ ...base })).not.toThrow();
+  });
+
   it("rejects a MISSING onOverflow at construction (silently terminal otherwise)", async () => {
     // CTC-114 review round 6. `onOverflow` was optional, and omitting it was silently terminal: the
     // first overflow latches `overflowed`, empties the inbox, and makes every later push() a no-op —

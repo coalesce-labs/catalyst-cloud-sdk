@@ -1061,6 +1061,83 @@ describe("a queue overflow quiesces the socket and never stays latched (CTC-114 
     replica.close();
   }, 15_000);
 
+  it("a WEDGED READ is bounded once no seed is in flight", async () => {
+    // CTC-114 review round 10. Round 9 EXEMPTED reads from the worker deadline, reasoning that some
+    // other bounded RPC would notice a dead worker first. Unfounded: on a quiet feed no apply and no
+    // seed need ever follow, so a UI awaiting queryIssues() hung forever. Reads are bounded again —
+    // their window merely PAUSES while a seed is in flight, which is the legitimate wait (SeedReadGate).
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("WebSocket", undefined);
+    const worker = new FakeWorker(
+      { open: undefined, getCursor: 42, close: undefined }, // WARM → no seed
+      {},
+      ["queryIssues"], // accepted, never answered
+    );
+    const c = collect();
+    const replica = new BrowserReplica(
+      c.handlers,
+      opts({
+        workerRpcTimeoutMs: 40,
+        createWorker: () => worker as unknown as Worker,
+      }),
+    );
+    await replica.start();
+
+    // THE OUTCOME: the query settles. Unfixed it never does, with nothing else to notice the wedge.
+    await expect(replica.queryIssues()).rejects.toThrow(/wedged/);
+    expect(worker.terminated).toBe(true);
+  }, 15_000);
+
+  it("HONOURS the transport's reseed cancellation signal", async () => {
+    // CTC-114 review round 10 (P1). LiveSyncClient bounds the reseed callback with a TOTAL deadline
+    // this integration never overrode, while the seed's own bounds (network idle, per-RPC) are
+    // satisfied indefinitely by a legitimately slow ~100 MB snapshot. So the transport could declare
+    // the attempt over and reconnect while the seed kept streaming into the worker — two writers, and
+    // a late commit leaving the socket advanced over a hole that the next delta sealed for good.
+    // END-TO-END on the TRANSPORT-driven path — a boot seed would only prove the pre-existing
+    // close()/abort route and nothing about the new link, which is the trap this test has to dodge.
+    // So: warm start (no boot seed), socket up, server sends {type:"resync"}, and the snapshot STALLS
+    // while the replica's own bounds are disabled. Only the transport's total deadline can end it.
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("location", { origin: "https://app.example" });
+    const Sock = recordingSocketGlobal();
+    stubFetch((_url, init) => stalledResponse((init as RequestInit).signal));
+    const worker = new FakeWorker({
+      open: undefined,
+      getCursor: 42, // WARM → start() opens a socket without seeding
+      seedBegin: undefined,
+      seedBatch: undefined,
+      seedCommit: 99,
+      seedAbort: undefined,
+      close: undefined,
+    });
+    const c = collect();
+    const replica = new BrowserReplica(c.handlers, {
+      baseUrl: "https://app.example/api/v1",
+      identity: "u1",
+      snapshotIdleTimeoutMs: 0, // the replica's OWN network bound is OFF
+      reseedTimeoutMs: 60, // ONLY the transport's total deadline can stop this seed
+      createWorker: () => worker as unknown as Worker,
+    });
+    await replica.start();
+    Sock.sockets[0]!.fireOpen();
+    Sock.sockets[0]!.deliver({ type: "resync" });
+
+    await vi.waitFor(
+      () => expect(worker.received.some((e) => e.request.type === "seedBegin")).toBe(true),
+      { timeout: 4000 },
+    );
+
+    // THE OUTCOME: the transport's deadline reaches INTO the seed. The stalled fetch is aborted and
+    // the worker's open transaction is rolled back. Unfixed, the transport abandons the callback and
+    // reconnects while this seed keeps streaming — two writers over one cursor.
+    await vi.waitFor(
+      () => expect(worker.received.map((e) => e.request.type)).toContain("seedAbort"),
+      { timeout: 4000 },
+    );
+    replica.close();
+  }, 15_000);
+
   it("a THROWING lock manager boots to 'error', never to 'secondary'", async () => {
     // CTC-114 review round 5. A denied / malfunctioning Web Locks API was collapsed into the same
     // `null` that means "another tab owns the replica", so start() resolved into the clean, terminal

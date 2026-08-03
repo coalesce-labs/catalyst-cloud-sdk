@@ -610,6 +610,134 @@ describe("requestResync() — the consumer-driven resync entry point (CTC-114 re
     client.stop();
   });
 
+  it("CANCELS the reseed when its deadline expires, not merely abandons it", async () => {
+    // CTC-114 review round 10 (P1). The deadline used to abandon the callback and reconnect while it
+    // kept running — justified as "the callback owns its own I/O bounds", which is exactly what makes
+    // a SECOND deadline here dangerous. Two layers bounding one operation with no cancellation link
+    // between them left two writers: the browser replica's seed streaming into the worker while the
+    // transport resumed a socket from a cursor that seed was still moving, so frames past it were
+    // accepted by the transport, dropped by the replica's paused queue, and sealed over for good.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let sawSignal: AbortSignal | undefined;
+    let abortedDuringSeed = false;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: (signal) => {
+        sawSignal = signal;
+        return new Promise<number>(() => {
+          // Never settles on its own — only the transport's deadline can end this attempt.
+          signal?.addEventListener("abort", () => {
+            abortedDuringSeed = true;
+          });
+        });
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 40,
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    await client.requestResync();
+
+    // THE OUTCOME: the callback was TOLD to stop. Unfixed it is never told, and keeps writing while
+    // the transport reconnects beneath it.
+    expect(sawSignal).toBeInstanceOf(AbortSignal);
+    expect(abortedDuringSeed).toBe(true);
+    expect(sawSignal!.aborted).toBe(true);
+    client.stop();
+  });
+
+  it("cancels an in-flight reseed on stop() too", async () => {
+    // Same link, the other give-up path: stop() abandons the attempt, so it must also cancel it.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let aborted = false;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: (signal) =>
+        new Promise<number>(() => {
+          signal?.addEventListener("abort", () => {
+            aborted = true;
+          });
+        }),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 600_000, // only stop() can end this
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    const pending = client.requestResync();
+    await new Promise((r) => setTimeout(r, 0));
+    client.stop();
+    await pending;
+
+    expect(aborted).toBe(true);
+  });
+
+  it("AWAITS an already-running resync rather than resolving at once", async () => {
+    // CTC-114 review round 10. handleResync()'s re-entrancy guard returned bare, so a caller awaiting
+    // the public requestResync() while a server-driven resync was already re-seeding got a promise
+    // that resolved IMMEDIATELY — and could then read a store still being rebuilt. Awaiting recovery
+    // must mean recovery finished, whoever started it. Same seam as the boot serialization, which
+    // covered only bootTask.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let seedDone = false;
+    let releaseSeed!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseSeed = r;
+    });
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        await gate;
+        seedDone = true;
+        store.setCursor(12);
+        return 12;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+
+    // A SERVER-driven resync starts first and parks in the seed.
+    sockets[0]!.deliver({ type: "resync" });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(seedDone).toBe(false);
+
+    // The consumer now asks for one too. This must not resolve until the running seed finishes.
+    let settledEarly = false;
+    const pending = client.requestResync().then(() => {
+      settledEarly = !seedDone;
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(settledEarly).toBe(false);
+
+    releaseSeed();
+    await pending;
+    // THE OUTCOME: it waited for the seed that was actually running.
+    expect(seedDone).toBe(true);
+    expect(settledEarly).toBe(false);
+    client.stop();
+  });
+
   it("never rejects when the re-seed fails", async () => {
     const { sockets, factory } = recordingFactory();
     const client = new LiveSyncClient({
