@@ -707,6 +707,34 @@ export class CatalystReplica {
     const engine = this.engine;
     const writeDb = this.writeDb;
     if (!engine || !writeDb) return;
+    // SEQ STALE-GUARD (CTC-328) — the node twin of the browser guard in
+    // `src/replica/browser/worker-core.ts` (CTC-114 round 4).
+    //
+    // The transport deliberately forwards duplicate / out-of-order frames at `seq <= deliveredSeq`
+    // (live-sync-client.ts: "passed through unchanged: the consumer's stale-guard already dedups
+    // it") — WE are that stale-guard. But `applyDelta`'s guard only covers UPSERTS
+    // (`ON CONFLICT … WHERE excluded.updated_at > …`); the DELETE path keys on the PK alone and has
+    // no guard at all. So a replayed old delete removed a row that a NEWER change had created, and
+    // because the durable cursor still holds the newer seq, a reconnect resumes ABOVE the damage —
+    // nothing ever repairs it short of a full re-seed.
+    //
+    // The cursor's own meaning is exactly the test: everything at or below it is already reflected
+    // in the DB — applied as a delta, dropped by the updated_at guard as stale (the DB then holds
+    // NEWER data), or carried in the snapshot that set it. Skipping is right in every case.
+    //
+    // Recorded as "skipped" and still stamped/signalled below, so a duplicate is observable in the
+    // apply log (which carries `seq`) and consumers see exactly the behaviour they see today for a
+    // stale-dropped frame. The ONLY difference is that the database is never touched.
+    if (frame.seq <= this.highWater) {
+      this.lastAppliedAtMs = Date.now();
+      this.recordApplyResult("skipped", frame);
+      try {
+        this.opts.onChange?.();
+      } catch (err) {
+        this.log("warn", "onChange handler threw", err);
+      }
+      return;
+    }
     try {
       // `applyDelta` returns whether the row was actually written (`true`) or dropped by the replica's
       // stale-guard (`false`) — the applied-vs-skipped signal (CTL-1402).
@@ -723,9 +751,12 @@ export class CatalystReplica {
         // guarantees contiguity (CTL-1402): LiveSyncClient never delivers a frame beyond
         // deliveredSeq+1 — it holds the cursor at the hole and re-requests the gap — so "seen" here
         // can no longer seal over an undelivered frame.
-        if (frame.seq > this.highWater) setCursor(writeDb, frame.seq, engine.toBindable);
+        //
+        // Unconditional since CTC-328: the stale-guard above returned for every `seq <= highWater`,
+        // so reaching here already means this is a newly seen seq.
+        setCursor(writeDb, frame.seq, engine.toBindable);
       });
-      if (frame.seq > this.highWater) this.highWater = frame.seq;
+      this.highWater = frame.seq;
       // Freshness stamp. The cursor + freshness_ms gauges read this.highWater / this.lastAppliedAtMs on
       // the next scrape.
       this.lastAppliedAtMs = Date.now();
