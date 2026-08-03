@@ -486,6 +486,11 @@ export class LiveSyncClient {
   start(): Promise<void> {
     this.stopped = false;
     this.started = true;
+    // RESET per boot. `start()` is restartable after `stop()`, and a stale `true` from a previous
+    // cold boot would make the NEXT boot — warm, and therefore re-seeding nothing — absorb a resync
+    // it should have honoured. Found while re-reading this path rather than reported; the same class
+    // of staleness as the `bootTask` handle being nulled when it settles.
+    this.bootColdSeeded = false;
     // The done deferred is created BEFORE the boot body runs (CTC-281 N2): stop() during the cold-seed
     // await used to find resolveDone still null and leave the returned promise pending forever — a
     // contract violation for a consumer awaiting start(). The boot body below is deliberately its OWN
@@ -992,25 +997,39 @@ export class LiveSyncClient {
    */
   private boundedReseed(): Promise<number> {
     const seed = this.reseed();
-    if (this.reseedTimeoutMs <= 0) return seed;
     void seed.catch(() => {}); // an abandoned attempt's late rejection must never go unhandled
+    // ALWAYS wrapped, even with the deadline disabled (CTC-114 review round 8). This used to
+    // early-return the raw seed promise when `reseedTimeoutMs <= 0` — the documented way to turn the
+    // deadline off — which skipped installing `abandonReseed` and so bypassed round 7's stop() fix
+    // entirely on that path. Disabling the DEADLINE must not also disable teardown: the two are
+    // independent, and `stop()` has to be able to settle an awaited `requestResync()` either way.
     return new Promise<number>((resolve, reject) => {
       let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        if (this.reseedTimer === timer) this.reseedTimer = null;
-        reject(new Error(`reseed did not settle within ${this.reseedTimeoutMs}ms; abandoning (CTC-281)`));
-      }, this.reseedTimeoutMs);
-      this.reseedTimer = timer;
+      let timer: ReturnType<typeof setTimeout> | null = null;
       const finish = (fn: () => void): void => {
-        if (settled) return; // stale settle: the deadline already abandoned this attempt
+        if (settled) return; // stale settle: the deadline or stop() already took this attempt
         settled = true;
-        clearTimeout(timer);
-        if (this.reseedTimer === timer) this.reseedTimer = null;
+        if (timer !== null) {
+          clearTimeout(timer);
+          if (this.reseedTimer === timer) this.reseedTimer = null;
+        }
         this.abandonReseed = null;
         fn();
       };
+      if (this.reseedTimeoutMs > 0) {
+        timer = setTimeout(
+          () =>
+            finish(() =>
+              reject(
+                new Error(
+                  `reseed did not settle within ${this.reseedTimeoutMs}ms; abandoning (CTC-281)`,
+                ),
+              ),
+            ),
+          this.reseedTimeoutMs,
+        );
+        this.reseedTimer = timer;
+      }
       // stop() settles this wrapper (CTC-114 review round 7). Clearing the deadline is not enough:
       // if the injected reseed() never settles, nothing else ever settles THIS promise, and while
       // that was merely "an irrelevant await nobody holds" when boundedReseed was internal, the
@@ -1062,8 +1081,20 @@ export class LiveSyncClient {
     // can no longer be caught up by deltas, which replaying from the cursor cannot fix.
     const boot = this.bootTask;
     if (boot) {
-      await boot.catch(() => undefined);
+      let bootFailed = false;
+      await boot.catch(() => {
+        bootFailed = true;
+      });
       if (this.stopped) return;
+      // A FAILED boot must not be recovered from here (CTC-114 review round 8). Round 7 swallowed the
+      // rejection and carried straight on into handleResync — so a cold start whose /snapshot failed
+      // would reject the caller's start(), sending the application into its boot-error path, and then
+      // a later successful reseed here would quietly open a live socket underneath it. The client must
+      // not outlive the startup the consumer was told had failed; recovery is start()'s to re-attempt.
+      if (bootFailed) {
+        this.log("warn", "requestResync() ignored — startup failed");
+        return;
+      }
       // A COLD boot re-seeded from /snapshot while we waited, which IS what was being asked for.
       if (this.bootColdSeeded) {
         this.log("info", "requestResync() absorbed by the boot's cold seed");

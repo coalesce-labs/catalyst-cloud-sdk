@@ -478,6 +478,106 @@ describe("requestResync() — the consumer-driven resync entry point (CTC-114 re
     await expect(pending).resolves.toBeUndefined();
   });
 
+  it("settles on stop() even with the reseed deadline DISABLED", async () => {
+    // CTC-114 review round 8 — the gap round 7's fix left. `boundedReseed()` early-returned the raw
+    // seed promise when `reseedTimeoutMs <= 0` (the documented way to disable the deadline), so it
+    // never installed the `abandonReseed` callback stop() invokes. Disabling the DEADLINE must not
+    // also disable teardown: the two are independent.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: () => new Promise<number>(() => {}), // never settles
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 0, // DEADLINE OFF — the path that bypassed the round-7 fix
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+
+    const pending = client.requestResync();
+    await new Promise((r) => setTimeout(r, 0));
+    client.stop();
+
+    await expect(pending).resolves.toBeUndefined();
+  });
+
+  it("does NOT recover from a startup that rejected", async () => {
+    // CTC-114 review round 8. Round 7 awaited the boot with `.catch(() => undefined)` and carried on
+    // regardless — so a cold start whose /snapshot failed would reject the caller's start(), sending
+    // the app into its boot-error path, and then a later successful reseed here would quietly open a
+    // live socket underneath it. The client must not outlive the startup the consumer was told failed.
+    const store = makeStore(null); // COLD → the boot reseeds, and this one fails
+    const { sockets, factory } = recordingFactory();
+    let seeds = 0;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        seeds += 1;
+        throw new Error("snapshot 503");
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      telemetry: true, // park the boot so the request lands mid-startup
+    });
+
+    const started = client.start();
+    const pending = client.requestResync();
+    await expect(started).rejects.toThrow("snapshot 503");
+    await pending;
+
+    // THE OUTCOME: no recovery attempt, and above all NO socket left running behind a failed start().
+    expect(seeds).toBe(1); // the boot's own attempt, and nothing after it
+    expect(sockets).toHaveLength(0);
+    client.stop();
+  });
+
+  it("re-evaluates the cold/warm verdict on RESTART", async () => {
+    // Not reported — found while re-reading this path. `bootColdSeeded` was never reset, and start()
+    // is restartable after stop(). So a client that cold-seeded on its FIRST boot carried that verdict
+    // forever: the second boot, now warm and therefore re-seeding nothing, would absorb a resync it
+    // should have honoured — the round-7 bug again, reachable only via restart.
+    const store = makeStore(null); // first boot: COLD
+    const { sockets, factory } = recordingFactory();
+    let seeds = 0;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        seeds += 1;
+        store.setCursor(12);
+        return 12;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      telemetry: true,
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(seeds).toBe(1)); // cold-seeded
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    client.stop();
+
+    // SECOND boot — the cursor is now set, so this one is WARM and re-seeds nothing.
+    void client.start();
+    const pending = client.requestResync();
+    await pending;
+
+    // THE OUTCOME: honoured, not absorbed by the FIRST boot's stale cold verdict.
+    expect(seeds).toBe(2);
+    client.stop();
+  });
+
   it("never rejects when the re-seed fails", async () => {
     const { sockets, factory } = recordingFactory();
     const client = new LiveSyncClient({
