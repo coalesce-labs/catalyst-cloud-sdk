@@ -893,6 +893,19 @@ export class CatalystReplica {
           // an empty replica from a stale cursor.
           engine.run("DELETE FROM sync_meta WHERE key = 'cursor'");
           engine.transaction(() => truncateReplica(writeDb));
+          // …and drop the IN-MEMORY high-water with it. `this.highWater` must mirror the durable cursor at
+          // all times — that equivalence is the whole justification for CTC-328's stale-guard in
+          // applyFrame ("everything at or below the cursor is already reflected in the DB"). The two lines
+          // above just made the DB empty and the durable cursor null; a highWater still holding the
+          // PRE-seed value would be a claim about rows that no longer exist. If this seed then fails
+          // (a mid-stream abort, a dropped connection), the transport re-reads the durable cursor — now
+          // null — and resumes from the BEGINNING, and the stale-guard would discard every replayed frame
+          // at or below the dead high-water. Those rows are never re-delivered, and the first frame above
+          // it advances the cursor straight over the hole: sealed, and invisible to a reconnect. The reset
+          // is deliberately here rather than in the success path, so the invariant holds at EVERY await in
+          // between. (Same move as the CTC-127 re-seed path above, which re-derives highWater from the
+          // cursor it just deleted.)
+          this.highWater = 0;
 
           let cursor = 0;
           let batch: SnapshotLine[] = [];

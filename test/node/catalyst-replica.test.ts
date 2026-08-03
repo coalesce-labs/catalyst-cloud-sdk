@@ -1174,4 +1174,94 @@ describe("CatalystReplica bounded teardown + seed abort (CTC-281)", () => {
     sockets[sockets.length - 1]!.fireOpen();
     await vi.waitFor(() => expect(statuses[statuses.length - 1]).toBe("live"));
   });
+
+  // ── CTC-328 follow-up (sdk#12 review, P1): a FAILED re-seed must reset the in-memory high-water ──
+  //
+  // seedFromSnapshot() invalidates the durable cursor and TRUNCATES up front (so a crash mid-seed
+  // re-seeds instead of going live over an empty replica), but `highWater` was only assigned after the
+  // seed committed. A seed that threw in between therefore left an in-memory high-water describing rows
+  // that no longer existed — and CTC-328's stale-guard trusts exactly that value.
+  //
+  // The reconnect is what makes it unrecoverable rather than merely stale. `ws.onopen` re-baselines
+  // from the DURABLE cursor — now null — so it sets deliveredSeq = -1 and sends {type:"sync", after:-1},
+  // asking the service to replay from the START. There is no second cold seed on a reconnect. Every
+  // replayed frame then arrives at a seq at or below the dead high-water and the guard discards it, so
+  // the truncated rows are never restored; the first frame ABOVE it advances the cursor straight over
+  // the hole, sealing it exactly the way the original CTC-328 bug sealed its own damage.
+  //
+  // Asserted as an OUTCOME — is the row readable — not as "highWater equals 0".
+  it("after a FAILED re-seed, replayed frames at or below the OLD cursor still land (the truncated replica is refilled, not sealed over)", async () => {
+    const { sockets, factory } = recordingFactory();
+    const enc = new TextEncoder();
+    let snapshotCalls = 0;
+    // The cold seed carries one row and a cursor of 5 — so highWater is 5 before the failure.
+    const goodBody = snapshotBody(
+      [{ entity: "issues", row: { id: "i1", identifier: "CTC-1", title: "cold seed", updated_at: 1 } }],
+      5,
+    );
+    const fetchImpl = (async () => {
+      snapshotCalls += 1;
+      if (snapshotCalls === 1) {
+        return { ok: true, status: 200, text: async () => goodBody } as unknown as Response;
+      }
+      // The RESYNC snapshot dies after the truncate: the cursor row is already gone and the tables are
+      // already empty when this throws.
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(enc.encode("%%corrupt line%%\n"));
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const statuses: string[] = [];
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl,
+        wsFactory: factory,
+        backoffMs: 20,
+        onStatus: (s) => statuses.push(s),
+      }),
+    );
+    await startToLive(replica, sockets);
+    expect(replica.issues()).toHaveLength(1); // the cold seed landed
+    expect(replica.cursor).toBe(5);
+
+    // Underflow → re-seed → truncate + drop the cursor → THROW.
+    sockets[0]!.deliver({ type: "resync", accountId: "tenant-0" });
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThanOrEqual(2));
+    // The premise of the whole test: the failed seed really did empty the replica.
+    expect(replica.issues()).toHaveLength(0);
+    expect(replica.cursor).toBeNull();
+
+    // Reconnect: onopen re-baselines deliveredSeq from the (null) durable cursor to -1 and asks for a
+    // replay from the start. The service replays the retained frames it still holds.
+    sockets[sockets.length - 1]!.fireOpen();
+    await vi.waitFor(() => expect(statuses[statuses.length - 1]).toBe("live"));
+
+    // seq 1 is genuinely deliverable here: the transport's gap check is gated on `deliveredSeq > 0`
+    // ("a fresh/cursorless store has nothing to be contiguous with"), so with the baseline at -1 the
+    // replay is passed straight through to the consumer — us.
+    const socket = sockets[sockets.length - 1]!;
+    socket.deliver({
+      type: "change",
+      accountId: "tenant-0",
+      seq: 1,
+      entity: "issues",
+      entityId: "i1",
+      op: "upsert",
+      row: { id: "i1", identifier: "CTC-1", title: "replayed", updated_at: 1 },
+    });
+
+    // THE assertion. seq 1 is far below the pre-seed cursor of 5, so the stale-guard would drop it if
+    // the high-water had survived the failed seed — and the row would be gone for good.
+    const view = replica.issues();
+    expect(view).toHaveLength(1);
+    expect(view[0]!.title).toBe("replayed");
+  });
 });
