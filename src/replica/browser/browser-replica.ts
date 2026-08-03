@@ -37,6 +37,7 @@ import type {
 import { streamSnapshotBatches } from "./snapshot-stream.js";
 import { DeltaQueue } from "./delta-queue.js";
 import { acquireReplicaLock, type ReplicaLockHandle } from "./browser-lock.js";
+import { requireNonNegativeFinite } from "./validate.js";
 
 /** Where the replica DB file + its OPFS dir live by default. Absolute path (SAHPool requires a leading
  *  slash); one directory per origin-app so engines don't collide. */
@@ -370,6 +371,25 @@ export class BrowserReplica {
         }
       },
     };
+    // Validate the numeric knobs ONCE, here (CTC-114 review round 13) — the FOURTH appearance of this
+    // class, and the first inside an option I added myself. `NaN` defeats each of these the same way:
+    // `ms <= 0` is false, so the guard that disables the bound does not fire, and `setTimeout(fn, NaN)`
+    // is then coerced to a ZERO-delay timer. A NaN `workerRpcTimeoutMs` therefore declares a healthy
+    // worker wedged before its own `open` reply can arrive, terminates it, and rejects `start()` —
+    // the opposite of the "generous by design" contract documented on the constant.
+    //
+    // Round 12 introduced validate.ts for exactly this and I applied it to the exported helpers while
+    // walking past the options object of the main public class. All three of these accept 0 to disable
+    // the bound, so non-negative rather than positive.
+    for (const [label, value] of [
+      ["snapshotIdleTimeoutMs", options.snapshotIdleTimeoutMs],
+      ["workerRpcTimeoutMs", options.workerRpcTimeoutMs],
+      ["reseedTimeoutMs", options.reseedTimeoutMs],
+    ] as const) {
+      if (value !== undefined) {
+        requireNonNegativeFinite("BrowserReplica", label, value);
+      }
+    }
     this.options = options;
     this.deltas = new DeltaQueue({
       // Bounded by `call()` itself (round 9) — a wedged apply used to leave the queue permanently

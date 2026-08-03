@@ -2418,3 +2418,33 @@ describe("LiveSyncClient fleet-incident hardening (CTC-281)", () => {
     expect(sockets).toHaveLength(0); // …and the stopped client correctly never opens a socket
   });
 });
+
+describe("re-entrant teardown from a status callback (CTC-114 review round 13)", () => {
+  it("does not create a socket when the consumer stops from onStatus", async () => {
+    // `openSocket()` guarded `stopped` on entry, then called setStatus("connecting") — which calls
+    // into CONSUMER code. A consumer tearing down from that notification (the browser replica's first
+    // "reconnecting" is a documented place to do so) ran stop() while `this.ws` was still null, so it
+    // had nothing to close; openSocket then resumed, constructed a socket and stored it in an
+    // already-stopped client, leaving it open and processing frames after teardown had completed.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let client!: LiveSyncClient;
+    client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(12),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      onStatus: (s) => {
+        if (s === "connecting") client.stop();
+      },
+    });
+
+    void client.start();
+    await new Promise((r) => setTimeout(r, 10));
+    // THE OUTCOME: no orphaned socket exists for the completed teardown to have missed.
+    expect(sockets).toHaveLength(0);
+  });
+});

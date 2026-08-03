@@ -1195,4 +1195,39 @@ describe("a queue overflow quiesces the socket and never stays latched (CTC-114 
     // Ordering matters: the abort must come after the begin it is rolling back.
     expect(sent.lastIndexOf("seedAbort")).toBeGreaterThan(sent.indexOf("seedBegin"));
   });
+
+  it("REJECTS non-finite timeout options at construction", async () => {
+    // CTC-114 review round 13 — the FOURTH appearance of this class, and the first inside an option I
+    // added myself. `NaN` defeats each of these identically: `ms <= 0` is false so the disable-guard
+    // does not fire, and `setTimeout(fn, NaN)` is then coerced to a ZERO-delay timer. A NaN
+    // `workerRpcTimeoutMs` therefore declares a healthy worker wedged before its own `open` reply can
+    // arrive, terminates it and rejects start() — the exact opposite of the documented contract.
+    // Round 12 added validate.ts for this and applied it to the exported helpers while walking past
+    // the options object of the main public class.
+    const c = collect();
+    for (const label of [
+      "snapshotIdleTimeoutMs",
+      "workerRpcTimeoutMs",
+      "reseedTimeoutMs",
+    ]) {
+      for (const bad of [NaN, Infinity, -1]) {
+        expect(
+          () => new BrowserReplica(c.handlers, opts({ [label]: bad })),
+        ).toThrow(new RegExp(`${label} must be a non-negative finite number`));
+      }
+    }
+    // Negative control: 0 DISABLES each bound and is legitimate, as is a normal value.
+    expect(
+      () =>
+        new BrowserReplica(
+          c.handlers,
+          opts({
+            snapshotIdleTimeoutMs: 0,
+            workerRpcTimeoutMs: 0,
+            reseedTimeoutMs: 0,
+          }),
+        ),
+    ).not.toThrow();
+    expect(() => new BrowserReplica(c.handlers, opts({}))).not.toThrow();
+  });
 });

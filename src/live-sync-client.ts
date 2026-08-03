@@ -677,6 +677,14 @@ export class LiveSyncClient {
   private openSocket(): void {
     if (this.stopped) return;
     this.setStatus("connecting");
+    // RE-CHECK after the status callback (CTC-114 review round 13). `setStatus` calls into consumer
+    // code, and a consumer may synchronously tear down from it — the browser replica's very first
+    // "reconnecting" notification is a documented place to do so. `stop()` then ran while `this.ws`
+    // was still null, so it had nothing to close; we resumed here, constructed a socket, stored it in
+    // an already-stopped client, and left it open processing frames with the teardown long finished.
+    // Every guarded entry point that calls out and then continues needs this; this is the one that
+    // creates a resource afterwards.
+    if (this.stopped) return;
     // One span per connect attempt: started here, ended OK in onopen, ERROR on construct-fail / a close
     // before open. Manual (not active) because the lifecycle spans onopen…onclose callbacks.
     this.connectSpan = this.telemetry.startSpan(REPLICA_SPAN.reconnect, {
