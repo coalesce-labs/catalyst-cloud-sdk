@@ -180,9 +180,22 @@ export class DeltaQueue {
     return this.inbox.length;
   }
 
-  /** Buffer one delta and make sure a drain is running. */
-  push(change: SeqChange): void {
-    if (this.stopped || this.overflowed) return;
+  /**
+   * Buffer one delta and make sure a drain is running.
+   *
+   * Returns whether the frame was KEPT (CTC-114 review round 11). A latched queue — paused for a
+   * re-seed, or overflowed — REFUSES frames, and the owner must not count a refused frame as
+   * delivered: its transport high-water would then describe a seq that is in neither the store nor
+   * this buffer, so a reconnect resuming above it seals a hole nothing ever re-requests.
+   *
+   * The owner used to advance that high-water unconditionally, one line ABOVE the call that decides.
+   * That was safe only while the sole latch (overflow) rolled the high-water back in the same
+   * synchronous block; round 9's `pause()` added a second latch with no such compensation, after
+   * which the safety rested on `closeSocket()` happening before `pause()` on every path. Returning
+   * the decision makes the owner's bookkeeping follow the queue's, instead of racing it.
+   */
+  push(change: SeqChange): boolean {
+    if (this.stopped || this.overflowed) return false;
     this.inbox.push(change);
     if (this.inbox.length > this.maxDepth) {
       // Deeper than it is worth replaying — drop the backlog and let the owner re-seed. Latched, so
@@ -192,9 +205,11 @@ export class DeltaQueue {
       this.inbox.length = 0;
       this.clearRetry();
       this.notify("onOverflow", () => this.opts.onOverflow(depth, "depth"));
-      return;
+      // This frame went into the discarded backlog, so it was NOT kept either.
+      return false;
     }
     void this.drain();
+    return true;
   }
 
   /**

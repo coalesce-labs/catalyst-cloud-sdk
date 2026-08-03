@@ -397,6 +397,62 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
     }
   });
 
+  it("push() REPORTS whether the frame was kept, so the owner cannot over-count", async () => {
+    // CTC-114 review round 11. The owner advanced its transport high-water one line ABOVE this call,
+    // unconditionally — so a frame arriving while the queue was latched (paused for a re-seed, or
+    // overflowed) was counted as delivered and then refused. `getCursor()` reports max(acceptedSeq,
+    // lastSeq), so the next `{type:"sync", after}` resumes ABOVE it, the gap detector re-baselines
+    // from the same poisoned value and sees contiguity, and the next applied batch carries the durable
+    // cursor past the hole: silent, permanent, recoverable only by another full re-seed.
+    //
+    // Reporting the decision is what lets the owner's bookkeeping FOLLOW the queue rather than race
+    // it, instead of relying on closeSocket() beating pause() on every path across three modules.
+    const q = new DeltaQueue({
+      apply: () => Promise.resolve({ cursor: 0 }),
+      onDrained: vi.fn(),
+      onError: vi.fn(),
+      onOverflow: vi.fn(),
+      maxDepth: 2,
+    });
+
+    // Accepted while running.
+    expect(q.push(change(1))).toBe(true);
+
+    // PAUSED (what reseed()'s preamble does): refused, and it says so.
+    q.pause();
+    expect(q.push(change(2))).toBe(false);
+
+    // Resumed: accepted again.
+    q.resume();
+    expect(q.push(change(3))).toBe(true);
+
+    // STOPPED: refused.
+    q.stop();
+    expect(q.push(change(4))).toBe(false);
+  });
+
+  it("push() reports FALSE for the frame that triggers a depth overflow", async () => {
+    // That frame goes into the backlog the overflow immediately discards, so it was not kept either —
+    // counting it as delivered would seal exactly the hole the overflow rollback exists to prevent.
+    const onOverflow = vi.fn();
+    const q = new DeltaQueue({
+      apply: () => new Promise(() => {}), // never settles, so the inbox actually fills
+      onDrained: vi.fn(),
+      onError: vi.fn(),
+      onOverflow,
+      maxDepth: 2,
+      maxBatch: 1,
+    });
+    // The FIRST push is spliced straight into the (now parked) apply, so the inbox trails by one:
+    // after this, inbox=[] with seq 1 in flight.
+    expect(q.push(change(1))).toBe(true);
+    expect(q.push(change(2))).toBe(true); // inbox=[2]
+    expect(q.push(change(3))).toBe(true); // inbox=[2,3] — at maxDepth, not past it
+    expect(q.push(change(4))).toBe(false); // inbox=[2,3,4] > maxDepth → discarded backlog
+    expect(onOverflow).toHaveBeenCalledTimes(1);
+    expect(q.depth).toBe(0);
+  });
+
   it("validates EVERY public numeric option, not just maxBatch", async () => {
     // CTC-114 review round 10. maxBatch was guarded in round 5 and maxDepth was not, though it comes
     // from the same public options object. Its failure modes are worse: 0/negative/fractional makes

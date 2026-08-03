@@ -1183,7 +1183,11 @@ export class LiveSyncClient {
     //
     // This is the same seam as the boot serialization, which covered only `bootTask`: one handle for
     // "a re-seed is in flight", awaited by everything that needs it to be done.
-    if (this.activeResync) return this.activeResync;
+    // `return await`, not `return` (CodeQL, round 11). Behaviour is identical today, but returning a
+    // bare promise from an async function means a later `try`/`finally` added around this line would
+    // settle BEFORE the awaited work — a foot-gun this file has been bitten by often enough to be
+    // worth foreclosing, and it keeps this frame in the stack trace when the resync rejects.
+    if (this.activeResync) return await this.activeResync;
     const run = this.runResync();
     this.activeResync = run;
     try {
@@ -1193,7 +1197,20 @@ export class LiveSyncClient {
     }
   }
 
-  /** The resync body. Never call directly — `handleResync()` owns the in-flight handle. */
+  /**
+   * The resync body. Never call directly — `handleResync()` owns the in-flight handle.
+   *
+   * TWO FLAGS, ONE FACT — documented rather than consolidated here, deliberately. `resyncing` and
+   * `activeResync` both mean "a re-seed is in flight", and they can disagree: the boot path sets
+   * `resyncing` directly (so a resync cannot race startup) without ever creating an `activeResync`
+   * handle. In that window a call landing here would hit the guard below and resolve silently, which
+   * is the very shape round 10 fixed for the live path.
+   *
+   * It is NOT reachable today, and both reasons are load-bearing: `requestResync()` serialises behind
+   * `bootTask` before it can get here, and the server-frame path needs a socket, which does not exist
+   * until the boot opens one. Consolidating the two into a single handle is the right fix and belongs
+   * with the wider lifecycle rework — not in a release candidate at round eleven.
+   */
   private async runResync(): Promise<void> {
     if (this.resyncing) return;
     this.resyncing = true;

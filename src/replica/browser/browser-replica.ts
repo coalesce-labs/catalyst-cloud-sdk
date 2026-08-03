@@ -865,16 +865,28 @@ export class BrowserReplica {
     row?: Record<string, unknown>;
   }): void {
     if (this.disposed) return;
-    // Advance the TRANSPORT high-water the instant the frame is accepted — before it is applied — so a
+    // Advance the TRANSPORT high-water the instant the frame is accepted — before it is APPLIED — so a
     // reconnect resumes from what we received rather than from what the worker has committed.
-    if (frame.seq > this.acceptedSeq) this.acceptedSeq = frame.seq;
-    this.deltas.push({
+    //
+    // But only if the queue actually KEPT it (CTC-114 review round 11). This advanced unconditionally,
+    // one line above the push that decides, so a frame arriving while the queue was latched — paused
+    // for a re-seed, or overflowed — was counted as delivered and then refused. `getCursor()` reports
+    // max(acceptedSeq, lastSeq), so the next `{type:"sync", after}` would resume ABOVE it, the gap
+    // detector would re-baseline from the same poisoned value and see contiguity, and the next applied
+    // batch would carry the durable cursor past the hole. Silent, permanent, re-seed-only recovery.
+    //
+    // Reachability today rests on `closeSocket()` running before `pause()` on every path that latches
+    // while a socket is open — which held when I traced it, but is a proof by call ordering across
+    // three modules, and this PR has now had five consecutive rounds where exactly that kind of
+    // reasoning was wrong. Following the queue's own decision costs one boolean and needs no proof.
+    const kept = this.deltas.push({
       seq: frame.seq,
       entity: frame.entity,
       op: frame.op,
       row: frame.row ?? {},
       entityId: frame.entityId,
     });
+    if (kept && frame.seq > this.acceptedSeq) this.acceptedSeq = frame.seq;
   }
 
   /** Read the issues list view from the local replica (buildIssuesView over OPFS). */
