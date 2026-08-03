@@ -127,6 +127,98 @@ void client.start(); // never await in the browser
 
 Requires a platform `WebSocket` (browser, Bun, or Node ≥22). On older Node, inject a `wsFactory` that wraps the [`ws`](https://www.npmjs.com/package/ws) package.
 
+### Browser — managed OPFS replica (`/browser`)
+
+`BrowserReplica` is the browser twin of `/node`'s `CatalystReplica`: an OPFS-persisted SQLite replica
+in a dedicated Web Worker, seeded from `/snapshot` in bounded streamed batches, kept live off the same
+change feed, and read through the same `@catalyst-cloud/read-model` views — no hand-written worker,
+apply, or seeding code in your app.
+
+```ts
+import {
+  BrowserReplica,
+  isBrowserReplicaSupported,
+  type ReplicaStatus,
+} from "@catalyst-cloud/sdk/browser";
+
+let status: ReplicaStatus = "loading";
+
+if (isBrowserReplicaSupported()) {
+  const replica = new BrowserReplica(
+    {
+      onChanged: () => void refreshList(), // after the seed and after every applied delta drain
+      onStatus: (s) => {
+        status = s; // "loading" | "live" | "reconnecting" | "error" | "secondary" | …
+        setBadge(s);
+      },
+    },
+    {
+      baseUrl: "/api/v1", // same-origin, cookie-authed; accountId optional
+      // REQUIRED. The OPFS database is shared by every replica on the origin and a warm cursor skips
+      // the snapshot, so without a fence a change of signed-in user serves the PREVIOUS user's rows.
+      // Pass a stable per-user id from your session — e.g. the WorkOS `user.id`. It never leaves the
+      // browser; it is only compared against the value stamped in the local DB, and a mismatch wipes
+      // the replica and forces a re-seed.
+      identity: session.user.id,
+    },
+  );
+  // AWAIT it. start() suspends on the Web Lock before the worker exists, so a query issued against a
+  // not-yet-started replica rejects with "replica client closed".
+  await replica.start(); // resolves once seeded — or immediately, with status "secondary"
+
+  // Another tab already owns the origin's replica. That is a normal outcome, not an error: this tab
+  // should read via its usual fetch path and leave the local DB alone.
+  if (status !== "secondary") {
+    const rows = await replica.queryIssues(); // read-model IssueView[], served locally
+  }
+  // replica.close() on teardown — cooperatively releases the OPFS handles, then terminates the worker
+}
+```
+
+`status` above is whatever your `onStatus` handler last recorded. `start()` REJECTS if the boot fails
+(bad origin, missing worker chunk, OPFS unavailable) — it does not resolve into a broken state, so a
+`try`/`catch` around it is where you surface the error to the user.
+
+Built in, because browsers need them:
+
+- **Single-owner election** (Web Locks): OPFS SAHPool is single-connection-per-origin, so exactly one
+  tab boots the replica; every other tab gets status `"secondary"` (a clean state, not an error) and
+  should read via its normal fetch path.
+- **Backpressure**: live deltas are coalesced into batched, single-flight applies with a bounded
+  buffer; a backlog too deep to replay escalates to a fresh snapshot instead of growing.
+
+**Peer dependency**: install [`@sqlite.org/sqlite-wasm`](https://www.npmjs.com/package/@sqlite.org/sqlite-wasm)
+yourself — the SDK never bundles the wasm.
+
+**Bundlers**: the worker is created with `new Worker(new URL("./db.worker.js", import.meta.url),
+{ type: "module" })`, which Vite, webpack 5, and Rollup detect statically and split into its own chunk
+(nothing wasm-related touches your main bundle; `/node` consumers never see it at all). Notes:
+
+- **Vite**: works out of the box in `build`. In dev, if pre-bundling interferes with the worker URL,
+  add `optimizeDeps: { exclude: ["@catalyst-cloud/sdk"] }`.
+- **webpack 5 / Rollup**: the `new Worker(new URL(...))` syntax is supported natively (Rollup needs
+  worker support in your config, e.g. `@surma/rollup-plugin-off-main-thread` or equivalent).
+- **Exotic bundlers**: pass `createWorker` in `BrowserReplicaOptions` and construct the worker
+  however your toolchain requires. The worker module is published at the dedicated subpath
+  **`@catalyst-cloud/sdk/browser/db-worker`** — that specifier is the supported entry point:
+
+  ```ts
+  // Vite
+  import DbWorker from "@catalyst-cloud/sdk/browser/db-worker?worker";
+  createWorker: () => new DbWorker();
+
+  // webpack 5 / anything that resolves a bare specifier to a URL
+  createWorker: () =>
+    new Worker(
+      new URL("@catalyst-cloud/sdk/browser/db-worker", import.meta.url),
+      { type: "module" },
+    );
+  ```
+
+  The worker is a **side-effect module** (it registers a message handler and exports nothing), so it
+  is listed in the package's `sideEffects` array — do not configure your bundler to tree-shake it, or
+  it will load and register nothing and every replica call will hang.
+
 ## API
 
 | Export | What it is |

@@ -61,9 +61,10 @@
 // a client RESTARTED mid-window would have re-latched the disable, so the degrade-not-disable shape is
 // what actually guarantees convergence); (4) a FAILED reseed re-enters the backoff path instead
 // of hot-reopening — and the reseed await itself is bounded by `reseedTimeoutMs` (the injected
-// callback is a trust boundary like the ws impl: the replica's seedFromSnapshot self-bounds via its
-// idle abort, but a consumer-supplied reseed — the browser's OPFS seed() over an unbounded fetch —
-// can hang, and "resyncing" holds no socket and suppresses scheduleReconnect, so without this bound
+// callback is a trust boundary like the ws impl: both first-party reseeds self-bound (the node
+// replica's seedFromSnapshot and the browser replica's OPFS seed both abort on an idle body), but an
+// arbitrary consumer-supplied reseed can still hang, and "resyncing" holds no socket and suppresses
+// scheduleReconnect, so without this bound
 // it was the one remaining zero-timer state; a timed-out reseed is ABANDONED, its late settle
 // discarded, and the client re-enters backoff); (5) closeSocket() escalates past `close()` to a duck-typed `terminate()` (Bun /
 // the 'ws' package expose one; undici does not — its close-handshake wait is why teardown must not
@@ -142,8 +143,20 @@ export interface LiveSyncClientOptions {
    * verbatim (path-preserving). A trailing slash is trimmed.
    */
   baseUrl: string;
-  /** The tenant id = the mirror's name; sent as `?account=` on the connect URL. */
-  accountId: string;
+  /**
+   * The tenant id = the mirror's name; sent as `?account=` on the connect URL.
+   *
+   * OPTIONAL, and omitting it is the browser default: the OPEN read plane scopes a cookie-authed
+   * connection to the session user's own tenant, and an explicit account is the tenant-SWITCHER path.
+   * When absent the parameter is omitted entirely rather than serialized as `?account=` — an empty
+   * value is not a mirror name, and freezing it into the wire contract would leave the one nearby
+   * server-side fallback that a bare empty value can reach (`adminAccountScope`'s `|| "tenant-0"`)
+   * cross-tenant-shaped.
+   *
+   * REQUIRED for `auth: {kind:"token"}` — a host has no session to fall back to, so the constructor
+   * throws rather than letting it fail later as an opaque server 401.
+   */
+  accountId?: string;
   /**
    * The connect route. Default "/connect"; the service dual-serves it at "/api/v1/connect" too, so a
    * path-prefixed `baseUrl` ("…/api/v1") with the default "/connect" resolves to "…/api/v1/connect".
@@ -160,8 +173,21 @@ export interface LiveSyncClientOptions {
    * and the client re-enters the backoff path, so this callback can never wedge the transport; still,
    * bound your own I/O (as the replica's seedFromSnapshot does) so a dead fetch fails fast, not at
    * the backstop.
+   *
+   * `signal` ABORTS when the transport gives up on this attempt — the {@link reseedTimeoutMs}
+   * deadline expiring, or `stop()` (CTC-114 review round 10). Honour it: the transport considers the
+   * attempt over the moment it fires, and RECONNECTS. A callback that keeps writing after that is a
+   * second writer racing the socket the transport just reopened — the browser replica's concrete
+   * failure was frames delivered past the abandoned seed's cursor being dropped by its paused queue,
+   * after which a late seed completion left the socket advanced over a hole that later deltas sealed
+   * permanently.
+   *
+   * This is why "abandon" alone was not enough. Two layers bounding one operation with NO
+   * cancellation link between them is the defect; the signal is the link. Optional parameter, so
+   * existing zero-arg callbacks still typecheck — but a consumer that ignores it keeps the old
+   * two-writer hazard.
    */
-  reseed: () => Promise<number>;
+  reseed: (signal?: AbortSignal) => Promise<number>;
   /**
    * Read the consumer's durable cursor (the last applied feed seq), or null/undefined if it has
    * never seeded. Drives the `{type:"sync", after}` catch-up request. Return `null` to send
@@ -215,6 +241,17 @@ export interface LiveSyncClientOptions {
    */
   reseedTimeoutMs?: number;
   /**
+   * How long a CANCELLED reseed gets to unwind before the transport settles and reconnects anyway.
+   * Default 250ms; the value must cover the consumer's OWN cleanup bound (CTC-114 review round 14).
+   *
+   * Reconnecting before the consumer has unwound is not merely early: its store may still be latched,
+   * so replayed frames are refused while this client's `deliveredSeq` advances over them — and the
+   * next frame it does accept carries the durable cursor past the gap, permanently. The transport
+   * cannot know how long a given consumer takes to unwind, so the consumer sets this. The browser
+   * replica raises it to cover its worker-RPC deadline, since its cleanup is a `seedAbort` RPC.
+   */
+  cancelCleanupGraceMs?: number;
+  /**
    * Gap detection (CTL-1402): how long (ms) to wait for a `{type:"sync"}` gap re-request to finish
    * redelivering the detected hole before retrying (or, once {@link gapRetryLimit} re-requests have
    * been spent, escalating to the full re-seed path). Default `10_000`; set `0` to never time out
@@ -243,6 +280,17 @@ export interface LiveSyncClientOptions {
    */
   telemetry?: TelemetryConfig | Telemetry;
 }
+
+/**
+ * How long a CANCELLED reseed gets to unwind before the transport settles anyway.
+ *
+ * Cancelling is asynchronous on the consumer's side — the browser seed aborts a fetch, trips its
+ * supersede guard, posts `seedAbort` and resumes its delta queue — and the transport reconnects the
+ * moment it settles, so it must wait for that unwind or it reconnects into a still-paused consumer.
+ * Bounded because the deadline that triggered this exists precisely for an unresponsive callback: a
+ * cleanup that also hangs must not wedge the transport (CTC-114 review round 12).
+ */
+const DEFAULT_CANCEL_CLEANUP_GRACE_MS = 250;
 
 /** Resolve the runtime global WebSocket, or fail with an actionable message. */
 function defaultWsFactory(url: string): WebSocketLike {
@@ -275,14 +323,19 @@ export function stripTrailingSlashes(s: string): string {
 export function buildConnectUrl(opts: {
   baseUrl: string;
   connectPath: string;
-  accountId: string;
+  accountId?: string;
   auth: AuthStrategy;
 }): string {
   const origin = toWsOrigin(stripTrailingSlashes(opts.baseUrl));
   const params = new URLSearchParams();
   if (opts.auth.kind === "token") params.set("token", opts.auth.token);
-  params.set("account", opts.accountId);
-  return `${origin}${opts.connectPath}?${params.toString()}`;
+  // Only when a tenant was actually named. `?account=` is NOT the same as no account: the server's
+  // consumers are truthiness checks, so empty takes the omitted path anyway — but it would freeze a
+  // contract in which "" is a legal mirror name, and it puts `catalyst.tenant=""` on every span.
+  if (opts.accountId) params.set("account", opts.accountId);
+  const query = params.toString();
+  // Guard the dangling "?" — with cookie auth and no account there are no params at all.
+  return `${origin}${opts.connectPath}${query ? `?${query}` : ""}`;
 }
 
 /**
@@ -318,10 +371,10 @@ const ERROR_CLOSE_GRACE_MS = 5_000;
 
 export class LiveSyncClient {
   private readonly baseUrl: string;
-  private readonly accountId: string;
+  private readonly accountId: string | undefined;
   private readonly connectPath: string;
   private readonly auth: AuthStrategy;
-  private readonly reseed: () => Promise<number>;
+  private readonly reseed: (signal?: AbortSignal) => Promise<number>;
   private readonly getCursor: () => number | null | undefined;
   private readonly onChange: (frame: ChangeFrame) => void;
   private readonly onFrame?: (frame: ServerFrame) => void;
@@ -332,6 +385,7 @@ export class LiveSyncClient {
   private readonly pongTimeoutMs: number;
   private readonly openTimeoutMs: number;
   private readonly reseedTimeoutMs: number;
+  private readonly cancelCleanupGraceMs: number;
   private readonly gapTimeoutMs: number;
   private readonly gapRetryLimit: number;
   private readonly wsFactory: WebSocketFactory;
@@ -340,6 +394,36 @@ export class LiveSyncClient {
 
   private ws: WebSocketLike | null = null;
   private stopped = false;
+  /**
+   * Has start() been entered? `stopped` alone cannot answer this — it is false BEFORE the first
+   * start() as well as during a run, so every "am I running?" guard read true on a client that had
+   * never booted. Only the public `requestResync()` can reach that window (CTC-114 review round 5):
+   * it would reseed and open a socket with no lifecycle deferred and no telemetry resolved, and the
+   * later real start() would then openSocket() again — overwriting `this.ws`, so the first socket
+   * kept delivering duplicate frames and could no longer be closed through the stored reference.
+   */
+  private started = false;
+  /** The in-flight boot task, or null once it settles — `requestResync()` serializes behind it. */
+  private bootTask: Promise<void> | null = null;
+  /** Settles an in-flight `boundedReseed` wrapper on stop(), so an awaited resync cannot hang. */
+  private abandonReseed: (() => void) | null = null;
+  /**
+   * The in-flight resync, so a concurrent caller AWAITS it instead of being handed an
+   * already-resolved promise and acting on a store still being rebuilt (round 10).
+   */
+  private activeResync: Promise<void> | null = null;
+  /** Did the boot this request waited on perform a COLD re-seed? Only then may it be absorbed. */
+  private bootColdSeeded = false;
+  /**
+   * Did the last boot REJECT? Latched until the next `start()` (CTC-114 review round 9).
+   *
+   * Round 8 read the failure from the awaited `bootTask`, but that handle is nulled once the boot
+   * settles — so a `requestResync()` arriving after that microtask found no record of the failure,
+   * with `started` still true and `stopped` still false, and sailed past the guard into a reseed that
+   * could open a live socket under an application already told startup had failed. The outcome has to
+   * outlive the handle.
+   */
+  private bootFailed = false;
   private resyncing = false;
   private backoff: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -402,11 +486,22 @@ export class LiveSyncClient {
   private socketOpened = false;
   /** The pending reseed deadline (CTC-281) — the timer that makes "resyncing" (no socket, reconnect
    *  suppressed) a bounded state instead of a restart-only wedge. Cleared when the reseed settles in
-   *  time and by stop() (ask 4: stop() leaves NOTHING pending). At most one reseed is ever in flight
-   *  (`resyncing` guards the resync path; the boot seed runs before any socket exists). */
+   *  time and by stop() (ask 4: stop() leaves NOTHING pending). At most one reseed is ever in flight:
+   *  `resyncing` guards the resync path, and the boot cold seed SETS that same flag for its duration.
+   *  (It used to rely on "the boot seed runs before any socket exists" — true only while a resync
+   *  needed a server frame. The public `requestResync()` added in 0.8.0 needs no socket.) */
   private reseedTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(opts: LiveSyncClientOptions) {
+    // Fail fast, and fail HERE. A token-authed client has no session to fall back to, so an omitted
+    // account is a misconfiguration, not a default. It is checked in the constructor rather than in
+    // buildConnectUrl because `connectUrl()` is called from `openSocket()` OUTSIDE its try/catch — a
+    // throw down there escapes the reconnect machinery entirely instead of surfacing to the caller.
+    if (opts.auth.kind === "token" && !opts.accountId) {
+      throw new Error(
+        "LiveSyncClient: accountId is required with token auth (only cookie auth can fall back to the session's own tenant)",
+      );
+    }
     this.baseUrl = stripTrailingSlashes(opts.baseUrl);
     this.accountId = opts.accountId;
     this.connectPath = opts.connectPath ?? "/connect";
@@ -422,6 +517,8 @@ export class LiveSyncClient {
     this.pongTimeoutMs = opts.pongTimeoutMs ?? 15_000;
     this.openTimeoutMs = opts.openTimeoutMs ?? 20_000;
     this.reseedTimeoutMs = opts.reseedTimeoutMs ?? 600_000;
+    this.cancelCleanupGraceMs =
+      opts.cancelCleanupGraceMs ?? DEFAULT_CANCEL_CLEANUP_GRACE_MS;
     this.gapTimeoutMs = opts.gapTimeoutMs ?? 10_000;
     this.gapRetryLimit = opts.gapRetryLimit ?? 3;
     this.wsFactory = opts.wsFactory ?? defaultWsFactory;
@@ -441,6 +538,13 @@ export class LiveSyncClient {
    */
   start(): Promise<void> {
     this.stopped = false;
+    this.started = true;
+    // RESET per boot. `start()` is restartable after `stop()`, and a stale `true` from a previous
+    // cold boot would make the NEXT boot — warm, and therefore re-seeding nothing — absorb a resync
+    // it should have honoured. Found while re-reading this path rather than reported; the same class
+    // of staleness as the `bootTask` handle being nulled when it settles.
+    this.bootColdSeeded = false;
+    this.bootFailed = false;
     // The done deferred is created BEFORE the boot body runs (CTC-281 N2): stop() during the cold-seed
     // await used to find resolveDone still null and leave the returned promise pending forever — a
     // contract violation for a consumer awaiting start(). The boot body below is deliberately its OWN
@@ -451,31 +555,81 @@ export class LiveSyncClient {
       this.resolveDone = resolve;
     });
     const boot = (async () => {
-      // Resolve the OTel seam ONCE up front (before the first reseed, so the seed span exists on the
-      // cold-start path too). Keep the OFF path FULLY SYNCHRONOUS — no `await`, so a caller that opens
-      // the socket and inspects it in the same tick still sees it (the boot body runs synchronously up
-      // to its first await); only pay the async resolution (guarded dynamic import, or a
-      // CatalystReplica passing its already-resolved instance) when telemetry is on.
-      this.telemetry =
-        this.telemetryConfig === undefined || this.telemetryConfig === false
-          ? NOOP_TELEMETRY
-          : await createTelemetry(this.telemetryConfig, {
-              tracerName: DEFAULT_SCOPE_NAME,
-              meterName: DEFAULT_SCOPE_NAME,
-            });
-      this.gapCounter = this.telemetry.counter(REPLICA_METRIC.gaps, {
-        description: "Change-feed seq-gap lifecycle events (detected/healed/escalated).",
-        unit: "{gap}",
-      });
-      const saved = this.getCursor();
-      if (saved == null) {
-        this.setStatus("resyncing");
-        // Bounded like the resync-path reseed (CTC-281): a hanging COLD seed surfaces as a start()
-        // rejection (the boot arm rejects) instead of a silent forever-"resyncing" start().
-        await this.boundedReseed();
+      // The WHOLE boot is an in-flight resync, not just the cold seed (CTC-114 review rounds 4 + 6).
+      //
+      // `requestResync()` — public as of 0.8.0 — is callable the moment start() returns its promise,
+      // which is before ANY of this settles. Without the latch, `handleResync()`'s re-entrancy guard
+      // read false and started a SECOND concurrent reseed: two seeds interleaving writes through a
+      // non-reentrant consumer callback, then each completion calling openSocket() — and since
+      // openSocket() overwrites `this.ws`, the first socket was orphaned, still delivering duplicate
+      // frames and unreachable by stop().
+      //
+      // Round 4 latched only the cold seed. That was not enough: `createTelemetry()` below is awaited
+      // BEFORE the seed, so with telemetry enabled the boot suspends in a window where `started` is
+      // already true and the latch is not yet set. The latch therefore has to cover the entire body.
+      //
+      // Until this release the invariant held for free — a resync could only be driven by a server
+      // frame, and a frame needs a socket, which does not exist until openSocket() below.
+      //
+      // The latch makes the request WAIT; whether it is then absorbed or honoured is decided in
+      // requestResync() from `bootColdSeeded`, once this task has settled.
+      //
+      // Round 6 absorbed it on BOTH arms, arguing that a warm boot's `{type:"sync", after:<cursor>}`
+      // is itself the catch-up. That was wrong (round 7), and wrong against this method's whole
+      // reason for existing: a consumer calls requestResync() when it has discovered ON ITS OWN SIDE
+      // that deltas can no longer catch its store up — the browser replica's dropped overflow buffer
+      // is the motivating case. Replaying from the cursor cannot rebuild rows the consumer already
+      // lost, so silently swallowing the request left it permanently inconsistent. Only a COLD boot
+      // may absorb it, because that boot really is a full re-seed from /snapshot.
+      this.resyncing = true;
+      try {
+        // Resolve the OTel seam ONCE up front (before the first reseed, so the seed span exists on the
+        // cold-start path too). Keep the OFF path FULLY SYNCHRONOUS — no `await`, so a caller that opens
+        // the socket and inspects it in the same tick still sees it (the boot body runs synchronously up
+        // to its first await); only pay the async resolution (guarded dynamic import, or a
+        // CatalystReplica passing its already-resolved instance) when telemetry is on.
+        this.telemetry =
+          this.telemetryConfig === undefined || this.telemetryConfig === false
+            ? NOOP_TELEMETRY
+            : await createTelemetry(this.telemetryConfig, {
+                tracerName: DEFAULT_SCOPE_NAME,
+                meterName: DEFAULT_SCOPE_NAME,
+              });
+        this.gapCounter = this.telemetry.counter(REPLICA_METRIC.gaps, {
+          description: "Change-feed seq-gap lifecycle events (detected/healed/escalated).",
+          unit: "{gap}",
+        });
+        const saved = this.getCursor();
+        if (saved == null) {
+          this.setStatus("resyncing");
+          // Bounded like the resync-path reseed (CTC-281): a hanging COLD seed surfaces as a start()
+          // rejection (the boot arm rejects) instead of a silent forever-"resyncing" start().
+          await this.boundedReseed();
+          // Only NOW may a request that waited on this boot be absorbed — this really was a full
+          // re-seed from /snapshot. A warm boot sets nothing, so the waiter is honoured instead.
+          this.bootColdSeeded = true;
+        }
+      } finally {
+        // Must clear on the FAILURE arm too, or a failed boot latches the client into a state where
+        // every later resync — and scheduleReconnect — is suppressed forever.
+        this.resyncing = false;
       }
       this.openSocket();
     })();
+    this.bootTask = boot;
+    // Clear the handle once boot settles, so a resync arriving LONG after startup is never mistaken
+    // for one that raced it — otherwise `bootColdSeeded` would absorb legitimate later requests
+    // forever. The catch keeps a boot rejection from surfacing as an unhandled one on this arm; the
+    // race below is what actually reports it.
+    void boot
+      .catch(() => {
+        // LATCH the failure before the handle is dropped — `bootTask` is the transient record, this is
+        // the durable one, and requestResync() has to be able to see it afterwards (round 9).
+        this.bootFailed = true;
+      })
+      .then(() => {
+        if (this.bootTask === boot) this.bootTask = null;
+      });
     // Settles when stop() resolves the deferred, OR rejects if the boot (cold seed) fails — a boot
     // SUCCESS deliberately keeps waiting on `done` (the "runs forever" contract). Promise.race
     // attaches handlers to both arms, so a boot rejection after stop() is never an unhandled one.
@@ -498,6 +652,12 @@ export class LiveSyncClient {
     const done = this.resolveDone;
     this.resolveDone = null;
     done?.();
+    // AFTER resolving start()'s deferred, so the race below settles on `done` and a boot arm that
+    // rejects from this abandon lands on an already-settled race rather than surfacing as the
+    // outcome of start(). Settles a `requestResync()` a consumer is awaiting — see boundedReseed.
+    const abandon = this.abandonReseed;
+    this.abandonReseed = null;
+    abandon?.();
   }
 
   /** The ws(s):// URL this client opens, for diagnostics/tests. Re-derived from the options. */
@@ -508,6 +668,16 @@ export class LiveSyncClient {
       accountId: this.accountId,
       auth: this.auth,
     });
+  }
+
+  /**
+   * The tenant label for telemetry. Attributes are `Record<string, string>`, and an empty string reads
+   * as a MISSING attribute in Loki/Tempo — which silently merges every session-scoped browser client
+   * into one unlabelled bucket. `"session"` names the case instead: this client is scoped to whatever
+   * tenant the cookie resolves to.
+   */
+  private get tenantAttr(): string {
+    return this.accountId ?? "session";
   }
 
   private setStatus(status: LiveSyncStatus): void {
@@ -521,10 +691,18 @@ export class LiveSyncClient {
   private openSocket(): void {
     if (this.stopped) return;
     this.setStatus("connecting");
+    // RE-CHECK after the status callback (CTC-114 review round 13). `setStatus` calls into consumer
+    // code, and a consumer may synchronously tear down from it — the browser replica's very first
+    // "reconnecting" notification is a documented place to do so. `stop()` then ran while `this.ws`
+    // was still null, so it had nothing to close; we resumed here, constructed a socket, stored it in
+    // an already-stopped client, and left it open processing frames with the teardown long finished.
+    // Every guarded entry point that calls out and then continues needs this; this is the one that
+    // creates a resource afterwards.
+    if (this.stopped) return;
     // One span per connect attempt: started here, ended OK in onopen, ERROR on construct-fail / a close
     // before open. Manual (not active) because the lifecycle spans onopen…onclose callbacks.
     this.connectSpan = this.telemetry.startSpan(REPLICA_SPAN.reconnect, {
-      [CATALYST_ATTR.tenant]: this.accountId,
+      [CATALYST_ATTR.tenant]: this.tenantAttr,
     });
     const wsUrl = this.connectUrl();
     let ws: WebSocketLike;
@@ -843,7 +1021,7 @@ export class LiveSyncClient {
    *  KEY ON `escalated` ONLY (logged at ERROR); a gap that heals is routine and boring. */
   private recordGap(event: ReplicaGapEvent, gap: { seqFrom: number; seqTo: number; retries: number }): void {
     this.gapCounter.add(1, {
-      [CATALYST_ATTR.tenant]: this.accountId,
+      [CATALYST_ATTR.tenant]: this.tenantAttr,
       [CATALYST_ATTR.gapEvent]: event,
     });
     this.log(event === "escalated" ? "error" : "info", REPLICA_LOG.gap, {
@@ -881,35 +1059,184 @@ export class LiveSyncClient {
    * The injected callback is a trust boundary like the ws impl: while it runs there is NO socket and
    * scheduleReconnect is suppressed, so an unbounded await here was the last zero-timer wedge — the
    * deadline below is the pending timer that upholds the header invariant for the "resyncing" state.
-   * On timeout the attempt is ABANDONED, not cancelled (the callback owns its own I/O bounds — the
-   * replica's seedFromSnapshot aborts its fetch itself): a late settle is discarded via the `settled`
-   * latch, and a late REJECTION is swallowed so it can never surface as an unhandled rejection.
+   * On timeout the attempt is both CANCELLED and abandoned (CTC-114 review round 10). It used to be
+   * abandoned only, justified as "the callback owns its own I/O bounds" — but the callback owning
+   * bounds is exactly what makes a SECOND, independent deadline here dangerous. The browser seed is
+   * bounded by network idleness and by per-RPC worker deadlines, both of which a legitimately slow
+   * ~100 MB snapshot satisfies indefinitely; this total deadline could therefore fire on a seed that
+   * was making honest progress, whereupon the transport reconnected while the callback kept writing.
+   * Frames past the abandoned seed's cursor were then accepted by the socket and discarded by the
+   * replica's paused queue, and a late seed completion left the socket advanced over a hole that
+   * later deltas sealed for good.
+   *
+   * So the deadline now fires an AbortSignal FIRST and rejects second: whoever is told the attempt is
+   * over is also told to stop. A late settle is still discarded via the `settled` latch, and a late
+   * REJECTION is still swallowed so it can never surface as an unhandled rejection.
    */
   private boundedReseed(): Promise<number> {
-    const seed = this.reseed();
-    if (this.reseedTimeoutMs <= 0) return seed;
+    // Cancellation is scoped to THIS attempt. Aborting it must not disturb a successor.
+    const cancel = new AbortController();
+    const seed = this.reseed(cancel.signal);
     void seed.catch(() => {}); // an abandoned attempt's late rejection must never go unhandled
+    // ALWAYS wrapped, even with the deadline disabled (CTC-114 review round 8). This used to
+    // early-return the raw seed promise when `reseedTimeoutMs <= 0` — the documented way to turn the
+    // deadline off — which skipped installing `abandonReseed` and so bypassed round 7's stop() fix
+    // entirely on that path. Disabling the DEADLINE must not also disable teardown: the two are
+    // independent, and `stop()` has to be able to settle an awaited `requestResync()` either way.
     return new Promise<number>((resolve, reject) => {
       let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        if (this.reseedTimer === timer) this.reseedTimer = null;
-        reject(new Error(`reseed did not settle within ${this.reseedTimeoutMs}ms; abandoning (CTC-281)`));
-      }, this.reseedTimeoutMs);
-      this.reseedTimer = timer;
+      let timer: ReturnType<typeof setTimeout> | null = null;
       const finish = (fn: () => void): void => {
-        if (settled) return; // stale settle: the deadline already abandoned this attempt
+        if (settled) return; // stale settle: the deadline or stop() already took this attempt
         settled = true;
-        clearTimeout(timer);
-        if (this.reseedTimer === timer) this.reseedTimer = null;
+        if (timer !== null) {
+          clearTimeout(timer);
+          if (this.reseedTimer === timer) this.reseedTimer = null;
+        }
+        this.abandonReseed = null;
         fn();
       };
+      /**
+       * Give up on this attempt: tell it to stop, WAIT for it to unwind, then settle.
+       *
+       * Signalling alone was not enough (CTC-114 review round 12, P1). `abort()` only *initiates* the
+       * consumer's cleanup — the browser seed still has to abort its fetch, let the supersede guard
+       * trip, post its `seedAbort`, and run the `finally` that resumes its delta queue. Settling
+       * immediately let `runResync()` reconnect after one backoff while that queue was still PAUSED,
+       * so arriving frames were counted as delivered and then discarded: exactly the hole the queue's
+       * discard/rollback pairing exists to prevent, re-opened from the other side.
+       *
+       * Bounded, because the whole point of this deadline is that the callback may be unresponsive: a
+       * cleanup that itself hangs must not wedge the transport, so we settle anyway after a grace.
+       */
+      const giveUp = (err: Error): void => {
+        if (settled) return;
+        cancel.abort();
+        // ALWAYS wait for the unwind, bounded by the grace (CTC-114 review round 14).
+        //
+        // Round 12 skipped the wait when `reseed.length === 0`, reasoning that a zero-arg callback
+        // cannot observe the signal. `Function.length` does not support that inference: it counts only
+        // parameters before the first default or rest, so `reseed: (signal = undefined) => …` reports
+        // 0 while receiving and honouring the signal — and that consumer got no wait at all, which is
+        // exactly the hazard the wait exists for. There is no sound way to ask a function whether it
+        // will act on a signal, so stop trying: wait for everyone, and let the grace bound it. A
+        // consumer that ignores the signal simply hits the grace, which is the pre-round-12 behaviour
+        // delayed by `cancelCleanupGraceMs` — the reason that default is small and this is the knob
+        // the browser replica raises.
+        // 0 DISABLES the wait outright rather than scheduling a zero-delay timer — the same
+        // disable-by-zero convention the other bounds use, and the honest meaning of "this consumer
+        // has nothing to unwind".
+        if (this.cancelCleanupGraceMs <= 0) {
+          finish(() => reject(err));
+          return;
+        }
+        const grace = setTimeout(
+          () => finish(() => reject(err)),
+          this.cancelCleanupGraceMs,
+        );
+        void seed
+          .catch(() => undefined)
+          .then(() => {
+            clearTimeout(grace);
+            finish(() => reject(err));
+          });
+      };
+      if (this.reseedTimeoutMs > 0) {
+        timer = setTimeout(
+          () =>
+            giveUp(
+              new Error(
+                `reseed did not settle within ${this.reseedTimeoutMs}ms; cancelled (CTC-281)`,
+              ),
+            ),
+          this.reseedTimeoutMs,
+        );
+        this.reseedTimer = timer;
+      }
+      // stop() settles this wrapper (CTC-114 review round 7). Clearing the deadline is not enough:
+      // if the injected reseed() never settles, nothing else ever settles THIS promise, and while
+      // that was merely "an irrelevant await nobody holds" when boundedReseed was internal, the
+      // public `requestResync()` is now awaited by consumers — so teardown or recovery code holding
+      // that await hung forever on stop(). Rejecting rather than resolving keeps the outcome honest;
+      // requestResync() catches it and still upholds its never-rejects contract.
+      this.abandonReseed = () =>
+        giveUp(new Error("client stopped while re-seeding"));
       seed.then(
         (cursor) => finish(() => resolve(cursor)),
         (err: unknown) => finish(() => reject(err instanceof Error ? err : new Error(String(err)))),
       );
     });
+  }
+
+  /**
+   * Ask the client to drop the socket, re-seed, and reconnect from the fresh cursor — the same path a
+   * server `{type:"resync"}` frame drives, exposed for a consumer that discovers ON ITS OWN SIDE that
+   * its store can no longer be caught up by deltas.
+   *
+   * The browser replica is the motivating caller: when its delta queue overflows (or its applies keep
+   * rejecting) the buffered frames are dropped, so the transport's notion of what has been delivered is
+   * now ahead of what the store actually holds. Re-seeding through here — rather than calling the
+   * `reseed` callback directly — is what makes that safe: this CLOSES THE SOCKET FIRST, so no live
+   * frame interleaves with the snapshot and lands in the window that is in neither the snapshot nor the
+   * store.
+   *
+   * Delegates to the existing resync path in full — same `resyncing` re-entrancy guard, same
+   * `boundedReseed` deadline, same span, same failure→backoff behaviour. NEVER rejects: a failed
+   * re-seed is already handled internally by re-entering the reconnect path, and this is called from
+   * event handlers and `void` contexts where a rejection would surface as an unhandled promise.
+   */
+  async requestResync(): Promise<void> {
+    if (this.stopped) return;
+    // BEFORE start() there is nothing to resync (CTC-114 review round 5). `stopped` is false on a
+    // never-started client, so it cannot carry this guard by itself. Reseeding here would run with no
+    // lifecycle deferred and no telemetry resolved, and — worse — open a socket that the later real
+    // start() would orphan: openSocket() overwrites `this.ws`, so the first socket keeps delivering
+    // frames and stop() can no longer reach it. Ignore rather than throw: the contract above is that
+    // this never rejects, and it is called from `void` contexts.
+    if (!this.started) {
+      this.log("warn", "requestResync() before start() — ignored");
+      return;
+    }
+    // SERIALIZE behind an in-flight boot (CTC-114 review rounds 6 + 7). Running concurrently with it
+    // meant two reseeds and two openSocket() calls, the second overwriting `this.ws` and orphaning the
+    // first socket. Waiting — rather than dropping — is what keeps the WARM path correct: a warm boot
+    // performs no re-seed, and this method's whole purpose is a consumer that has discovered its store
+    // can no longer be caught up by deltas, which replaying from the cursor cannot fix.
+    const boot = this.bootTask;
+    if (boot) {
+      await boot.catch(() => undefined); // the outcome is read from `bootFailed`, latched below
+      if (this.stopped) return;
+    }
+    // A FAILED boot must not be recovered from here (CTC-114 review rounds 8 + 9). Round 7 swallowed
+    // the rejection and carried straight on into handleResync — so a cold start whose /snapshot failed
+    // would reject the caller's start(), sending the application into its boot-error path, and then a
+    // later successful reseed here would quietly open a live socket underneath it. Round 8 read the
+    // failure from the awaited task, which round 9 showed is not enough: `bootTask` is nulled when the
+    // boot settles, so a request arriving after that microtask saw no failure at all. Checked OUTSIDE
+    // the `if (boot)` for exactly that reason — the latch outlives the handle, until the next start().
+    if (this.bootFailed) {
+      this.log("warn", "requestResync() ignored — startup failed");
+      return;
+    }
+    // A COLD boot re-seeded from /snapshot while we waited, which IS what was being asked for.
+    if (boot && this.bootColdSeeded) {
+      this.log("info", "requestResync() absorbed by the boot's cold seed");
+      return;
+    }
+    // Unlike the frame path, this entry point can be called MID-BACKOFF: the queue overflowed while the
+    // client was already waiting to reconnect. handleResync would then reopen the socket itself and the
+    // pending timer would open a second one on top of it.
+    if (this.reconnectTimer != null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    try {
+      await this.handleResync();
+    } catch (err) {
+      // handleResync already catches its own reseed failure; this is the belt-and-braces guard for the
+      // contract above (never reject) against a throw from a consumer callback it invokes.
+      this.log("error", "requestResync failed", err);
+    }
   }
 
   /**
@@ -919,6 +1246,43 @@ export class LiveSyncClient {
    * frame and suppresses scheduleReconnect for the duration so we reopen exactly once.
    */
   private async handleResync(): Promise<void> {
+    // RETURN THE RUNNING ONE, do not resolve immediately (CTC-114 review round 10). The re-entrancy
+    // guard used to `return` bare, so a caller awaiting the public `requestResync()` while a
+    // server-driven resync was already re-seeding got a promise that resolved AT ONCE — and then read
+    // the store while the replacement snapshot was still being written into it. Awaiting recovery has
+    // to mean recovery finished, whoever started it.
+    //
+    // This is the same seam as the boot serialization, which covered only `bootTask`: one handle for
+    // "a re-seed is in flight", awaited by everything that needs it to be done.
+    // `return await`, not `return` (CodeQL, round 11). Behaviour is identical today, but returning a
+    // bare promise from an async function means a later `try`/`finally` added around this line would
+    // settle BEFORE the awaited work — a foot-gun this file has been bitten by often enough to be
+    // worth foreclosing, and it keeps this frame in the stack trace when the resync rejects.
+    if (this.activeResync) return await this.activeResync;
+    const run = this.runResync();
+    this.activeResync = run;
+    try {
+      await run;
+    } finally {
+      if (this.activeResync === run) this.activeResync = null;
+    }
+  }
+
+  /**
+   * The resync body. Never call directly — `handleResync()` owns the in-flight handle.
+   *
+   * TWO FLAGS, ONE FACT — documented rather than consolidated here, deliberately. `resyncing` and
+   * `activeResync` both mean "a re-seed is in flight", and they can disagree: the boot path sets
+   * `resyncing` directly (so a resync cannot race startup) without ever creating an `activeResync`
+   * handle. In that window a call landing here would hit the guard below and resolve silently, which
+   * is the very shape round 10 fixed for the live path.
+   *
+   * It is NOT reachable today, and both reasons are load-bearing: `requestResync()` serialises behind
+   * `bootTask` before it can get here, and the server-frame path needs a socket, which does not exist
+   * until the boot opens one. Consolidating the two into a single handle is the right fix and belongs
+   * with the wider lifecycle rework — not in a release candidate at round eleven.
+   */
+  private async runResync(): Promise<void> {
     if (this.resyncing) return;
     this.resyncing = true;
     // A full re-seed supersedes any pending gap re-request (it rebuilds from /snapshot wholesale) —
@@ -932,7 +1296,7 @@ export class LiveSyncClient {
       // seedFromSnapshot) auto-parents under this resync span.
       await this.telemetry.withActiveSpan(
         REPLICA_SPAN.resync,
-        { [CATALYST_ATTR.tenant]: this.accountId },
+        { [CATALYST_ATTR.tenant]: this.tenantAttr },
         async () => {
           const cursor = await this.boundedReseed();
           this.log("info", `resynced, cursor=${cursor}`);

@@ -144,6 +144,763 @@ describe("buildConnectUrl auth strategy", () => {
     expect(u.searchParams.get("account")).toBe("tenant-0");
     expect(url).not.toContain("token");
   });
+
+  // CTC-114 review (KtB). The browser default omits accountId entirely: the OPEN read plane scopes a
+  // cookie-authed socket to the session's own tenant. Serializing it as `?account=` freezes a contract
+  // in which "" is a legal mirror name — and puts `catalyst.tenant=""` on every span, which reads in
+  // Loki/Tempo as a MISSING attribute rather than a session-scoped one.
+  it("omits ?account= entirely when no account is named (and leaves no dangling '?')", () => {
+    const url = buildConnectUrl({
+      baseUrl: "https://app.example/api/v1",
+      connectPath: "/connect",
+      auth: { kind: "cookie" },
+    });
+    expect(url).toBe("wss://app.example/api/v1/connect");
+    expect(url).not.toContain("account");
+    // The whole point: absent, not empty.
+    expect(new URL(url).searchParams.has("account")).toBe(false);
+    expect(url.endsWith("?")).toBe(false);
+  });
+
+  it("still emits ?token= with no account when a token client somehow reaches the builder", () => {
+    // buildConnectUrl is exported from the root entry, so it is reachable independently of the
+    // constructor guard below. It must not produce a dangling separator here either.
+    const url = buildConnectUrl({
+      baseUrl: "https://h.example/api/v1",
+      connectPath: "/connect",
+      auth: { kind: "token", token: "svc-tok" },
+    });
+    expect(url).toBe("wss://h.example/api/v1/connect?token=svc-tok");
+  });
+});
+
+describe("accountId is required only for token auth (CTC-114 review, KtB)", () => {
+  const base = {
+    baseUrl: BASE,
+    reseed: async () => 0,
+    getCursor: () => null,
+    onChange: () => {},
+    wsFactory: recordingFactory().factory,
+  };
+
+  it("throws at CONSTRUCTION for token auth without an account", () => {
+    // Checked in the constructor, not in buildConnectUrl: connectUrl() is called from openSocket()
+    // OUTSIDE its try/catch, so a throw there escapes the reconnect machinery instead of reaching
+    // the caller. A host has no session to fall back to, so this is a misconfiguration, not a default.
+    expect(
+      () =>
+        new LiveSyncClient({
+          ...base,
+          auth: { kind: "token", token: "svc-tok" },
+        }),
+    ).toThrow(/accountId is required with token auth/);
+  });
+
+  it("constructs fine for cookie auth without an account", () => {
+    expect(
+      () => new LiveSyncClient({ ...base, auth: { kind: "cookie" } }),
+    ).not.toThrow();
+  });
+
+  it("constructs fine for token auth WITH an account (negative control)", () => {
+    expect(
+      () =>
+        new LiveSyncClient({
+          ...base,
+          accountId: "tenant-7",
+          auth: { kind: "token", token: "svc-tok" },
+        }),
+    ).not.toThrow();
+  });
+});
+
+describe("requestResync() — the consumer-driven resync entry point (CTC-114 review, Ks8)", () => {
+  it("closes the socket BEFORE re-seeding, then reopens from the fresh cursor", async () => {
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(12),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+    });
+
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    await client.requestResync();
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+
+    // Closing first is the WHOLE POINT: it is what stops a live frame landing in the window that is
+    // in neither the snapshot nor the consumer's store. Asserting only "reseed was called" would pass
+    // against a direct reseed() call, which is exactly the unsafe thing this method exists to replace.
+    expect(sockets[0]!.closed).toBe(true);
+    expect(store.reseedCalls.count).toBe(1);
+
+    sockets[1]!.fireOpen();
+    expect(sockets[1]!.lastSent()).toEqual({ type: "sync", after: 12 });
+
+    client.stop();
+  });
+
+  it("opens exactly ONE socket when called mid-backoff", async () => {
+    // The motivating case: the browser replica's queue overflows while the client is already waiting
+    // to reconnect. Without clearing the pending timer, handleResync reopens and then the timer opens
+    // a second socket on top of it.
+    vi.useFakeTimers();
+    try {
+      const store = makeStore(7);
+      const { sockets, factory } = recordingFactory();
+      const client = new LiveSyncClient({
+        baseUrl: BASE,
+        accountId: "tenant-0",
+        auth: { kind: "cookie" },
+        reseed: store.reseedTo(12),
+        getCursor: store.getCursor,
+        onChange: store.onChange,
+        wsFactory: factory,
+        backoffMs: 1000,
+      });
+
+      void client.start();
+      sockets[0]!.fireOpen();
+      sockets[0]!.fireServerClose(); // → schedules a reconnect
+      expect(sockets).toHaveLength(1);
+
+      const done = client.requestResync();
+      await vi.advanceTimersByTimeAsync(0);
+      await done;
+      // Let the reconnect timer that WAS pending fire, had it not been cleared.
+      await vi.advanceTimersByTimeAsync(5000);
+
+      expect(sockets).toHaveLength(2);
+      client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does NOT start a second reseed when called during the boot cold seed", async () => {
+    // CTC-114 review round 4 (P2). `requestResync()` is public as of 0.8.0 and is callable the moment
+    // start() returns — which is BEFORE a cursorless client's boot seed settles. The boot path set the
+    // "resyncing" STATUS but not the `resyncing` re-entrancy FLAG, so handleResync() read false and
+    // began a SECOND concurrent reseed: two seeds interleaving writes through a non-reentrant consumer
+    // callback, then each completion calling openSocket() — a second socket with the first never
+    // closed. The invariant used to hold for free (a resync needed a server frame, a frame needs a
+    // socket, and no socket exists yet); the new entry point needs no socket.
+    const store = makeStore(null); // cursorless → start() takes the cold-seed path
+    const { sockets, factory } = recordingFactory();
+    let seeds = 0;
+    let releaseSeed!: () => void;
+    const seedGate = new Promise<void>((resolve) => {
+      releaseSeed = resolve;
+    });
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        seeds += 1;
+        await seedGate; // hold the boot seed open so the race is deterministic
+        store.setCursor(12);
+        return 12;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(seeds).toBe(1));
+    expect(sockets).toHaveLength(0); // the cold seed runs BEFORE any socket is opened
+
+    // The consumer asks for a resync mid-boot — exactly what the browser replica's overflow handler
+    // does. Not awaited: unfixed, this call blocks on its own second seed and would hang the test
+    // rather than fail it.
+    const pending = client.requestResync();
+    await new Promise((r) => setTimeout(r, 0));
+
+    // OUTCOME 1: the request is absorbed by the seed already in flight — which IS a full re-seed from
+    // /snapshot, i.e. exactly what the caller wanted.
+    expect(seeds).toBe(1);
+
+    releaseSeed();
+    await pending;
+    // OUTCOME 2: exactly ONE socket, opened once the single seed completed.
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    expect(seeds).toBe(1);
+    client.stop();
+  });
+
+  it("is a no-op BEFORE start() — no reseed, no orphaned socket", async () => {
+    // CTC-114 review round 5. `stopped` is false on a client that has never started, so it could not
+    // carry this guard by itself: requestResync() ran the reseed and opened a socket with no lifecycle
+    // deferred and no telemetry resolved. The real damage came next — openSocket() overwrites
+    // `this.ws`, so the later genuine start() orphaned that first socket: it kept delivering duplicate
+    // frames and stop() could no longer reach it.
+    const store = makeStore(7); // warm cursor → a real start() goes straight to the socket
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(12),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+    });
+
+    await client.requestResync();
+    expect(store.reseedCalls.count).toBe(0);
+    expect(sockets).toHaveLength(0);
+
+    // And the real start() still opens EXACTLY one socket.
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    expect(sockets).toHaveLength(1);
+    client.stop();
+  });
+
+  it("does not race the boot when telemetry resolution suspends it", async () => {
+    // CTC-114 review round 6 — the hole in round 5's fix. `started` is set at the TOP of start(), but
+    // `createTelemetry()` is awaited BEFORE the cold-seed latch, so with telemetry enabled the boot
+    // suspends in a window where `started` is already true and `resyncing` is not yet set. A
+    // requestResync() landing there passed both guards and began a second concurrent reseed; both
+    // paths then called openSocket(), and since that overwrites `this.ws` the first socket was
+    // orphaned — still delivering duplicate frames, unreachable by stop(). The latch now covers the
+    // whole boot body, telemetry included.
+    const store = makeStore(null); // cursorless → the boot also cold-seeds
+    const { sockets, factory } = recordingFactory();
+    let seeds = 0;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        seeds += 1;
+        store.setCursor(12);
+        return 12;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      // ENABLED so `createTelemetry()` takes its `await loadOtelApi()` arm — the real suspension the
+      // finding names. (The optional peer is absent here, so it warns and resolves NOOP; what matters
+      // is that the boot genuinely parks at that await.)
+      telemetry: true,
+    });
+
+    void client.start();
+    // SYNCHRONOUS, in the same tick: the boot body has run up to the telemetry await and parked, so
+    // `started` is true while the cold seed — and the latch round 4 put on it — has not been reached.
+    // handleResync()'s guard is evaluated synchronously too, so this lands squarely in the window.
+    const pending = client.requestResync();
+    expect(seeds).toBe(0);
+    expect(sockets).toHaveLength(0);
+
+    await pending;
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    // ONE seed, ONE socket: no second reseed, and no orphaned socket left behind.
+    expect(seeds).toBe(1);
+    expect(sockets).toHaveLength(1);
+    client.stop();
+  });
+
+  it("HONOURS a resync requested during a WARM boot instead of absorbing it", async () => {
+    // CTC-114 review round 7 — round 6 got this wrong. The whole-boot latch absorbed the request on
+    // BOTH arms, on the argument that a warm boot's `{type:"sync", after:<cursor>}` is itself the
+    // catch-up. That defeats the method's entire purpose: a consumer calls requestResync() when it
+    // has discovered ON ITS OWN SIDE that deltas can no longer catch its store up — the browser
+    // replica's dropped overflow buffer is the motivating case — and replaying from the cursor cannot
+    // rebuild rows the consumer has already lost. A warm boot performs no re-seed, so swallowing the
+    // request left the store permanently inconsistent with nothing to signal it.
+    const store = makeStore(7); // WARM: the boot opens a socket and does NOT re-seed
+    const { sockets, factory } = recordingFactory();
+    let seeds = 0;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        seeds += 1;
+        store.setCursor(12);
+        return 12;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      telemetry: true, // parks the boot at the telemetry await, as in the round-6 test
+    });
+
+    void client.start();
+    const pending = client.requestResync(); // lands inside the boot window
+    expect(seeds).toBe(0);
+
+    await pending;
+    // THE OUTCOME: honoured, not swallowed — and serialized, so it did not race the boot.
+    expect(seeds).toBe(1);
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThanOrEqual(2));
+    expect(sockets[0]!.closed).toBe(true); // the resync closed the boot's socket before re-seeding
+    client.stop();
+  });
+
+  it("settles an awaited requestResync() when stop() lands mid-reseed", async () => {
+    // CTC-114 review round 7. stop() cleared the reseed DEADLINE but never settled the wrapper
+    // promise, so if the injected reseed() stays pending nothing ever settles it. That was merely "an
+    // irrelevant await nobody holds" while boundedReseed was internal; `requestResync()` is public and
+    // awaited, so teardown or recovery code holding it hung forever.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: () => new Promise<number>(() => {}), // never settles
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 600_000, // long, so ONLY stop() can settle this
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+
+    const pending = client.requestResync();
+    await new Promise((r) => setTimeout(r, 0));
+    client.stop();
+
+    // THE OUTCOME: it settles. Unfixed, this await never returns and the test times out.
+    await expect(pending).resolves.toBeUndefined();
+  });
+
+  it("settles on stop() even with the reseed deadline DISABLED", async () => {
+    // CTC-114 review round 8 — the gap round 7's fix left. `boundedReseed()` early-returned the raw
+    // seed promise when `reseedTimeoutMs <= 0` (the documented way to disable the deadline), so it
+    // never installed the `abandonReseed` callback stop() invokes. Disabling the DEADLINE must not
+    // also disable teardown: the two are independent.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: () => new Promise<number>(() => {}), // never settles
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 0, // DEADLINE OFF — the path that bypassed the round-7 fix
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+
+    const pending = client.requestResync();
+    await new Promise((r) => setTimeout(r, 0));
+    client.stop();
+
+    await expect(pending).resolves.toBeUndefined();
+  });
+
+  it("does NOT recover from a startup that rejected", async () => {
+    // CTC-114 review round 8. Round 7 awaited the boot with `.catch(() => undefined)` and carried on
+    // regardless — so a cold start whose /snapshot failed would reject the caller's start(), sending
+    // the app into its boot-error path, and then a later successful reseed here would quietly open a
+    // live socket underneath it. The client must not outlive the startup the consumer was told failed.
+    const store = makeStore(null); // COLD → the boot reseeds, and this one fails
+    const { sockets, factory } = recordingFactory();
+    let seeds = 0;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        seeds += 1;
+        throw new Error("snapshot 503");
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      telemetry: true, // park the boot so the request lands mid-startup
+    });
+
+    const started = client.start();
+    const pending = client.requestResync();
+    await expect(started).rejects.toThrow("snapshot 503");
+    await pending;
+
+    // THE OUTCOME: no recovery attempt, and above all NO socket left running behind a failed start().
+    expect(seeds).toBe(1); // the boot's own attempt, and nothing after it
+    expect(sockets).toHaveLength(0);
+    client.stop();
+  });
+
+  it("re-evaluates the cold/warm verdict on RESTART", async () => {
+    // Not reported — found while re-reading this path. `bootColdSeeded` was never reset, and start()
+    // is restartable after stop(). So a client that cold-seeded on its FIRST boot carried that verdict
+    // forever: the second boot, now warm and therefore re-seeding nothing, would absorb a resync it
+    // should have honoured — the round-7 bug again, reachable only via restart.
+    const store = makeStore(null); // first boot: COLD
+    const { sockets, factory } = recordingFactory();
+    let seeds = 0;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        seeds += 1;
+        store.setCursor(12);
+        return 12;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      telemetry: true,
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(seeds).toBe(1)); // cold-seeded
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    client.stop();
+
+    // SECOND boot — the cursor is now set, so this one is WARM and re-seeds nothing.
+    void client.start();
+    const pending = client.requestResync();
+    await pending;
+
+    // THE OUTCOME: honoured, not absorbed by the FIRST boot's stale cold verdict.
+    expect(seeds).toBe(2);
+    client.stop();
+  });
+
+  it("still refuses to recover LONG AFTER a failed startup, not just during it", async () => {
+    // CTC-114 review round 9 — the gap round 8's fix left. The failure was read from the awaited
+    // `bootTask`, but that handle is nulled once the boot settles. So a request arriving after that
+    // cleanup microtask found no record of the failure at all, with `started` still true and `stopped`
+    // still false, and sailed past the guard into a reseed that could open a live socket beneath an
+    // application already told startup had failed. The outcome has to outlive the handle.
+    const store = makeStore(null); // COLD → the boot reseeds, and this one fails
+    const { sockets, factory } = recordingFactory();
+    let seeds = 0;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        seeds += 1;
+        throw new Error("snapshot 503");
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+    });
+
+    await expect(client.start()).rejects.toThrow("snapshot 503");
+    // Let the bootTask cleanup microtask run — THIS is what round 8 depended on not having happened.
+    await new Promise((r) => setTimeout(r, 0));
+
+    await client.requestResync();
+    expect(seeds).toBe(1); // the boot's own attempt, and nothing after it
+    expect(sockets).toHaveLength(0);
+    client.stop();
+  });
+
+  it("CANCELS the reseed when its deadline expires, not merely abandons it", async () => {
+    // CTC-114 review round 10 (P1). The deadline used to abandon the callback and reconnect while it
+    // kept running — justified as "the callback owns its own I/O bounds", which is exactly what makes
+    // a SECOND deadline here dangerous. Two layers bounding one operation with no cancellation link
+    // between them left two writers: the browser replica's seed streaming into the worker while the
+    // transport resumed a socket from a cursor that seed was still moving, so frames past it were
+    // accepted by the transport, dropped by the replica's paused queue, and sealed over for good.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let sawSignal: AbortSignal | undefined;
+    let abortedDuringSeed = false;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: (signal) => {
+        sawSignal = signal;
+        return new Promise<number>(() => {
+          // Never settles on its own — only the transport's deadline can end this attempt.
+          signal?.addEventListener("abort", () => {
+            abortedDuringSeed = true;
+          });
+        });
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 40,
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    await client.requestResync();
+
+    // THE OUTCOME: the callback was TOLD to stop. Unfixed it is never told, and keeps writing while
+    // the transport reconnects beneath it.
+    expect(sawSignal).toBeInstanceOf(AbortSignal);
+    expect(abortedDuringSeed).toBe(true);
+    expect(sawSignal!.aborted).toBe(true);
+    client.stop();
+  });
+
+  it("cancels an in-flight reseed on stop() too", async () => {
+    // Same link, the other give-up path: stop() abandons the attempt, so it must also cancel it.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let aborted = false;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: (signal) =>
+        new Promise<number>(() => {
+          signal?.addEventListener("abort", () => {
+            aborted = true;
+          });
+        }),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 600_000, // only stop() can end this
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    const pending = client.requestResync();
+    await new Promise((r) => setTimeout(r, 0));
+    client.stop();
+    await pending;
+
+    expect(aborted).toBe(true);
+  });
+
+  it("AWAITS an already-running resync rather than resolving at once", async () => {
+    // CTC-114 review round 10. handleResync()'s re-entrancy guard returned bare, so a caller awaiting
+    // the public requestResync() while a server-driven resync was already re-seeding got a promise
+    // that resolved IMMEDIATELY — and could then read a store still being rebuilt. Awaiting recovery
+    // must mean recovery finished, whoever started it. Same seam as the boot serialization, which
+    // covered only bootTask.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let seedDone = false;
+    let releaseSeed!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseSeed = r;
+    });
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        await gate;
+        seedDone = true;
+        store.setCursor(12);
+        return 12;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+
+    // A SERVER-driven resync starts first and parks in the seed.
+    sockets[0]!.deliver({ type: "resync" });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(seedDone).toBe(false);
+
+    // The consumer now asks for one too. This must not resolve until the running seed finishes.
+    let settledEarly = false;
+    const pending = client.requestResync().then(() => {
+      settledEarly = !seedDone;
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(settledEarly).toBe(false);
+
+    releaseSeed();
+    await pending;
+    // THE OUTCOME: it waited for the seed that was actually running.
+    expect(seedDone).toBe(true);
+    expect(settledEarly).toBe(false);
+    client.stop();
+  });
+
+  it("WAITS for the cancelled seed to unwind before settling", async () => {
+    // CTC-114 review round 12 (P1). Round 10 made the deadline SIGNAL the seed, but settled straight
+    // afterwards — and `abort()` only *initiates* the consumer's cleanup. The browser seed still has
+    // to abort its fetch, trip the supersede guard, post `seedAbort` and run the `finally` that
+    // resumes its delta queue. Settling immediately let runResync() reconnect after one backoff while
+    // that queue was still PAUSED, so arriving frames were counted as delivered and then discarded:
+    // the same hole the queue's discard/rollback pairing closes, re-opened from the transport side.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let cleanupDone = false;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      // One-arg, so it can observe the signal — and unwinds ASYNCHRONOUSLY, like the real seed.
+      reseed: (signal) =>
+        new Promise<number>((_resolve, rejectSeed) => {
+          signal?.addEventListener("abort", () => {
+            setTimeout(() => {
+              cleanupDone = true;
+              rejectSeed(new Error("seed cancelled"));
+            }, 30);
+          });
+        }),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 20,
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+
+    await client.requestResync();
+    // THE OUTCOME: by the time the transport is free to reconnect, the consumer has finished unwinding.
+    expect(cleanupDone).toBe(true);
+    client.stop();
+  });
+
+
+  it("waits for a SLOW unwind, not just a fast one", async () => {
+    // CTC-114 review round 14 (P1). Round 12's wait used a fixed 500ms, but the browser replica's own
+    // cleanup is bounded by its worker-RPC deadline (120s by default) — a mid-flight seedBatch has to
+    // unwind before seedAbort can land. The grace expired first, so runResync() reconnected into a
+    // still-paused queue: replayed frames refused while `deliveredSeq` advanced over them, and the
+    // next accepted frame carried the durable cursor past the gap. The grace is now the consumer's to
+    // set, and the replica derives it from its own bound.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let cleanupDone = false;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      // Unwinds well past the OLD fixed 500ms default would have allowed at this scale.
+      reseed: (signal) =>
+        new Promise<number>((_res, rejectSeed) => {
+          signal?.addEventListener("abort", () => {
+            setTimeout(() => {
+              cleanupDone = true;
+              rejectSeed(new Error("seed cancelled"));
+            }, 120);
+          });
+        }),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 20,
+      cancelCleanupGraceMs: 5_000, // what a real consumer sets: cover YOUR cleanup bound
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    await client.requestResync();
+    expect(cleanupDone).toBe(true);
+    client.stop();
+  });
+
+  it("does not infer cancellation support from ARITY", async () => {
+    // CTC-114 review round 14. Round 12 skipped the wait when `reseed.length === 0`. Function.length
+    // counts only parameters before the first default or rest, so a signal-aware callback written
+    // `(signal = undefined) => …` reports 0 — and got no wait at all, which is precisely the hazard.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let cleanupDone = false;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      // Function.length === 0 here, yet it honours the signal.
+      reseed: (signal = undefined) =>
+        new Promise<number>((_res, rejectSeed) => {
+          signal?.addEventListener("abort", () => {
+            setTimeout(() => {
+              cleanupDone = true;
+              rejectSeed(new Error("seed cancelled"));
+            }, 30);
+          });
+        }),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 20,
+      cancelCleanupGraceMs: 2_000,
+    });
+    expect(client).toBeDefined();
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    await client.requestResync();
+    // THE OUTCOME: it waited, despite the arity being 0.
+    expect(cleanupDone).toBe(true);
+    client.stop();
+  });
+
+  it("never rejects when the re-seed fails", async () => {
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        throw new Error("snapshot 503");
+      },
+      getCursor: () => 7,
+      onChange: () => {},
+      wsFactory: factory,
+      log: () => {},
+    });
+
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    // Called from event handlers and `void` contexts — a rejection here surfaces as an unhandled
+    // promise rejection, not as anything a consumer can catch.
+    await expect(client.requestResync()).resolves.toBeUndefined();
+    client.stop();
+  });
+
+  it("is inert after stop()", async () => {
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(12),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+    });
+
+    void client.start();
+    sockets[0]!.fireOpen();
+    client.stop();
+
+    await client.requestResync();
+    expect(store.reseedCalls.count).toBe(0);
+    expect(sockets).toHaveLength(1);
+  });
 });
 
 describe("parseFrame", () => {
@@ -1590,6 +2347,9 @@ describe("LiveSyncClient fleet-incident hardening (CTC-281)", () => {
       pingIntervalMs: 0,
       openTimeoutMs: 0,
       reseedTimeoutMs: 5000,
+      // Nothing to unwind: this seed never settles and never observes the signal, so the round-14
+      // cleanup wait has no work to do. 0 keeps this test on the bound it was written for.
+      cancelCleanupGraceMs: 0,
       wsFactory: factory,
     });
     void client.start();
@@ -1640,6 +2400,9 @@ describe("LiveSyncClient fleet-incident hardening (CTC-281)", () => {
       onChange: () => {},
       pingIntervalMs: 0,
       reseedTimeoutMs: 5000,
+      // Nothing to unwind: this seed never settles and never observes the signal, so the round-14
+      // cleanup wait has no work to do. 0 keeps this test on the bound it was written for.
+      cancelCleanupGraceMs: 0,
       wsFactory: factory,
     });
     const started = client.start();
@@ -1661,6 +2424,9 @@ describe("LiveSyncClient fleet-incident hardening (CTC-281)", () => {
       pingIntervalMs: 0,
       openTimeoutMs: 0,
       reseedTimeoutMs: 5000,
+      // Nothing to unwind: this seed never settles and never observes the signal, so the round-14
+      // cleanup wait has no work to do. 0 keeps this test on the bound it was written for.
+      cancelCleanupGraceMs: 0,
       wsFactory: factory,
     });
     void client.start();
@@ -1737,5 +2503,35 @@ describe("LiveSyncClient fleet-incident hardening (CTC-281)", () => {
     seedGate.release(); // the seed settles late…
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(sockets).toHaveLength(0); // …and the stopped client correctly never opens a socket
+  });
+});
+
+describe("re-entrant teardown from a status callback (CTC-114 review round 13)", () => {
+  it("does not create a socket when the consumer stops from onStatus", async () => {
+    // `openSocket()` guarded `stopped` on entry, then called setStatus("connecting") — which calls
+    // into CONSUMER code. A consumer tearing down from that notification (the browser replica's first
+    // "reconnecting" is a documented place to do so) ran stop() while `this.ws` was still null, so it
+    // had nothing to close; openSocket then resumed, constructed a socket and stored it in an
+    // already-stopped client, leaving it open and processing frames after teardown had completed.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let client!: LiveSyncClient;
+    client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(12),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      onStatus: (s) => {
+        if (s === "connecting") client.stop();
+      },
+    });
+
+    void client.start();
+    await new Promise((r) => setTimeout(r, 10));
+    // THE OUTCOME: no orphaned socket exists for the completed teardown to have missed.
+    expect(sockets).toHaveLength(0);
   });
 });
