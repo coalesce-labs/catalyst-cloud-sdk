@@ -133,6 +133,96 @@ describe("worker-core over real sqlite-wasm (CTC-114)", () => {
     expect(await core.handle({ type: "getCursor" })).toBe(13);
   });
 
+  // CTC-114 review round 4 (P1). The transport DELIBERATELY forwards duplicate / out-of-order frames
+  // at `seq <= deliveredSeq` (live-sync-client: "the consumer's stale-guard already dedups it"). The
+  // shared apply guard only covers upserts — `ON CONFLICT ... WHERE excluded.updated_at > …` — while a
+  // delete keys on the PK alone. So a replayed OLD delete used to remove a row a NEWER change had
+  // created, and because the cursor still held the newer seq, a reconnect resumed ABOVE the damage:
+  // nothing short of a full re-seed ever repaired it.
+  it("a REPLAYED old delete does not remove a row a newer change created", async () => {
+    const core = memoryCore();
+    await core.handle({
+      type: "open",
+      dbPath: ":memory:",
+      directory: "unused",
+      identity: "test-identity",
+    });
+    await seed(core, [], 10);
+
+    // seq 11 deletes "x"; seq 12 re-creates it. After this the DB legitimately HAS "x".
+    await core.handle({
+      type: "applyChanges",
+      changes: [
+        { seq: 11, entity: "issues", op: "delete", row: {}, entityId: "x" },
+        {
+          seq: 12,
+          entity: "issues",
+          op: "upsert",
+          row: issueRow("x", { updated_at: 500 }),
+          entityId: "x",
+        },
+      ],
+    });
+    expect(
+      ((await core.handle({ type: "queryIssues" })) as IssueView[]).map(
+        (r) => r.id,
+      ),
+    ).toEqual(["x"]);
+
+    // The socket redelivers seq 11. It is at/below the cursor, so it is already reflected in the DB.
+    const replay = (await core.handle({
+      type: "applyChanges",
+      changes: [
+        { seq: 11, entity: "issues", op: "delete", row: {}, entityId: "x" },
+      ],
+    })) as { applied: number; cursor: number };
+
+    // THE OUTCOME: the row survives, and the cursor does not regress to the replayed seq.
+    expect(
+      ((await core.handle({ type: "queryIssues" })) as IssueView[]).map(
+        (r) => r.id,
+      ),
+    ).toEqual(["x"]);
+    expect(replay.applied).toBe(0);
+    expect(replay.cursor).toBe(12);
+    expect(await core.handle({ type: "getCursor" })).toBe(12);
+  });
+
+  // Same hazard, one batch: the guard compares against the ROLLING max, not just the entry cursor, so
+  // a duplicate that trails its original INSIDE a single drain is caught too.
+  it("a duplicate delete repeated WITHIN one batch is skipped", async () => {
+    const core = memoryCore();
+    await core.handle({
+      type: "open",
+      dbPath: ":memory:",
+      directory: "unused",
+      identity: "test-identity",
+    });
+    await seed(core, [], 10);
+
+    const res = (await core.handle({
+      type: "applyChanges",
+      changes: [
+        { seq: 11, entity: "issues", op: "delete", row: {}, entityId: "y" },
+        {
+          seq: 12,
+          entity: "issues",
+          op: "upsert",
+          row: issueRow("y", { updated_at: 500 }),
+          entityId: "y",
+        },
+        { seq: 11, entity: "issues", op: "delete", row: {}, entityId: "y" },
+      ],
+    })) as { applied: number; cursor: number };
+
+    expect(
+      ((await core.handle({ type: "queryIssues" })) as IssueView[]).map(
+        (r) => r.id,
+      ),
+    ).toEqual(["y"]);
+    expect(res.cursor).toBe(12);
+  });
+
   it("defers a read that arrives MID-SEED until commit, then serves the fresh snapshot", async () => {
     const core = memoryCore();
     await core.handle({

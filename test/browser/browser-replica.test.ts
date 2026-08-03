@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   BrowserReplica,
   type BrowserReplicaOptions,
+  type ReplicaHandlers,
   type ReplicaStatus,
 } from "../../src/replica/browser/browser-replica.js";
 import type {
@@ -297,7 +298,7 @@ describe("BrowserReplica (CTC-114)", () => {
     const open = worker.received[0]?.request as { identity?: string };
     // accountId is folded in so a tenant switcher cannot reuse another account's rows even when the
     // consumer's identity only names the signed-in user.
-    expect(open.identity).toBe("user-a tenant-7");
+    expect(open.identity).toBe("user-a\0tenant-7");
     replica.close();
   });
 
@@ -646,7 +647,11 @@ describe("a queue overflow quiesces the socket and never stays latched (CTC-114 
    * deterministic than the depth path, which needs 20k frames, and it exercises the identical
    * onOverflow contract.
    */
-  async function bootToOverflow(snapshot: () => Response | Promise<Response>) {
+  async function bootToOverflow(
+    snapshot: () => Response | Promise<Response>,
+    /** Swap in handlers that misbehave (e.g. an onStatus that throws) — defaults to the recorder. */
+    handlersOverride?: ReplicaHandlers,
+  ) {
     vi.stubGlobal("navigator", {});
     vi.stubGlobal("location", { origin: "https://app.example" });
     const Sock = recordingSocketGlobal();
@@ -663,7 +668,7 @@ describe("a queue overflow quiesces the socket and never stays latched (CTC-114 
       close: undefined,
     });
     const c = collect();
-    const replica = new BrowserReplica(c.handlers, {
+    const replica = new BrowserReplica(handlersOverride ?? c.handlers, {
       baseUrl: "https://app.example/api/v1",
       identity: "u1",
       createWorker: () => worker as unknown as Worker,
@@ -763,6 +768,64 @@ describe("a queue overflow quiesces the socket and never stays latched (CTC-114 
     expect(Sock.sockets.at(-1)!.lastSent()).toEqual({ type: "sync", after: 42 });
     replica.close();
   }, 15_000);
+  it("recovers even when the consumer's onStatus THROWS during the overflow", async () => {
+    // CTC-114 review round 4 (P2). `onStatus("reconnecting")` is raised at the TOP of the overflow
+    // handler — before `acceptedSeq` is rolled back and `requestResync()` dispatched. Consumer
+    // handlers are arbitrary app code (a React setState that throws lands right here), and an
+    // uncaught throw left the queue OVERFLOW-LATCHED: `push()` then refuses every subsequent frame
+    // while the socket stays happily open. DeltaQueue.notify() catches the exception, so nothing
+    // reports an error — the replica just silently stops applying while still claiming to be live.
+    let threw = 0;
+    const handlers: ReplicaHandlers = {
+      onChanged: () => {},
+      onStatus: (s) => {
+        if (s === "reconnecting") {
+          threw++;
+          throw new Error("consumer setState blew up");
+        }
+      },
+    };
+    // A FAILING replacement snapshot, like the two tests above: it keeps the durable cursor at 42 so
+    // the rollback is observable, and it is the arm where a latched queue is unrecoverable.
+    const { Sock, worker, replica } = await bootToOverflow(() => {
+      throw new Error("snapshot 503");
+    }, handlers);
+
+    // The throwing handler really did fire on the overflow — otherwise this test proves nothing.
+    await vi.waitFor(() => expect(threw).toBeGreaterThan(0), { timeout: 4000 });
+
+    await vi.waitFor(
+      () => expect(Sock.sockets.length).toBeGreaterThanOrEqual(2),
+      { timeout: 4000 },
+    );
+    Sock.sockets.at(-1)!.fireOpen();
+    // OUTCOME 1: recovery ran past the throw — the high-water was rolled back to the DURABLE cursor,
+    // so the reconnect re-requests from 42 rather than sealing the discarded frame over.
+    expect(Sock.sockets.at(-1)!.lastSent()).toEqual({ type: "sync", after: 42 });
+
+    const appliesBefore = worker.received.filter(
+      (e) => e.request.type === "applyChanges",
+    ).length;
+    Sock.sockets.at(-1)!.deliver({
+      type: "change",
+      seq: 43,
+      entity: "issues",
+      entityId: "i2",
+      op: "upsert",
+      row: { id: "i2" },
+    });
+    // OUTCOME 2: the queue is UNLATCHED — a post-overflow frame still reaches the worker.
+    await vi.waitFor(
+      () =>
+        expect(
+          worker.received.filter((e) => e.request.type === "applyChanges")
+            .length,
+        ).toBeGreaterThan(appliesBefore),
+      { timeout: 4000 },
+    );
+    replica.close();
+  }, 15_000);
+
   it("still sends seedAbort to the worker when the idle timeout fires", async () => {
     // The idle bound aborts the FETCH — but the worker has already run `seedBegin`, so it is sitting
     // in an open transaction with its SeedReadGate armed. `streamSeedIntoWorker`'s catch issues the

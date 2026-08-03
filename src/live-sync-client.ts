@@ -420,8 +420,10 @@ export class LiveSyncClient {
   private socketOpened = false;
   /** The pending reseed deadline (CTC-281) — the timer that makes "resyncing" (no socket, reconnect
    *  suppressed) a bounded state instead of a restart-only wedge. Cleared when the reseed settles in
-   *  time and by stop() (ask 4: stop() leaves NOTHING pending). At most one reseed is ever in flight
-   *  (`resyncing` guards the resync path; the boot seed runs before any socket exists). */
+   *  time and by stop() (ask 4: stop() leaves NOTHING pending). At most one reseed is ever in flight:
+   *  `resyncing` guards the resync path, and the boot cold seed SETS that same flag for its duration.
+   *  (It used to rely on "the boot seed runs before any socket exists" — true only while a resync
+   *  needed a server frame. The public `requestResync()` added in 0.8.0 needs no socket.) */
   private reseedTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(opts: LiveSyncClientOptions) {
@@ -497,9 +499,28 @@ export class LiveSyncClient {
       const saved = this.getCursor();
       if (saved == null) {
         this.setStatus("resyncing");
-        // Bounded like the resync-path reseed (CTC-281): a hanging COLD seed surfaces as a start()
-        // rejection (the boot arm rejects) instead of a silent forever-"resyncing" start().
-        await this.boundedReseed();
+        // Mark the COLD SEED as an in-flight resync, not just a status string (CTC-114 review round 4).
+        // `requestResync()` — public as of 0.8.0 — is callable the moment start() returns its promise,
+        // which is BEFORE this await settles. With only the status set, `handleResync()`'s `resyncing`
+        // re-entrancy guard read false and began a SECOND concurrent reseed: two seeds interleaving
+        // writes through a non-reentrant consumer callback, then each completion calling openSocket()
+        // — the second socket opened without the first being closed.
+        //
+        // Until this release the invariant held for free: a resync could only be driven by a server
+        // frame, and a frame requires a socket, which does not exist until openSocket() below. The new
+        // public entry point needs no socket, so the guard has to be set explicitly. Dropping the
+        // concurrent request is the correct answer, not queueing it — this seed IS a full re-seed from
+        // /snapshot, which is exactly what the caller is asking for.
+        this.resyncing = true;
+        try {
+          // Bounded like the resync-path reseed (CTC-281): a hanging COLD seed surfaces as a start()
+          // rejection (the boot arm rejects) instead of a silent forever-"resyncing" start().
+          await this.boundedReseed();
+        } finally {
+          // Must clear on the FAILURE arm too, or a failed cold seed latches the client into a state
+          // where every later resync — and scheduleReconnect — is suppressed forever.
+          this.resyncing = false;
+        }
       }
       this.openSocket();
     })();

@@ -282,7 +282,33 @@ export class BrowserReplica {
           "The OPFS database is shared across the origin and a warm cursor skips the snapshot, so without it a change of signed-in user serves the previous user's rows.",
       );
     }
-    this.handlers = handlers;
+    // ISOLATE the consumer's callbacks ONCE, here, rather than at each of the ~16 call sites (CTC-114
+    // review round 4). These are arbitrary app code — a React setState that throws lands in whatever
+    // internal path happened to be notifying. The concrete finding: `onStatus("reconnecting")` is
+    // raised at the TOP of the overflow handler, so a throw there escaped before `acceptedSeq` was
+    // rolled back and `requestResync()` dispatched. `DeltaQueue.notify()` catches it, but the queue
+    // stays overflow-LATCHED — `push()` then refuses every subsequent frame while the socket happily
+    // stays up, i.e. a silently frozen replica still reporting itself connected.
+    //
+    // Wrapping at the boundary (not per-site) is deliberate: it cannot be forgotten by a later call
+    // site, and it holds for `onChanged` too. This is the same discipline DeltaQueue and the transport
+    // already apply to their own user handlers.
+    this.handlers = {
+      onStatus: (status) => {
+        try {
+          handlers.onStatus(status);
+        } catch (err) {
+          console.error(`[replica] onStatus("${status}") handler threw`, err);
+        }
+      },
+      onChanged: () => {
+        try {
+          handlers.onChanged();
+        } catch (err) {
+          console.error("[replica] onChanged handler threw", err);
+        }
+      },
+    };
     this.options = options;
     this.deltas = new DeltaQueue({
       apply: (changes) => this.call({ type: "applyChanges", changes }),

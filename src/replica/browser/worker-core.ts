@@ -159,8 +159,23 @@ export function createWorkerCore(open: ReplicaOpener): WorkerCore {
         let maxSeq = since;
         r.write.transaction(() => {
           for (const rec of request.changes) {
+            // SEQ STALE-GUARD (CTC-114 review). The transport deliberately forwards duplicate /
+            // out-of-order frames at `seq <= deliveredSeq` (live-sync-client.ts: "passed through
+            // unchanged: the consumer's stale-guard already dedups it") — WE are that stale-guard, and
+            // `applyDelta`'s only covers upserts (`ON CONFLICT ... WHERE excluded.updated_at > …`).
+            // The DELETE path keys on the PK alone and has no guard, so a replayed old delete removed a
+            // row that a NEWER change had created. `setCursor` still holds the newer cursor, so a
+            // reconnect resumes above the damage and nothing ever repairs it — only a re-seed does.
+            //
+            // The cursor's meaning is exactly the test we need: everything at or below it is already
+            // reflected in the DB — applied as a delta, dropped by the updated_at guard as stale (the
+            // DB then holds NEWER data), or carried in the snapshot that set it. So skipping is right
+            // in every case. Comparing against the ROLLING `maxSeq` rather than the entry `since` also
+            // catches a duplicate that repeats WITHIN one batch: the transport delivers in arrival
+            // order, so an oldie always trails the original it duplicates.
+            if (rec.seq <= maxSeq) continue;
             if (applyChange(r.write, rec)) applied++;
-            if (rec.seq > maxSeq) maxSeq = rec.seq;
+            maxSeq = rec.seq;
           }
           // Advance to the max seq SEEN (not just applied) — a window of all-stale deltas still moves
           // the cursor forward so we don't re-fetch forever. Twin of the node sync path.

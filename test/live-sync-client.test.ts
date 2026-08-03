@@ -283,6 +283,58 @@ describe("requestResync() — the consumer-driven resync entry point (CTC-114 re
     }
   });
 
+  it("does NOT start a second reseed when called during the boot cold seed", async () => {
+    // CTC-114 review round 4 (P2). `requestResync()` is public as of 0.8.0 and is callable the moment
+    // start() returns — which is BEFORE a cursorless client's boot seed settles. The boot path set the
+    // "resyncing" STATUS but not the `resyncing` re-entrancy FLAG, so handleResync() read false and
+    // began a SECOND concurrent reseed: two seeds interleaving writes through a non-reentrant consumer
+    // callback, then each completion calling openSocket() — a second socket with the first never
+    // closed. The invariant used to hold for free (a resync needed a server frame, a frame needs a
+    // socket, and no socket exists yet); the new entry point needs no socket.
+    const store = makeStore(null); // cursorless → start() takes the cold-seed path
+    const { sockets, factory } = recordingFactory();
+    let seeds = 0;
+    let releaseSeed!: () => void;
+    const seedGate = new Promise<void>((resolve) => {
+      releaseSeed = resolve;
+    });
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        seeds += 1;
+        await seedGate; // hold the boot seed open so the race is deterministic
+        store.setCursor(12);
+        return 12;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(seeds).toBe(1));
+    expect(sockets).toHaveLength(0); // the cold seed runs BEFORE any socket is opened
+
+    // The consumer asks for a resync mid-boot — exactly what the browser replica's overflow handler
+    // does. Not awaited: unfixed, this call blocks on its own second seed and would hang the test
+    // rather than fail it.
+    const pending = client.requestResync();
+    await new Promise((r) => setTimeout(r, 0));
+
+    // OUTCOME 1: the request is absorbed by the seed already in flight — which IS a full re-seed from
+    // /snapshot, i.e. exactly what the caller wanted.
+    expect(seeds).toBe(1);
+
+    releaseSeed();
+    await pending;
+    // OUTCOME 2: exactly ONE socket, opened once the single seed completed.
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    expect(seeds).toBe(1);
+    client.stop();
+  });
+
   it("never rejects when the re-seed fails", async () => {
     const { sockets, factory } = recordingFactory();
     const client = new LiveSyncClient({
