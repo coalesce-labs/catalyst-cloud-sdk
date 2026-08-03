@@ -953,6 +953,114 @@ describe("a queue overflow quiesces the socket and never stays latched (CTC-114 
     replica.close();
   }, 15_000);
 
+  it("bounds the BOOT RPCs too — a wedged open() cannot hold the lock forever", async () => {
+    // CTC-114 review round 9. Rounds 6 and 7 wrapped the seed RPCs and then the apply RPC, one at a
+    // time, and missed `open` / `getCursor`. A worker that loads and installs its handler but whose
+    // `openReplica()` never settles (installOpfsSAHPoolVfs wedging on OPFS handles) emits NO worker
+    // `error` event, so start() stayed pending forever while holding the ORIGIN-WIDE Web Lock — with
+    // every sibling tab reporting "secondary". The deadline now lives in call() itself, so this is
+    // bounded by construction rather than by remembering to wrap the site.
+    const locks = fakeLockManager();
+    vi.stubGlobal("navigator", locks);
+    vi.stubGlobal("WebSocket", undefined);
+    const worker = new FakeWorker({}, {}, ["open"]); // accepted, never answered
+    const c = collect();
+    const replica = new BrowserReplica(
+      c.handlers,
+      opts({
+        workerRpcTimeoutMs: 40,
+        createWorker: () => worker as unknown as Worker,
+      }),
+    );
+
+    await expect(replica.start()).rejects.toThrow(/wedged/);
+    expect(c.statuses).toContain("error");
+    expect(worker.terminated).toBe(true);
+    // The origin lock is RELEASED, so sibling tabs are not stranded in "secondary" for the document's
+    // life — the failure mode that made this worse than a plain hang.
+    expect(locks.held.has("catalyst-replica:.catalyst-replica")).toBe(false);
+  }, 15_000);
+
+  it("never posts an applyChanges INSIDE an open seed transaction", async () => {
+    // CTC-114 review round 9. A reseed can begin while the queue still holds buffered work with a
+    // retry armed. Left live across `seedBegin`, that retry timer posts `applyChanges` INTO the seed's
+    // open transaction; the nested BEGIN rejects, and repeated failures walk the queue into
+    // apply-failed overflow during an otherwise HEALTHY reseed — whose requestResync() then returns
+    // immediately (the transport is already resyncing), so the escalation buys no recovery at all and
+    // simply discards live frames.
+    //
+    // The harness matters here, and `bootToOverflow` is the WRONG one: by the time it reseeds, the
+    // queue has already latched `overflowed`, which suppresses applies on its own — so that version of
+    // this test passed with the fix reverted, and proved nothing. (Ran the control; it did not fire.)
+    //
+    // This drives the real shape instead: a SERVER-driven resync arriving while the queue is live with
+    // an apply in flight and another frame queued behind it. Without the pause, the drain loop resumes
+    // when the slow apply resolves and posts the queued batch straight into the open seed transaction.
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("location", { origin: "https://app.example" });
+    const Sock = recordingSocketGlobal();
+    // A one-row snapshot, so the seed posts a seedBatch and the OPEN-TRANSACTION window is visible in
+    // post order as seedBegin → seedBatch → seedCommit. (Gating the fetch instead does not work: the
+    // transaction opens at seedBegin, which is posted only AFTER the body arrives.)
+    stubFetch(() => okSnapshot([{ entity: "issues", op: "upsert", row: { id: "s1" } }], 99));
+    const worker = new FakeWorker(
+      {
+        open: undefined,
+        getCursor: 42, // WARM → start() opens a socket without seeding
+        applyChanges: { applied: 1, cursor: 43 },
+        seedBegin: undefined,
+        seedBatch: undefined,
+        seedCommit: 99,
+        seedAbort: undefined,
+        close: undefined,
+      },
+      // SLOW seedBatch holds the transaction open; the SLOWER-than-the-resync apply is still in
+      // flight when it opens, and resolves inside that window — the moment that used to post the
+      // queued batch straight into the open transaction.
+      { applyChanges: 200, seedBatch: 400 },
+    );
+    const c = collect();
+    const replica = new BrowserReplica(c.handlers, {
+      baseUrl: "https://app.example/api/v1",
+      identity: "u1",
+      createWorker: () => worker as unknown as Worker,
+    });
+    await replica.start();
+    Sock.sockets[0]!.fireOpen();
+
+    const frame = (seq: number) => ({
+      type: "change" as const,
+      seq,
+      entity: "issues",
+      entityId: `i${seq}`,
+      op: "upsert" as const,
+      row: { id: `i${seq}` },
+    });
+    Sock.sockets[0]!.deliver(frame(43)); // starts the slow apply
+    await new Promise((r) => setTimeout(r, 10));
+    Sock.sockets[0]!.deliver(frame(44)); // QUEUED behind it (single-flight)
+
+    // The server asks for a full resync while that apply is still running.
+    Sock.sockets[0]!.deliver({ type: "resync" });
+    await vi.waitFor(
+      () => expect(worker.received.some((e) => e.request.type === "seedBegin")).toBe(true),
+      { timeout: 4000 },
+    );
+    await vi.waitFor(
+      () => expect(worker.received.some((e) => e.request.type === "seedCommit")).toBe(true),
+      { timeout: 4000 },
+    );
+
+    const types = worker.received.map((e) => e.request.type);
+    const begin = types.indexOf("seedBegin");
+    const commit = types.indexOf("seedCommit", begin);
+    expect(begin).toBeGreaterThanOrEqual(0);
+    expect(commit).toBeGreaterThan(begin);
+    // THE OUTCOME: the seed's transaction window contains no applies.
+    expect(types.slice(begin, commit)).not.toContain("applyChanges");
+    replica.close();
+  }, 15_000);
+
   it("a THROWING lock manager boots to 'error', never to 'secondary'", async () => {
     // CTC-114 review round 5. A denied / malfunctioning Web Locks API was collapsed into the same
     // `null` that means "another tab owns the replica", so start() resolved into the clean, terminal

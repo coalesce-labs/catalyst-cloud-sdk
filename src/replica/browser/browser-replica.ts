@@ -76,6 +76,24 @@ const DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_WORKER_RPC_TIMEOUT_MS = 120_000;
 
 /**
+ * Request types deliberately EXEMPT from {@link DEFAULT_WORKER_RPC_TIMEOUT_MS}.
+ *
+ * Only the reads. They are the one family whose pending time is not the worker's own work: the
+ * `SeedReadGate` defers a read for as long as an open seed lasts (CTC-132), and a legitimate ~100 MB
+ * snapshot streams for minutes — so a deadline here would abort healthy reads during exactly the
+ * operation the gate exists to protect them from.
+ *
+ * They are not left defenceless. Every other RPC IS bounded, and a deadline expiry runs `failWorker`,
+ * which rejects every pending entry — so a genuinely wedged worker still surfaces on the reads, via
+ * whichever bounded request notices first.
+ */
+const UNBOUNDED_WORKER_RPCS: ReadonlySet<string> = new Set([
+  "queryIssues",
+  "queryIssueDetail",
+  "queryPulls",
+]);
+
+/**
  * Resolve the API base to a URL — the SINGLE point of construction.
  *
  * `snapshotUrl` and `subscribe` each derived this independently, which is a real hazard once a
@@ -339,20 +357,10 @@ export class BrowserReplica {
     };
     this.options = options;
     this.deltas = new DeltaQueue({
-      // BOUNDED like the seed RPCs (CTC-114 review round 7). Round 6 wrapped only the seed, which left
-      // the live path with the same hole: a worker that accepts an `applyChanges` and never replies
-      // (an OPFS/SQLite op wedging without firing a worker `error`) left this promise pending forever,
-      // so the queue stayed permanently `draining` and could reach NEITHER its retry nor its overflow
-      // recovery — the two paths that exist for exactly this. Meanwhile arriving frames kept advancing
-      // `acceptedSeq`, so a reconnect resumed ABOVE changes that were never committed, sealing the
-      // hole. Safe to bound here, unlike the read RPCs: `applyChanges` does not wait on the
-      // SeedReadGate, so its duration is the worker's actual work and nothing else. Tearing the worker
-      // down on expiry also rejects every pending read, so a wedge surfaces on those too.
-      apply: (changes) =>
-        this.withWorkerDeadline(
-          "applyChanges",
-          this.call({ type: "applyChanges", changes }),
-        ),
+      // Bounded by `call()` itself (round 9) — a wedged apply used to leave the queue permanently
+      // `draining`, reaching NEITHER its retry nor its overflow recovery, while arriving frames kept
+      // advancing `acceptedSeq` so a reconnect resumed above changes that were never committed.
+      apply: (changes) => this.call({ type: "applyChanges", changes }),
       onDrained: (cursor) => {
         this.lastSeq = Math.max(this.lastSeq, cursor);
         if (this.disposed) return;
@@ -402,7 +410,15 @@ export class BrowserReplica {
         // test). It is written this way so the unlatch survives that contract changing.
         const live = this.live;
         if (live) {
-          void live.requestResync().finally(() => this.deltas.resume());
+          void live.requestResync().finally(() => {
+            // Only unlatch if NO seed is in flight (round 9). requestResync() can return without
+            // re-seeding at all — the transport may already be resyncing, or the boot may have failed
+            // — and in the already-resyncing case a seed is running right now with the queue paused by
+            // its own preamble. Resuming here would clear that pause and let stale frames apply into
+            // its open transaction. When a seed IS running, its `finally` owns the unlatch; this arm
+            // exists for the case where requestResync did nothing and nobody else will.
+            if (!this.seedAbort) this.deltas.resume();
+          });
           return;
         }
         // No transport yet (overflow during boot, before subscribe()) — there is no socket to
@@ -431,7 +447,18 @@ export class BrowserReplica {
     return `${this.options.identity}\0${this.options.accountId ?? ""}`;
   }
 
-  /** Send a typed request to the Worker and resolve with its result (cast by the ResultMap entry). */
+  /**
+   * Send a typed request to the Worker and resolve with its result (cast by the ResultMap entry).
+   *
+   * BOUNDED HERE, for every request type, rather than at individual call sites (CTC-114 review round
+   * 9). Rounds 6 and 7 wrapped the seed RPCs and then the apply RPC one at a time, and round 9 found
+   * the ones still missed — `open` and `getCursor`, where a wedged `installOpfsSAHPoolVfs()` left
+   * `start()` pending forever while holding the origin-wide Web Lock, with every sibling tab reporting
+   * "secondary" and no worker `error` event to notice. Bounding at the seam instead makes that class
+   * of miss structural: a new request type is bounded by construction, not by remembering.
+   *
+   * READS are the deliberate exemption ({@link UNBOUNDED_WORKER_RPCS}) — see that constant.
+   */
   private call<K extends ReplicaRequest["type"]>(
     request: Extract<ReplicaRequest, { type: K }>,
   ): Promise<ResultMap[K]> {
@@ -450,13 +477,15 @@ export class BrowserReplica {
     const worker = this.worker;
     const id = this.nextId++;
     const envelope: Envelope = { id, request };
-    return new Promise<ResultMap[K]>((resolve, reject) => {
+    const sent = new Promise<ResultMap[K]>((resolve, reject) => {
       this.pending.set(id, {
         resolve: (v) => resolve(v as ResultMap[K]),
         reject,
       });
       worker.postMessage(envelope);
     });
+    if (UNBOUNDED_WORKER_RPCS.has(request.type)) return sent;
+    return this.withWorkerDeadline(request.type, sent);
   }
 
   /**
@@ -588,6 +617,16 @@ export class BrowserReplica {
    * a stale cursor over a truncated DB, which the next cold start reads as WARM and goes live over.
    */
   private async reseed(): Promise<number> {
+    // QUIESCE THE DELTA QUEUE FIRST (CTC-114 review round 9) — before anything can open the worker's
+    // seed transaction. A reseed can begin while the queue still holds buffered work (a gap escalating
+    // mid-replay is the concrete case), and a live queue across `seedBegin` posts `applyChanges` into
+    // that open transaction from its retry timer; the nested `BEGIN` rejects, and repeated failures
+    // walk the queue into its apply-failed overflow during an otherwise healthy re-seed. That
+    // escalation then buys nothing: its `requestResync()` returns immediately because the transport is
+    // already resyncing, so live frames are discarded with no recovery. Everything buffered here is
+    // pre-snapshot by definition and the snapshot supersedes it, so dropping it is also correct.
+    // Unlatched in the `finally` below, on BOTH arms.
+    this.deltas.pause();
     // Supersede any seed already running: abort its fetch, then release the worker-side seed session
     // so its SeedReadGate stops holding reads. `seedAbort` is idempotent worker-side.
     this.seedAbort?.abort();
@@ -653,15 +692,15 @@ export class BrowserReplica {
      * converge at all. This restores what DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS already documents: "this
      * only fires when the server has genuinely stopped sending."
      *
-     * Taking the network timer down leaves the WORKER unbounded — `call()` has no deadline of its own
-     * — so the RPC gets its own, much longer bound instead (round 6). One number could not serve both:
-     * 30s of network silence means a dead server, while 30s inside a `seedCommit` can be honest work.
-     * See {@link DEFAULT_WORKER_RPC_TIMEOUT_MS}.
+     * Taking the network timer down leaves the WORKER unbounded on its own — which is why `call()`
+     * now applies a separate, much longer deadline to every RPC (rounds 6-9). One number could not
+     * serve both: 30s of network silence means a dead server, while 30s inside a `seedCommit` can be
+     * honest work. See {@link DEFAULT_WORKER_RPC_TIMEOUT_MS}.
      */
     const seedCall = async (req: ReplicaRequest): Promise<unknown> => {
       clearIdle();
       try {
-        return await this.withWorkerDeadline(req.type, guardedCall(req));
+        return await guardedCall(req);
       } finally {
         // Back to waiting on the body — start a FRESH window rather than resuming a partly-spent one.
         armIdle();
@@ -703,17 +742,22 @@ export class BrowserReplica {
       this.lastSeq = cursor;
       // The snapshot IS the new baseline for both cursors — anything accepted before it is superseded.
       this.acceptedSeq = cursor;
-      // Unlatch the queue HERE, not only in the overflow handler's `.finally`. reseed() is also the
-      // callback the transport awaits BEFORE reopening the socket, so resuming at this point clears
-      // the latch before any frame can be delivered — on the server-`{type:"resync"}` path too, which
-      // never passes through the overflow handler at all.
-      this.deltas.resume();
       this.handlers.onStatus("live");
       this.handlers.onChanged();
       return cursor;
     } finally {
       clearIdle();
       if (this.seedAbort === abort) this.seedAbort = null;
+      // UNLATCH on both arms (round 9), pairing the `pause()` this method opened with. It lives in the
+      // `finally` so a FAILED seed also releases the queue — the worker rolled back to the prior
+      // complete snapshot and the durable cursor never moved, so live frames may resume against it.
+      // Still before reseed() returns, which is what matters: this is the callback the transport
+      // awaits BEFORE reopening the socket, so the latch clears before any frame can be delivered —
+      // on the server-`{type:"resync"}` path too, which never passes through the overflow handler.
+      //
+      // GENERATION-GUARDED: a superseded seed must NOT unlatch, or it would clear the pause the
+      // successor's preamble just set and let stale frames apply into ITS open transaction.
+      if (gen === this.seedGeneration) this.deltas.resume();
     }
   }
 

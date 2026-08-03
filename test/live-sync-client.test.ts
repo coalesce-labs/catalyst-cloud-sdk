@@ -578,6 +578,38 @@ describe("requestResync() — the consumer-driven resync entry point (CTC-114 re
     client.stop();
   });
 
+  it("still refuses to recover LONG AFTER a failed startup, not just during it", async () => {
+    // CTC-114 review round 9 — the gap round 8's fix left. The failure was read from the awaited
+    // `bootTask`, but that handle is nulled once the boot settles. So a request arriving after that
+    // cleanup microtask found no record of the failure at all, with `started` still true and `stopped`
+    // still false, and sailed past the guard into a reseed that could open a live socket beneath an
+    // application already told startup had failed. The outcome has to outlive the handle.
+    const store = makeStore(null); // COLD → the boot reseeds, and this one fails
+    const { sockets, factory } = recordingFactory();
+    let seeds = 0;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        seeds += 1;
+        throw new Error("snapshot 503");
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+    });
+
+    await expect(client.start()).rejects.toThrow("snapshot 503");
+    // Let the bootTask cleanup microtask run — THIS is what round 8 depended on not having happened.
+    await new Promise((r) => setTimeout(r, 0));
+
+    await client.requestResync();
+    expect(seeds).toBe(1); // the boot's own attempt, and nothing after it
+    expect(sockets).toHaveLength(0);
+    client.stop();
+  });
+
   it("never rejects when the re-seed fails", async () => {
     const { sockets, factory } = recordingFactory();
     const client = new LiveSyncClient({

@@ -350,6 +350,53 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
     expect(() => new DeltaQueue({ ...base })).not.toThrow();
   });
 
+  it("pause() stops an ARMED retry from firing, and never escalates to the owner", async () => {
+    // CTC-114 review round 9. The owner calls this before opening the worker's seed transaction. An
+    // armed retry firing into that transaction posts an applyChanges whose nested BEGIN rejects, and
+    // the repeated failures walk the queue into apply-failed overflow during a HEALTHY reseed. It must
+    // NOT notify onOverflow: the owner is the one re-seeding, so telling it to re-seed is circular.
+    vi.useFakeTimers();
+    try {
+      const onOverflow = vi.fn();
+      const applied: number[] = [];
+      let calls = 0;
+      const q = new DeltaQueue({
+        apply: (c) => {
+          calls++;
+          if (calls === 1) return Promise.reject(new Error("boom"));
+          for (const ch of c) applied.push(ch.seq);
+          return Promise.resolve({ cursor: c[c.length - 1]!.seq });
+        },
+        onDrained: vi.fn(),
+        onError: vi.fn(),
+        onOverflow,
+        maxBatch: 1,
+        retryDelayMs: 1000,
+      });
+
+      q.push(change(1));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(q.depth).toBe(1); // requeued, retry armed
+      expect(calls).toBe(1);
+
+      q.pause();
+
+      // THE OUTCOME: the armed retry does not fire — nothing is posted while the seed txn is open.
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(calls).toBe(1);
+      expect(q.depth).toBe(0); // pre-snapshot work dropped, as the snapshot supersedes it
+      expect(onOverflow).not.toHaveBeenCalled(); // NOT an escalation — the owner is already re-seeding
+
+      // resume() clears it, and the queue works again.
+      q.resume();
+      q.push(change(2));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(applied).toEqual([2]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects a MISSING onOverflow at construction (silently terminal otherwise)", async () => {
     // CTC-114 review round 6. `onOverflow` was optional, and omitting it was silently terminal: the
     // first overflow latches `overflowed`, empties the inbox, and makes every later push() a no-op —

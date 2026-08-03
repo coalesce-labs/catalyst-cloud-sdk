@@ -171,6 +171,28 @@ export class DeltaQueue {
     void this.drain();
   }
 
+  /**
+   * Latch the queue for an owner-driven re-seed, WITHOUT escalating back to the owner (CTC-114 review
+   * round 9).
+   *
+   * The same latch `onOverflow` sets, minus the callback — the owner is the one re-seeding, so telling
+   * it to re-seed would be circular. Without this, a reseed that began while buffered work remained
+   * (a gap escalating mid-replay, say) left the queue live across `seedBegin`: its retry timer then
+   * posted an `applyChanges` INTO the seed's open transaction, whose nested `BEGIN` rejects, and the
+   * repeated failures walked the queue into its apply-failed overflow during an otherwise healthy
+   * re-seed. The overflow's `requestResync()` then returned immediately — the transport is already
+   * resyncing — so the escalation bought no recovery at all and simply discarded live frames.
+   *
+   * Dropping the inbox is correct for the same reason `resume()` drops it: everything buffered is
+   * pre-snapshot by definition, and the snapshot supersedes it. `resume()` clears this.
+   */
+  pause(): void {
+    if (this.stopped) return;
+    this.overflowed = true;
+    this.inbox.length = 0;
+    this.clearRetry();
+  }
+
   /** Clear the overflow latch so the queue accepts deltas again (after the owner's re-seed lands). */
   resume(): void {
     if (this.stopped) return;

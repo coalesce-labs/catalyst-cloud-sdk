@@ -373,6 +373,16 @@ export class LiveSyncClient {
   private abandonReseed: (() => void) | null = null;
   /** Did the boot this request waited on perform a COLD re-seed? Only then may it be absorbed. */
   private bootColdSeeded = false;
+  /**
+   * Did the last boot REJECT? Latched until the next `start()` (CTC-114 review round 9).
+   *
+   * Round 8 read the failure from the awaited `bootTask`, but that handle is nulled once the boot
+   * settles — so a `requestResync()` arriving after that microtask found no record of the failure,
+   * with `started` still true and `stopped` still false, and sailed past the guard into a reseed that
+   * could open a live socket under an application already told startup had failed. The outcome has to
+   * outlive the handle.
+   */
+  private bootFailed = false;
   private resyncing = false;
   private backoff: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -491,6 +501,7 @@ export class LiveSyncClient {
     // it should have honoured. Found while re-reading this path rather than reported; the same class
     // of staleness as the `bootTask` handle being nulled when it settles.
     this.bootColdSeeded = false;
+    this.bootFailed = false;
     // The done deferred is created BEFORE the boot body runs (CTC-281 N2): stop() during the cold-seed
     // await used to find resolveDone still null and leave the returned promise pending forever — a
     // contract violation for a consumer awaiting start(). The boot body below is deliberately its OWN
@@ -567,9 +578,15 @@ export class LiveSyncClient {
     // for one that raced it — otherwise `bootColdSeeded` would absorb legitimate later requests
     // forever. The catch keeps a boot rejection from surfacing as an unhandled one on this arm; the
     // race below is what actually reports it.
-    void boot.catch(() => undefined).then(() => {
-      if (this.bootTask === boot) this.bootTask = null;
-    });
+    void boot
+      .catch(() => {
+        // LATCH the failure before the handle is dropped — `bootTask` is the transient record, this is
+        // the durable one, and requestResync() has to be able to see it afterwards (round 9).
+        this.bootFailed = true;
+      })
+      .then(() => {
+        if (this.bootTask === boot) this.bootTask = null;
+      });
     // Settles when stop() resolves the deferred, OR rejects if the boot (cold seed) fails — a boot
     // SUCCESS deliberately keeps waiting on `done` (the "runs forever" contract). Promise.race
     // attaches handlers to both arms, so a boot rejection after stop() is never an unhandled one.
@@ -1081,25 +1098,24 @@ export class LiveSyncClient {
     // can no longer be caught up by deltas, which replaying from the cursor cannot fix.
     const boot = this.bootTask;
     if (boot) {
-      let bootFailed = false;
-      await boot.catch(() => {
-        bootFailed = true;
-      });
+      await boot.catch(() => undefined); // the outcome is read from `bootFailed`, latched below
       if (this.stopped) return;
-      // A FAILED boot must not be recovered from here (CTC-114 review round 8). Round 7 swallowed the
-      // rejection and carried straight on into handleResync — so a cold start whose /snapshot failed
-      // would reject the caller's start(), sending the application into its boot-error path, and then
-      // a later successful reseed here would quietly open a live socket underneath it. The client must
-      // not outlive the startup the consumer was told had failed; recovery is start()'s to re-attempt.
-      if (bootFailed) {
-        this.log("warn", "requestResync() ignored — startup failed");
-        return;
-      }
-      // A COLD boot re-seeded from /snapshot while we waited, which IS what was being asked for.
-      if (this.bootColdSeeded) {
-        this.log("info", "requestResync() absorbed by the boot's cold seed");
-        return;
-      }
+    }
+    // A FAILED boot must not be recovered from here (CTC-114 review rounds 8 + 9). Round 7 swallowed
+    // the rejection and carried straight on into handleResync — so a cold start whose /snapshot failed
+    // would reject the caller's start(), sending the application into its boot-error path, and then a
+    // later successful reseed here would quietly open a live socket underneath it. Round 8 read the
+    // failure from the awaited task, which round 9 showed is not enough: `bootTask` is nulled when the
+    // boot settles, so a request arriving after that microtask saw no failure at all. Checked OUTSIDE
+    // the `if (boot)` for exactly that reason — the latch outlives the handle, until the next start().
+    if (this.bootFailed) {
+      this.log("warn", "requestResync() ignored — startup failed");
+      return;
+    }
+    // A COLD boot re-seeded from /snapshot while we waited, which IS what was being asked for.
+    if (boot && this.bootColdSeeded) {
+      this.log("info", "requestResync() absorbed by the boot's cold seed");
+      return;
     }
     // Unlike the frame path, this entry point can be called MID-BACKOFF: the queue overflowed while the
     // client was already waiting to reconnect. handleResync would then reopen the socket itself and the
