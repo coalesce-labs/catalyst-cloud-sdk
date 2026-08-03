@@ -407,4 +407,82 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(batches.slice(1).flat().map((c) => c.seq)).not.toContain(2);
   });
+  it("keeps retrying when the consumer's onError handler THROWS", async () => {
+    // These handlers are arbitrary app code — the replica forwards them to onStatus/onChanged, so a
+    // React setState that throws lands here. Uncaught, it propagated out of the failure path BEFORE
+    // scheduleRetry() ran: the batch was already requeued and the transport's high-water had already
+    // advanced past it, so on a quiet feed nothing re-drained it and a reconnect resumed ABOVE data
+    // that was never applied.
+    let calls = 0;
+    const applied: SeqChange[][] = [];
+    const apply = (changes: SeqChange[]): Promise<{ cursor: number }> => {
+      calls += 1;
+      applied.push(changes);
+      if (calls === 1) return Promise.reject(new Error("SQLITE_IOERR"));
+      return Promise.resolve({ cursor: changes[changes.length - 1]?.seq ?? 0 });
+    };
+    const onDrained = vi.fn();
+    const q = new DeltaQueue({
+      apply,
+      onDrained,
+      onError: () => {
+        throw new Error("consumer setState blew up");
+      },
+      onOverflow: vi.fn(),
+      maxBatch: 10,
+      retryDelayMs: 5,
+    });
+
+    q.push(change(1));
+    // The self-driven retry must still fire and land the batch.
+    await vi.waitFor(() => expect(calls).toBeGreaterThanOrEqual(2), { timeout: 2000 });
+    await vi.waitFor(() => expect(onDrained).toHaveBeenCalled(), { timeout: 2000 });
+    expect(applied[1]?.map((c) => c.seq)).toEqual([1]);
+    expect(q.depth).toBe(0);
+  });
+
+  it("still escalates to a re-seed when onError throws on every failure", async () => {
+    const onOverflow = vi.fn();
+    const q = new DeltaQueue({
+      apply: () => Promise.reject(new Error("SQLITE_IOERR")),
+      onDrained: vi.fn(),
+      onError: () => {
+        throw new Error("consumer setState blew up");
+      },
+      onOverflow,
+      maxBatch: 10,
+      maxApplyRetries: 2,
+      retryDelayMs: 5,
+    });
+
+    q.push(change(1));
+    await vi.waitFor(() => expect(onOverflow).toHaveBeenCalledTimes(1), { timeout: 2000 });
+    expect(onOverflow.mock.calls[0]?.[1]).toBe("apply-failed");
+  });
+
+  it("a throwing onDrained leaves the queue usable", async () => {
+    // HONEST SCOPE: this passes with or without the notify() wrap today, because `draining` is already
+    // cleared before onDrained runs — verified by negative control. It is kept as a guard against a
+    // future reordering that moved the clear AFTER the callback, which would wedge the queue on the
+    // first consumer render error. The wrap's other benefit — drain() still resolving, so the
+    // `void this.drain()` call sites cannot raise an unhandled rejection — is not observable through
+    // the public API, since push() has already consumed the inbox by the time a test can call drain().
+    const applied: SeqChange[][] = [];
+    const q = new DeltaQueue({
+      apply: (changes) => {
+        applied.push(changes);
+        return Promise.resolve({ cursor: changes[changes.length - 1]?.seq ?? 0 });
+      },
+      onDrained: () => {
+        throw new Error("consumer render blew up");
+      },
+      onError: vi.fn(),
+      maxBatch: 10,
+    });
+    q.push(change(1));
+    await new Promise((r) => setTimeout(r, 0));
+    q.push(change(2));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(applied.flat().map((c) => c.seq)).toEqual([1, 2]);
+  });
 });

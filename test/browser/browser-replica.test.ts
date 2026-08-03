@@ -763,4 +763,34 @@ describe("a queue overflow quiesces the socket and never stays latched (CTC-114 
     expect(Sock.sockets.at(-1)!.lastSent()).toEqual({ type: "sync", after: 42 });
     replica.close();
   }, 15_000);
+  it("still sends seedAbort to the worker when the idle timeout fires", async () => {
+    // The idle bound aborts the FETCH — but the worker has already run `seedBegin`, so it is sitting
+    // in an open transaction with its SeedReadGate armed. `streamSeedIntoWorker`'s catch issues the
+    // cleanup `seedAbort` that rolls it back and settles the gate; if the supersede guard rejects
+    // that call, the wedge is merely relocated from the fetch to the worker — every subsequent read
+    // waits forever and delta applies fail on a nested transaction until a reload.
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("WebSocket", undefined);
+    stubFetch((_url, init) => stalledResponse((init as RequestInit).signal));
+    const worker = new FakeWorker({
+      open: undefined,
+      getCursor: null,
+      seedBegin: undefined,
+      seedAbort: undefined,
+      close: undefined,
+    });
+    const c = collect();
+    const replica = new BrowserReplica(c.handlers, opts({
+      snapshotIdleTimeoutMs: 20,
+      createWorker: () => worker as unknown as Worker,
+    }));
+
+    await expect(replica.start()).rejects.toThrow();
+
+    const sent = worker.received.map((e) => e.request.type);
+    expect(sent).toContain("seedBegin");
+    expect(sent).toContain("seedAbort");
+    // Ordering matters: the abort must come after the begin it is rolling back.
+    expect(sent.lastIndexOf("seedAbort")).toBeGreaterThan(sent.indexOf("seedBegin"));
+  });
 });

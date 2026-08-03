@@ -143,7 +143,7 @@ export class DeltaQueue {
       const depth = this.inbox.length;
       this.inbox.length = 0;
       this.clearRetry();
-      this.opts.onOverflow?.(depth, "depth");
+      this.notify("onOverflow", () => this.opts.onOverflow?.(depth, "depth"));
       return;
     }
     void this.drain();
@@ -161,6 +161,24 @@ export class DeltaQueue {
     this.overflowed = false;
     // The re-seed supersedes whatever could not be applied, so the failure streak starts over.
     this.applyFailures = 0;
+  }
+
+  /**
+   * Invoke a CONSUMER callback without letting it break the queue's state machine.
+   *
+   * These handlers are arbitrary app code — the replica forwards them straight to `onStatus` /
+   * `onChanged`, so a React setState that throws lands here. Uncaught, the exception propagates out of
+   * the failure path BEFORE `scheduleRetry()` or the overflow escalation runs: the batch is already
+   * requeued and the transport's high-water has already advanced past it, so on a quiet feed nothing
+   * ever re-drains it and a reconnect resumes ABOVE data that was never applied. The transport applies
+   * the same discipline to its own user handlers.
+   */
+  private notify(label: string, fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      console.error(`[delta-queue] ${label} handler threw`, err);
+    }
   }
 
   /** Cancel a pending self-retry. */
@@ -220,14 +238,14 @@ export class DeltaQueue {
         // removes a row the snapshot legitimately has. Drop it, and do not escalate again: the owner
         // has already been told to re-seed.
         if (this.overflowed) {
-          this.opts.onError(err);
+          this.notify("onError", () => this.opts.onError(err));
           return;
         }
         // Back at the FRONT: these seqs are strictly older than anything still queued behind them,
         // and the worker applies in order.
         this.inbox.unshift(...batch);
         this.applyFailures += 1;
-        this.opts.onError(err);
+        this.notify("onError", () => this.opts.onError(err));
         if (this.applyFailures >= this.maxApplyRetries) {
           // Not replayable in place. Drop the backlog and let the owner re-seed — same contract as a
           // depth overflow, so the owner needs no new branch.
@@ -235,7 +253,7 @@ export class DeltaQueue {
           const depth = this.inbox.length;
           this.inbox.length = 0;
           this.clearRetry();
-          this.opts.onOverflow?.(depth, "apply-failed");
+          this.notify("onOverflow", () => this.opts.onOverflow?.(depth, "apply-failed"));
         } else {
           this.scheduleRetry();
         }
@@ -246,7 +264,8 @@ export class DeltaQueue {
     // ONE notification per drain rather than one per frame. The caller's reaction is a full view
     // rebuild + a structured clone of a whole page back across the boundary, and a burst of deltas has
     // exactly one visible outcome — so firing it per frame was pure waste.
-    if (applied && !this.stopped) this.opts.onDrained(highest);
+    if (applied && !this.stopped)
+      this.notify("onDrained", () => this.opts.onDrained(highest));
   }
 
   /** Drop everything buffered and refuse further work (teardown). Each queued delta retains a fully

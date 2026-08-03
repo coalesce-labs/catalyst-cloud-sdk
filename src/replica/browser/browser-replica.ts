@@ -544,7 +544,19 @@ export class BrowserReplica {
     /** A superseded or aborted seed must post ZERO further worker messages — otherwise its batches
      *  interleave with the newer seed's transaction. */
     const guardedCall = (req: ReplicaRequest): Promise<unknown> => {
-      if (this.disposed || abort.signal.aborted || gen !== this.seedGeneration) {
+      if (this.disposed) return Promise.reject(new Error("seed superseded"));
+      // A NEWER seed now owns the worker's session. Post NOTHING — not even the cleanup abort, which
+      // would roll back the successor's transaction. Its own preamble already aborted this session.
+      if (gen !== this.seedGeneration) {
+        return Promise.reject(new Error("seed superseded"));
+      }
+      // Aborted with NO successor (idle timeout, or close() before teardown): refuse everything
+      // EXCEPT `seedAbort`. That one MUST still reach the worker — it is what rolls back the open
+      // seed transaction and settles the SeedReadGate. Blocking it left the gate armed forever, so
+      // every subsequent read hung: precisely the wedge the idle bound exists to prevent, merely
+      // relocated from the fetch to the worker. (The boot path masked this — its catch terminates the
+      // worker — but a transport-driven resync leaves the worker alive.)
+      if (abort.signal.aborted && req.type !== "seedAbort") {
         return Promise.reject(new Error("seed superseded"));
       }
       return this.call(req as never);
