@@ -307,4 +307,22 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
     expect(onOverflow).toHaveBeenCalledTimes(1);
     expect(onOverflow.mock.calls[0]?.[1]).toBe("depth");
   });
+  it("rejects a non-positive maxBatch at construction (public option, unbounded spin)", async () => {
+    // `splice(0, 0)` removes nothing, so `while (inbox.length > 0)` never advances: awaiting
+    // `apply([])` and iterating forever, an unbounded stream of empty worker transactions that never
+    // applies the queued change. Both types are public exports of `./browser`, so this is reachable.
+    const base = { apply: vi.fn(), onDrained: vi.fn(), onError: vi.fn() };
+    expect(() => new DeltaQueue({ ...base, maxBatch: 0 })).toThrow(
+      /maxBatch must be a positive integer/,
+    );
+    expect(() => new DeltaQueue({ ...base, maxBatch: -1 })).toThrow(
+      /maxBatch must be a positive integer/,
+    );
+    expect(() => new DeltaQueue({ ...base, maxBatch: 1.5 })).toThrow(
+      /maxBatch must be a positive integer/,
+    );
+    // Negative control: a legal batch size still constructs, and the default is untouched.
+    expect(() => new DeltaQueue({ ...base, maxBatch: 1 })).not.toThrow();
+    expect(() => new DeltaQueue({ ...base })).not.toThrow();
+  });
 });

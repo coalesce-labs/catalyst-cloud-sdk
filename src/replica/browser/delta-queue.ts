@@ -112,6 +112,16 @@ export class DeltaQueue {
   constructor(opts: DeltaQueueOptions) {
     this.opts = opts;
     this.maxBatch = opts.maxBatch ?? MAX_APPLY_BATCH_ROWS;
+    // `DeltaQueue` and `DeltaQueueOptions` are both public exports of `./browser`, so these values are
+    // consumer-supplied. A non-positive maxBatch is not merely degenerate — `splice(0, 0)` removes
+    // NOTHING, so the drain loop's `while (inbox.length > 0)` never advances: it awaits `apply([])`
+    // and immediately iterates again, an unbounded stream of empty worker transactions that never
+    // applies the queued change. Fail at construction rather than hang at the first delta.
+    if (!Number.isInteger(this.maxBatch) || this.maxBatch < 1) {
+      throw new Error(
+        `DeltaQueue: maxBatch must be a positive integer (got ${String(opts.maxBatch)})`,
+      );
+    }
     this.maxDepth = opts.maxDepth ?? MAX_INBOX_DEPTH;
     this.maxApplyRetries = opts.maxApplyRetries ?? MAX_APPLY_RETRIES;
     this.retryDelayMs = opts.retryDelayMs ?? APPLY_RETRY_DELAY_MS;
