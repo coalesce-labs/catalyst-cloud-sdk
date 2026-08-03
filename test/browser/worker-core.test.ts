@@ -7,6 +7,10 @@ import {
 } from "../../src/replica/browser/worker-core.js";
 import { buildOpenedReplica } from "../../src/replica/browser/ports.js";
 import type { IssueView } from "@catalyst-cloud/read-model";
+import { applyMigrations, MIRROR_MIGRATIONS } from "@catalyst-cloud/schema";
+
+/** The newest migration tag that changes row shape — the one a "behind by a column" DB is missing. */
+const LAST_SHAPE_TAG = "0008_optimal_rattler";
 
 // CTC-114 / CTC-131 — the browser replica's ENTIRE dispatch lifecycle, exercised against the REAL
 // sqlite-wasm engine and the REAL shared migrations/apply/read-model, in plain node. This is the exact
@@ -311,14 +315,23 @@ describe("worker-core — tenant fence on open (CTC-114 review)", () => {
     expect(rows).toHaveLength(1);
   });
 
-  it("adopts a pre-fence database without wiping it", async () => {
-    // A replica seeded by an older build has no stored identity. Treat that as "unknown, not foreign":
-    // wiping would force a needless full re-seed on every existing install at upgrade time.
+  it("WIPES a pre-fence database instead of adopting it", async () => {
+    // This test previously asserted the OPPOSITE — that a database with no stored identity is adopted
+    // as "unknown, not foreign", to spare existing installs a re-seed at upgrade time. That reasoning
+    // does not survive contact with the threat model (CTC-114 review, second round):
+    //
+    //   • An unstamped database is exactly the population that MIGHT belong to another cookie user —
+    //     every replica written before the fence existed has no key. A missing identity cannot be
+    //     validated, so it cannot be trusted.
+    //   • Adopting one stamps the NEW identity over the OLD ROWS while leaving the old cursor intact,
+    //     so start() reads warm, skips /snapshot, and renders the previous tenant's issues.
+    //   • The cost it was avoiding is zero: `./browser` is new and UNPUBLISHED in 0.8.0, so there is
+    //     no install base to spare. It was trading a real cross-tenant read for a saving that does
+    //     not exist.
     const db = new sqlite3.oo1.DB(":memory:", "c") as unknown as Database;
     const make = () =>
       createWorkerCore(() => Promise.resolve(buildOpenedReplica(db)));
     const seeded = make();
-    // Seed WITHOUT ever stamping an identity, by seeding before any open stamps one.
     await seeded.handle({
       type: "open",
       dbPath: ":memory:",
@@ -336,6 +349,139 @@ describe("worker-core — tenant fence on open (CTC-114 review)", () => {
       directory: "unused",
       identity: "x",
     });
-    expect(await upgraded.handle({ type: "getCursor" })).toBe(7);
+
+    // Cold → the client takes the /snapshot path.
+    expect(await upgraded.handle({ type: "getCursor" })).toBeNull();
+    // And the rows are GONE, not merely unreachable — so even a FAILED re-seed cannot serve them.
+    const rows = (await upgraded.handle({ type: "queryIssues" })) as IssueView[];
+    expect(rows).toHaveLength(0);
+  });
+
+  it("rejects a re-open under a different identity rather than silently ignoring it", async () => {
+    // The fence runs only on the FIRST open. A second open with a different identity used to be a
+    // silent no-op, which left the core serving tenant A's rows to a caller that believed it had
+    // opened tenant B — the same exposure as the unfenced case, reached by a different route.
+    const core = memoryCore();
+    await core.handle({
+      type: "open",
+      dbPath: ":memory:",
+      directory: "unused",
+      identity: "user-a",
+    });
+    await expect(
+      core.handle({
+        type: "open",
+        dbPath: ":memory:",
+        directory: "unused",
+        identity: "user-b",
+      }),
+    ).rejects.toThrow(/different identity/);
+  });
+
+  it("allows an idempotent re-open under the SAME identity (negative control)", async () => {
+    const core = memoryCore();
+    const open = {
+      type: "open" as const,
+      dbPath: ":memory:",
+      directory: "unused",
+      identity: "user-a",
+    };
+    await core.handle(open);
+    await seed(core, [{ entity: "issues", row: issueRow("a") }], 42);
+    await expect(core.handle(open)).resolves.toBeUndefined();
+    // The re-open must not have re-run the fence and wiped the warm replica.
+    expect(await core.handle({ type: "getCursor" })).toBe(42);
+  });
+});
+
+describe("row-shape migration forces one re-seed — CTC-127's browser twin (CTC-114 review, KtI)", () => {
+  /** The bundle minus its last column-adding migration: a replica that predates the mirror's ALTER. */
+  const partialBundle = {
+    ...MIRROR_MIGRATIONS,
+    journal: {
+      ...MIRROR_MIGRATIONS.journal,
+      entries: MIRROR_MIGRATIONS.journal.entries.filter(
+        (e) => e.tag !== LAST_SHAPE_TAG,
+      ),
+    },
+  };
+
+  /** A raw handle migrated only through `bundle`, with `cursor` persisted — a WARM replica.
+   *  `bundle` is typed as the runner's own parameter: MIRROR_MIGRATIONS' journal is a readonly TUPLE
+   *  of exactly N entries, so a filtered copy is not assignable to `typeof MIRROR_MIGRATIONS`. */
+  type Bundle = Parameters<typeof applyMigrations>[1];
+  function warmDbAt(bundle: Bundle, cursor: string): Database {
+    const db = new sqlite3.oo1.DB(":memory:", "c") as unknown as Database;
+    applyMigrations(
+      {
+        exec: (sql: string) => {
+          db.exec(sql);
+        },
+        query: (sql: string) =>
+          db.exec(sql, {
+            rowMode: "object",
+            returnValue: "resultRows",
+          }) as Array<Record<string, unknown>>,
+      },
+      bundle,
+    );
+    db.exec("CREATE TABLE IF NOT EXISTS sync_meta (key TEXT PRIMARY KEY, value TEXT)");
+    db.exec(`INSERT INTO sync_meta (key, value) VALUES ('cursor', '${cursor}')`);
+    return db;
+  }
+
+  function cursorOf(db: Database): unknown {
+    const rows = db.exec("SELECT value FROM sync_meta WHERE key = 'cursor'", {
+      rowMode: "object",
+      returnValue: "resultRows",
+    }) as Record<string, unknown>[];
+    return rows[0]?.value ?? null;
+  }
+
+  it("clears the cursor when opening a warm DB behind a column-adding migration", () => {
+    // The row the warm DB already holds was written before the new column existed and holds NULL for
+    // it forever — deltas only carry CHANGED rows, so nothing backfills it. Dropping the cursor makes
+    // the client's warm-start check read cold and take /snapshot exactly once.
+    const db = warmDbAt(partialBundle, "7");
+    buildOpenedReplica(db); // applies the missing migration → row shape changed
+    expect(cursorOf(db)).toBeNull();
+  });
+
+  it("PRESERVES the cursor on a fully-migrated warm DB — the warm-start path stays alive", () => {
+    // The mandatory negative control for the test above: without it, "clear the cursor whenever the
+    // bundle contains a CREATE TABLE" passes the primary test while making every warm tab re-download
+    // the whole (~100 MB) snapshot, and the warm-start path this replica exists for becomes dead code.
+    //
+    // What actually protects that path is the migration runner's contract — `applyMigrations` reports
+    // only the tags it applied THIS call (measured: 9 on a cold DB, 0 on a re-open), so a fully
+    // migrated DB evaluates the predicate over an empty list. This assertion is what pins that
+    // contract: if the runner ever starts reporting all known tags, `0000_baseline`'s CREATE TABLE
+    // makes the predicate true forever and this test is the thing that goes red.
+    const db = warmDbAt(MIRROR_MIGRATIONS, "7");
+    buildOpenedReplica(db); // nothing new to apply → no shape change
+    expect(cursorOf(db)).toBe("7");
+  });
+
+  it("applies NOTHING on a re-open — the contract the test above depends on", () => {
+    // Asserted directly rather than inferred, because everything above rests on it.
+    const db = new sqlite3.oo1.DB(":memory:", "c") as unknown as Database;
+    const adapter = {
+      exec: (sql: string) => {
+        db.exec(sql);
+      },
+      query: (sql: string) =>
+        db.exec(sql, { rowMode: "object", returnValue: "resultRows" }) as Array<
+          Record<string, unknown>
+        >,
+    };
+    expect(applyMigrations(adapter, MIRROR_MIGRATIONS).appliedTags.length).
+      toBeGreaterThan(0);
+    expect(applyMigrations(adapter, MIRROR_MIGRATIONS).appliedTags).toEqual([]);
+  });
+
+  it("leaves a COLD DB cold without a spurious clear", () => {
+    const db = new sqlite3.oo1.DB(":memory:", "c") as unknown as Database;
+    buildOpenedReplica(db);
+    expect(cursorOf(db)).toBeNull();
   });
 });

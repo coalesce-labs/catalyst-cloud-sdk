@@ -44,6 +44,9 @@ export function createWorkerCore(open: ReplicaOpener): WorkerCore {
   /** The opened replica — set once by the `open` request, then reused for every subsequent command. */
   let replica: OpenedReplica | null = null;
 
+  /** The tenant fence the open replica was admitted under, so a re-open can be checked against it. */
+  let openedIdentity: string | null = null;
+
   /** The in-flight batched seed (CTC-132), if one is open — spans seedBegin → seedBatch* → seedCommit. */
   let session: SeedSession | null = null;
 
@@ -61,25 +64,49 @@ export function createWorkerCore(open: ReplicaOpener): WorkerCore {
   async function handle(request: ReplicaRequest): Promise<unknown> {
     switch (request.type) {
       case "open": {
-        if (!replica) {
-          replica = await open(request);
-          // TENANT FENCE (CTC-114 review). dbPath/directory default to constants, so every tenant on
-          // an origin shares one OPFS database. Enforce the fence HERE, before any read can be served:
-          // on a mismatch wipe the entity tables and delete the cursor, which makes the client's
-          // warm-start check (`getCursor() != null`) read cold and take the /snapshot path. Without
-          // this, a cookie-user change left the previous tenant's rows both readable and unremovable —
-          // deltas carry changes, never "forget everything".
-          const stored = getIdentity(replica.write);
-          if (stored !== request.identity) {
-            replica.write.transaction(() => {
-              if (stored !== null) {
-                truncateReplica(replica!.write);
-                clearCursor(replica!.write);
-              }
-              setIdentity(replica!.write, request.identity);
-            });
+        // A re-open with a DIFFERENT identity is a programming error, not a tenant switch: the fence
+        // below runs only on the first open, so silently ignoring the second would leave the core
+        // serving tenant A's rows to a caller that believes it opened tenant B. Loud beats silent.
+        if (replica) {
+          if (openedIdentity !== request.identity) {
+            throw new Error(
+              "replica already open under a different identity — close() before reopening",
+            );
           }
+          return undefined;
         }
+        replica = await open(request);
+        // TENANT FENCE (CTC-114 review). dbPath/directory default to constants, so every tenant on
+        // an origin shares one OPFS database. Enforce the fence HERE, before any read can be served:
+        // on a mismatch wipe the entity tables and delete the cursor, which makes the client's
+        // warm-start check (`getCursor() != null`) read cold and take the /snapshot path. Without
+        // this, a cookie-user change left the previous tenant's rows both readable and unremovable —
+        // deltas carry changes, never "forget everything".
+        const stored = getIdentity(replica.write);
+        if (stored !== request.identity) {
+          // UNCONDITIONAL on mismatch — including `stored === null` (CTC-114 review, second round).
+          // An earlier version adopted a null-identity database on the theory that it was fresh. It is
+          // not: every OPFS replica written before this fence existed has no identity key, and those
+          // are exactly the databases that may belong to a different cookie user. Adopting one stamps
+          // the new identity over the OLD ROWS and leaves the old cursor intact, so start() reads warm,
+          // skips /snapshot, and serves the previous tenant. A missing identity cannot be validated,
+          // so it must force a cold re-seed.
+          //
+          // The cost on a genuinely fresh database is a truncate over empty tables and a DELETE that
+          // matches no row — which is why this is safe to do unconditionally, and why the alternative
+          // (clear the cursor only) is not enough: if the forced re-seed then FAILS, the client stays
+          // alive and queryIssues() would still read the previous tenant's rows. Truncating makes
+          // "wrong-identity rows are unreadable" unconditional rather than contingent on a later step.
+          //
+          // ONE transaction, so a crash mid-wipe can never leave rows from A under a stamp saying B.
+          const r = replica;
+          r.write.transaction(() => {
+            truncateReplica(r.write);
+            clearCursor(r.write);
+            setIdentity(r.write, request.identity);
+          });
+        }
+        openedIdentity = request.identity;
         return undefined;
       }
 
@@ -178,6 +205,7 @@ export function createWorkerCore(open: ReplicaOpener): WorkerCore {
         readGate.settle();
         replica?.close();
         replica = null;
+        openedIdentity = null;
         return undefined;
       }
     }

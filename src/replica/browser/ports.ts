@@ -16,6 +16,7 @@
 import type { Database } from "@sqlite.org/sqlite-wasm";
 import type { SqlExecutor, SqlValue } from "@catalyst-cloud/read-model";
 import { applyMigrations, MIRROR_MIGRATIONS, type MigrationDb } from "@catalyst-cloud/schema";
+import { migrationsChangeRowShape } from "../migration-shape.js";
 
 /**
  * The write port the delta-apply path (apply.ts) drives. `run` executes a mutation with positional `?`
@@ -65,6 +66,22 @@ export interface OpenedReplica {
 /** A sqlite-wasm bindable array, narrowed to what the read-model/apply paths actually bind. */
 function bindArgs(bindings: SqlValue[]): SqlValue[] | undefined {
   return bindings.length > 0 ? bindings : undefined;
+}
+
+/**
+ * Read the persisted cursor straight off the handle, before the write port exists.
+ *
+ * The row-shape check below runs inside `buildOpenedReplica`, so apply.ts's `getCursor(db.write)` is not
+ * available yet — and it must stay that way: apply.ts imports the shared replicate helpers, and pulling
+ * that graph in here just to read one row would invert the layering this file exists to keep flat.
+ */
+function readCursorRow(db: Database): string | null {
+  const rows = db.exec("SELECT value FROM sync_meta WHERE key = 'cursor'", {
+    rowMode: "object",
+    returnValue: "resultRows",
+  }) as Record<string, SqlValue>[];
+  const v = rows[0]?.value;
+  return typeof v === "string" ? v : null;
 }
 
 /**
@@ -130,11 +147,28 @@ export function buildOpenedReplica(db: Database): OpenedReplica {
         Record<string, unknown>
       >,
   };
-  applyMigrations(migrationAdapter, MIRROR_MIGRATIONS);
+  const { appliedTags } = applyMigrations(migrationAdapter, MIRROR_MIGRATIONS);
 
   // Host-only bookkeeping table (NOT in the DO mirror schema, so not in the bundle) — the cursor.
   // Identical to the node engine's SYNC_META_DDL.
   db.exec("CREATE TABLE IF NOT EXISTS sync_meta (key TEXT PRIMARY KEY, value TEXT)");
+
+  // CTC-127's browser twin (CTC-114 review, KtI). A migration that adds a column or a table leaves a
+  // WARM replica's existing rows holding NULL for it forever — deltas only carry CHANGED rows, so
+  // nothing ever backfills them. Dropping the cursor makes the client's warm-start check read cold and
+  // take the /snapshot path exactly once. The node replica has done this since CTC-127; without it the
+  // browser bites on the FIRST row-shape migration after 0.8.0.
+  //
+  // On the `cursor != null` guard: it is DEFENCE IN DEPTH, not the thing that makes this correct.
+  // What makes it correct is that `applyMigrations` reports only the tags it applied THIS call —
+  // verified: 9 on a cold database, 0 on a re-open — so a fully-migrated warm tab evaluates the
+  // predicate over an EMPTY list and never reaches the delete. (An earlier reading of this had the
+  // guard preventing a re-download on every warm reload; that is not what happens, because the
+  // predicate is already false there. It is kept because it costs one indexed lookup and it is what
+  // holds the line if the runner's contract ever changes to report all known tags.)
+  if (readCursorRow(db) != null && migrationsChangeRowShape(appliedTags)) {
+    db.exec("DELETE FROM sync_meta WHERE key = 'cursor'");
+  }
 
   return {
     read,

@@ -19,6 +19,7 @@
 // and the SAME @catalyst-cloud/schema MIRROR_MIGRATIONS.
 
 import { applyMigrations, MIRROR_MIGRATIONS, type MigrationDb } from "@catalyst-cloud/schema";
+import { migrationsChangeRowShape } from "./migration-shape.js";
 import {
   applyDelta,
   truncateReplica,
@@ -96,22 +97,12 @@ const SYNC_META_DDL = `CREATE TABLE IF NOT EXISTS sync_meta (
 const SEED_BATCH_ROWS = 1000;
 
 /**
- * CTC-127: does any of the migrations applied THIS boot change a table's ROW SHAPE — i.e. add a column
- * (`ALTER TABLE … ADD …`) or a new entity table (`CREATE TABLE`)? If so, a WARM replica's existing rows
- * were seeded/applied before that column existed and hold NULL for it, so `start()` forces one re-seed
- * to backfill. A pure `CREATE INDEX` migration changes no row shape → no re-seed. Detected by
- * string-matching the applied tags' SQL — drizzle-kit emits bare `ADD` and `CREATE TABLE` (the same
- * vocabulary @catalyst-cloud/schema's migration runner trusts). Conservative-safe: a false positive is
- * a harmless extra re-seed; there are no false negatives for real `ALTER TABLE ADD` / `CREATE TABLE`.
- * Exported for direct unit testing of the predicate.
+ * CTC-127's row-shape predicate. Defined in ./migration-shape.js so the BROWSER worker can use it too
+ * — this module top-level-imports ./engine.js, which imports `node:module`, so the browser cannot
+ * cross-import from here. Re-exported (rather than moved outright) because it is public API and its
+ * unit tests import it from this path.
  */
-export function migrationsChangeRowShape(appliedTags: readonly string[]): boolean {
-  const byTag = MIRROR_MIGRATIONS.migrations as Record<string, string | undefined>;
-  return appliedTags.some((tag) => {
-    const sql = byTag[tag] ?? "";
-    return /\bADD\b/i.test(sql) || /\bCREATE\s+TABLE\b/i.test(sql);
-  });
-}
+export { migrationsChangeRowShape };
 
 export interface CatalystReplicaOptions {
   /** http(s) origin incl. any path prefix (…/api/v1); the scheme is swapped to ws(s) for /connect. */
