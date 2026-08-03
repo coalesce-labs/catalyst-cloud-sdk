@@ -778,6 +778,84 @@ describe("requestResync() — the consumer-driven resync entry point (CTC-114 re
     client.stop();
   });
 
+
+  it("waits for a SLOW unwind, not just a fast one", async () => {
+    // CTC-114 review round 14 (P1). Round 12's wait used a fixed 500ms, but the browser replica's own
+    // cleanup is bounded by its worker-RPC deadline (120s by default) — a mid-flight seedBatch has to
+    // unwind before seedAbort can land. The grace expired first, so runResync() reconnected into a
+    // still-paused queue: replayed frames refused while `deliveredSeq` advanced over them, and the
+    // next accepted frame carried the durable cursor past the gap. The grace is now the consumer's to
+    // set, and the replica derives it from its own bound.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let cleanupDone = false;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      // Unwinds well past the OLD fixed 500ms default would have allowed at this scale.
+      reseed: (signal) =>
+        new Promise<number>((_res, rejectSeed) => {
+          signal?.addEventListener("abort", () => {
+            setTimeout(() => {
+              cleanupDone = true;
+              rejectSeed(new Error("seed cancelled"));
+            }, 120);
+          });
+        }),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 20,
+      cancelCleanupGraceMs: 5_000, // what a real consumer sets: cover YOUR cleanup bound
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    await client.requestResync();
+    expect(cleanupDone).toBe(true);
+    client.stop();
+  });
+
+  it("does not infer cancellation support from ARITY", async () => {
+    // CTC-114 review round 14. Round 12 skipped the wait when `reseed.length === 0`. Function.length
+    // counts only parameters before the first default or rest, so a signal-aware callback written
+    // `(signal = undefined) => …` reports 0 — and got no wait at all, which is precisely the hazard.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    let cleanupDone = false;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      // Function.length === 0 here, yet it honours the signal.
+      reseed: (signal = undefined) =>
+        new Promise<number>((_res, rejectSeed) => {
+          signal?.addEventListener("abort", () => {
+            setTimeout(() => {
+              cleanupDone = true;
+              rejectSeed(new Error("seed cancelled"));
+            }, 30);
+          });
+        }),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      reseedTimeoutMs: 20,
+      cancelCleanupGraceMs: 2_000,
+    });
+    expect(client).toBeDefined();
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    await client.requestResync();
+    // THE OUTCOME: it waited, despite the arity being 0.
+    expect(cleanupDone).toBe(true);
+    client.stop();
+  });
+
   it("never rejects when the re-seed fails", async () => {
     const { sockets, factory } = recordingFactory();
     const client = new LiveSyncClient({
@@ -2269,6 +2347,9 @@ describe("LiveSyncClient fleet-incident hardening (CTC-281)", () => {
       pingIntervalMs: 0,
       openTimeoutMs: 0,
       reseedTimeoutMs: 5000,
+      // Nothing to unwind: this seed never settles and never observes the signal, so the round-14
+      // cleanup wait has no work to do. 0 keeps this test on the bound it was written for.
+      cancelCleanupGraceMs: 0,
       wsFactory: factory,
     });
     void client.start();
@@ -2319,6 +2400,9 @@ describe("LiveSyncClient fleet-incident hardening (CTC-281)", () => {
       onChange: () => {},
       pingIntervalMs: 0,
       reseedTimeoutMs: 5000,
+      // Nothing to unwind: this seed never settles and never observes the signal, so the round-14
+      // cleanup wait has no work to do. 0 keeps this test on the bound it was written for.
+      cancelCleanupGraceMs: 0,
       wsFactory: factory,
     });
     const started = client.start();
@@ -2340,6 +2424,9 @@ describe("LiveSyncClient fleet-incident hardening (CTC-281)", () => {
       pingIntervalMs: 0,
       openTimeoutMs: 0,
       reseedTimeoutMs: 5000,
+      // Nothing to unwind: this seed never settles and never observes the signal, so the round-14
+      // cleanup wait has no work to do. 0 keeps this test on the bound it was written for.
+      cancelCleanupGraceMs: 0,
       wsFactory: factory,
     });
     void client.start();

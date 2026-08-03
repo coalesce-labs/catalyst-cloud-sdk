@@ -863,6 +863,21 @@ export class BrowserReplica {
       // uses for the next {type:"sync"} — so a resync resumes from the fresh head, never 0.
       // Forward the transport's cancellation signal — see reseed()'s preamble (round 10 P1).
       reseed: (signal) => this.reseed(signal),
+      // The transport must stay disconnected until THIS seed has unwound (CTC-114 review round 14).
+      //
+      // Our cleanup is not instantaneous and not short: aborting mid-seed has to unwind a `seedBatch`
+      // or `seedCommit` that is already in flight and then land a `seedAbort`, each bounded by
+      // `workerRpcTimeoutMs` (120s by default) — a slow OPFS commit legitimately uses that budget. The
+      // transport's own default grace is 250ms, so it would have reconnected long before, into a
+      // replica whose delta queue is still PAUSED: replayed frames get refused while the transport's
+      // `deliveredSeq` advances over them, and the next frame we do accept carries the durable cursor
+      // past the gap. Permanent, and invisible.
+      //
+      // Derived rather than hard-coded, so raising the RPC deadline cannot silently un-fix this. The
+      // margin covers the abort round-trip that follows the RPC being unwound.
+      cancelCleanupGraceMs:
+        (this.options.workerRpcTimeoutMs ?? DEFAULT_WORKER_RPC_TIMEOUT_MS) +
+        CLOSE_GRACE_MS,
       ...(this.options.reseedTimeoutMs === undefined
         ? {}
         : { reseedTimeoutMs: this.options.reseedTimeoutMs }),

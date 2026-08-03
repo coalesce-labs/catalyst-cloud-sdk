@@ -241,6 +241,17 @@ export interface LiveSyncClientOptions {
    */
   reseedTimeoutMs?: number;
   /**
+   * How long a CANCELLED reseed gets to unwind before the transport settles and reconnects anyway.
+   * Default 250ms; the value must cover the consumer's OWN cleanup bound (CTC-114 review round 14).
+   *
+   * Reconnecting before the consumer has unwound is not merely early: its store may still be latched,
+   * so replayed frames are refused while this client's `deliveredSeq` advances over them — and the
+   * next frame it does accept carries the durable cursor past the gap, permanently. The transport
+   * cannot know how long a given consumer takes to unwind, so the consumer sets this. The browser
+   * replica raises it to cover its worker-RPC deadline, since its cleanup is a `seedAbort` RPC.
+   */
+  cancelCleanupGraceMs?: number;
+  /**
    * Gap detection (CTL-1402): how long (ms) to wait for a `{type:"sync"}` gap re-request to finish
    * redelivering the detected hole before retrying (or, once {@link gapRetryLimit} re-requests have
    * been spent, escalating to the full re-seed path). Default `10_000`; set `0` to never time out
@@ -279,7 +290,7 @@ export interface LiveSyncClientOptions {
  * Bounded because the deadline that triggered this exists precisely for an unresponsive callback: a
  * cleanup that also hangs must not wedge the transport (CTC-114 review round 12).
  */
-const CANCEL_CLEANUP_GRACE_MS = 500;
+const DEFAULT_CANCEL_CLEANUP_GRACE_MS = 250;
 
 /** Resolve the runtime global WebSocket, or fail with an actionable message. */
 function defaultWsFactory(url: string): WebSocketLike {
@@ -374,6 +385,7 @@ export class LiveSyncClient {
   private readonly pongTimeoutMs: number;
   private readonly openTimeoutMs: number;
   private readonly reseedTimeoutMs: number;
+  private readonly cancelCleanupGraceMs: number;
   private readonly gapTimeoutMs: number;
   private readonly gapRetryLimit: number;
   private readonly wsFactory: WebSocketFactory;
@@ -505,6 +517,8 @@ export class LiveSyncClient {
     this.pongTimeoutMs = opts.pongTimeoutMs ?? 15_000;
     this.openTimeoutMs = opts.openTimeoutMs ?? 20_000;
     this.reseedTimeoutMs = opts.reseedTimeoutMs ?? 600_000;
+    this.cancelCleanupGraceMs =
+      opts.cancelCleanupGraceMs ?? DEFAULT_CANCEL_CLEANUP_GRACE_MS;
     this.gapTimeoutMs = opts.gapTimeoutMs ?? 10_000;
     this.gapRetryLimit = opts.gapRetryLimit ?? 3;
     this.wsFactory = opts.wsFactory ?? defaultWsFactory;
@@ -1098,18 +1112,27 @@ export class LiveSyncClient {
       const giveUp = (err: Error): void => {
         if (settled) return;
         cancel.abort();
-        // Only WAIT for a callback that can actually act on the signal. Arity is the honest test:
-        // a zero-arg `reseed` (the node replica's `() => this.seedFromSnapshot()`, and every consumer
-        // written before 0.8.0) cannot observe the abort, so there is no unwind to wait for and
-        // pausing here would only add latency to the failure path. This also keeps the pre-round-12
-        // behaviour exactly for those consumers.
-        if (this.reseed.length === 0) {
+        // ALWAYS wait for the unwind, bounded by the grace (CTC-114 review round 14).
+        //
+        // Round 12 skipped the wait when `reseed.length === 0`, reasoning that a zero-arg callback
+        // cannot observe the signal. `Function.length` does not support that inference: it counts only
+        // parameters before the first default or rest, so `reseed: (signal = undefined) => …` reports
+        // 0 while receiving and honouring the signal — and that consumer got no wait at all, which is
+        // exactly the hazard the wait exists for. There is no sound way to ask a function whether it
+        // will act on a signal, so stop trying: wait for everyone, and let the grace bound it. A
+        // consumer that ignores the signal simply hits the grace, which is the pre-round-12 behaviour
+        // delayed by `cancelCleanupGraceMs` — the reason that default is small and this is the knob
+        // the browser replica raises.
+        // 0 DISABLES the wait outright rather than scheduling a zero-delay timer — the same
+        // disable-by-zero convention the other bounds use, and the honest meaning of "this consumer
+        // has nothing to unwind".
+        if (this.cancelCleanupGraceMs <= 0) {
           finish(() => reject(err));
           return;
         }
         const grace = setTimeout(
           () => finish(() => reject(err)),
-          CANCEL_CLEANUP_GRACE_MS,
+          this.cancelCleanupGraceMs,
         );
         void seed
           .catch(() => undefined)
