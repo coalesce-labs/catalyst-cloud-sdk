@@ -146,7 +146,15 @@ if (isBrowserReplicaSupported()) {
       onChanged: () => void refreshList(), // after the seed and after every applied delta drain
       onStatus: (s) => setBadge(s), // "loading" | "live" | "reconnecting" | "error" | "secondary" | …
     },
-    { baseUrl: "/api/v1" }, // same-origin, cookie-authed; accountId optional
+    {
+      baseUrl: "/api/v1", // same-origin, cookie-authed; accountId optional
+      // REQUIRED. The OPFS database is shared by every replica on the origin and a warm cursor skips
+      // the snapshot, so without a fence a change of signed-in user serves the PREVIOUS user's rows.
+      // Pass a stable per-user id from your session — e.g. the WorkOS `user.id`. It never leaves the
+      // browser; it is only compared against the value stamped in the local DB, and a mismatch wipes
+      // the replica and forces a re-seed.
+      identity: session.user.id,
+    },
   );
   void replica.start(); // resolves once seeded (or immediately with status "secondary")
 
@@ -175,7 +183,25 @@ yourself — the SDK never bundles the wasm.
 - **webpack 5 / Rollup**: the `new Worker(new URL(...))` syntax is supported natively (Rollup needs
   worker support in your config, e.g. `@surma/rollup-plugin-off-main-thread` or equivalent).
 - **Exotic bundlers**: pass `createWorker` in `BrowserReplicaOptions` and construct the worker
-  however your toolchain requires — it must run this package's `db.worker` module.
+  however your toolchain requires. The worker module is published at the dedicated subpath
+  **`@catalyst-cloud/sdk/browser/db-worker`** — that specifier is the supported entry point:
+
+  ```ts
+  // Vite
+  import DbWorker from "@catalyst-cloud/sdk/browser/db-worker?worker";
+  createWorker: () => new DbWorker();
+
+  // webpack 5 / anything that resolves a bare specifier to a URL
+  createWorker: () =>
+    new Worker(
+      new URL("@catalyst-cloud/sdk/browser/db-worker", import.meta.url),
+      { type: "module" },
+    );
+  ```
+
+  The worker is a **side-effect module** (it registers a message handler and exports nothing), so it
+  is listed in the package's `sideEffects` array — do not configure your bundler to tree-shake it, or
+  it will load and register nothing and every replica call will hang.
 
 ## API
 

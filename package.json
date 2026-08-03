@@ -30,6 +30,11 @@
       "import": "./dist/browser.js",
       "default": "./dist/browser.js"
     },
+    "./browser/db-worker": {
+      "types": "./dist/replica/browser/db.worker.d.ts",
+      "import": "./dist/replica/browser/db.worker.js",
+      "default": "./dist/replica/browser/db.worker.js"
+    },
     "./node": {
       "types": "./dist/node.d.ts",
       "import": "./dist/node.js",
@@ -39,7 +44,9 @@
   "files": [
     "dist"
   ],
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/replica/browser/db.worker.js"
+  ],
   "engines": {
     "node": ">=22"
   },
