@@ -144,6 +144,190 @@ describe("buildConnectUrl auth strategy", () => {
     expect(u.searchParams.get("account")).toBe("tenant-0");
     expect(url).not.toContain("token");
   });
+
+  // CTC-114 review (KtB). The browser default omits accountId entirely: the OPEN read plane scopes a
+  // cookie-authed socket to the session's own tenant. Serializing it as `?account=` freezes a contract
+  // in which "" is a legal mirror name — and puts `catalyst.tenant=""` on every span, which reads in
+  // Loki/Tempo as a MISSING attribute rather than a session-scoped one.
+  it("omits ?account= entirely when no account is named (and leaves no dangling '?')", () => {
+    const url = buildConnectUrl({
+      baseUrl: "https://app.example/api/v1",
+      connectPath: "/connect",
+      auth: { kind: "cookie" },
+    });
+    expect(url).toBe("wss://app.example/api/v1/connect");
+    expect(url).not.toContain("account");
+    // The whole point: absent, not empty.
+    expect(new URL(url).searchParams.has("account")).toBe(false);
+    expect(url.endsWith("?")).toBe(false);
+  });
+
+  it("still emits ?token= with no account when a token client somehow reaches the builder", () => {
+    // buildConnectUrl is exported from the root entry, so it is reachable independently of the
+    // constructor guard below. It must not produce a dangling separator here either.
+    const url = buildConnectUrl({
+      baseUrl: "https://h.example/api/v1",
+      connectPath: "/connect",
+      auth: { kind: "token", token: "svc-tok" },
+    });
+    expect(url).toBe("wss://h.example/api/v1/connect?token=svc-tok");
+  });
+});
+
+describe("accountId is required only for token auth (CTC-114 review, KtB)", () => {
+  const base = {
+    baseUrl: BASE,
+    reseed: async () => 0,
+    getCursor: () => null,
+    onChange: () => {},
+    wsFactory: recordingFactory().factory,
+  };
+
+  it("throws at CONSTRUCTION for token auth without an account", () => {
+    // Checked in the constructor, not in buildConnectUrl: connectUrl() is called from openSocket()
+    // OUTSIDE its try/catch, so a throw there escapes the reconnect machinery instead of reaching
+    // the caller. A host has no session to fall back to, so this is a misconfiguration, not a default.
+    expect(
+      () =>
+        new LiveSyncClient({
+          ...base,
+          auth: { kind: "token", token: "svc-tok" },
+        }),
+    ).toThrow(/accountId is required with token auth/);
+  });
+
+  it("constructs fine for cookie auth without an account", () => {
+    expect(
+      () => new LiveSyncClient({ ...base, auth: { kind: "cookie" } }),
+    ).not.toThrow();
+  });
+
+  it("constructs fine for token auth WITH an account (negative control)", () => {
+    expect(
+      () =>
+        new LiveSyncClient({
+          ...base,
+          accountId: "tenant-7",
+          auth: { kind: "token", token: "svc-tok" },
+        }),
+    ).not.toThrow();
+  });
+});
+
+describe("requestResync() — the consumer-driven resync entry point (CTC-114 review, Ks8)", () => {
+  it("closes the socket BEFORE re-seeding, then reopens from the fresh cursor", async () => {
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(12),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+    });
+
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    await client.requestResync();
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+
+    // Closing first is the WHOLE POINT: it is what stops a live frame landing in the window that is
+    // in neither the snapshot nor the consumer's store. Asserting only "reseed was called" would pass
+    // against a direct reseed() call, which is exactly the unsafe thing this method exists to replace.
+    expect(sockets[0]!.closed).toBe(true);
+    expect(store.reseedCalls.count).toBe(1);
+
+    sockets[1]!.fireOpen();
+    expect(sockets[1]!.lastSent()).toEqual({ type: "sync", after: 12 });
+
+    client.stop();
+  });
+
+  it("opens exactly ONE socket when called mid-backoff", async () => {
+    // The motivating case: the browser replica's queue overflows while the client is already waiting
+    // to reconnect. Without clearing the pending timer, handleResync reopens and then the timer opens
+    // a second socket on top of it.
+    vi.useFakeTimers();
+    try {
+      const store = makeStore(7);
+      const { sockets, factory } = recordingFactory();
+      const client = new LiveSyncClient({
+        baseUrl: BASE,
+        accountId: "tenant-0",
+        auth: { kind: "cookie" },
+        reseed: store.reseedTo(12),
+        getCursor: store.getCursor,
+        onChange: store.onChange,
+        wsFactory: factory,
+        backoffMs: 1000,
+      });
+
+      void client.start();
+      sockets[0]!.fireOpen();
+      sockets[0]!.fireServerClose(); // → schedules a reconnect
+      expect(sockets).toHaveLength(1);
+
+      const done = client.requestResync();
+      await vi.advanceTimersByTimeAsync(0);
+      await done;
+      // Let the reconnect timer that WAS pending fire, had it not been cleared.
+      await vi.advanceTimersByTimeAsync(5000);
+
+      expect(sockets).toHaveLength(2);
+      client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never rejects when the re-seed fails", async () => {
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        throw new Error("snapshot 503");
+      },
+      getCursor: () => 7,
+      onChange: () => {},
+      wsFactory: factory,
+      log: () => {},
+    });
+
+    void client.start();
+    sockets[0]!.fireOpen();
+
+    // Called from event handlers and `void` contexts — a rejection here surfaces as an unhandled
+    // promise rejection, not as anything a consumer can catch.
+    await expect(client.requestResync()).resolves.toBeUndefined();
+    client.stop();
+  });
+
+  it("is inert after stop()", async () => {
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(12),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+    });
+
+    void client.start();
+    sockets[0]!.fireOpen();
+    client.stop();
+
+    await client.requestResync();
+    expect(store.reseedCalls.count).toBe(0);
+    expect(sockets).toHaveLength(1);
+  });
 });
 
 describe("parseFrame", () => {

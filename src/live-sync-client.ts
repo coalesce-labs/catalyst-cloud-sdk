@@ -61,9 +61,10 @@
 // a client RESTARTED mid-window would have re-latched the disable, so the degrade-not-disable shape is
 // what actually guarantees convergence); (4) a FAILED reseed re-enters the backoff path instead
 // of hot-reopening — and the reseed await itself is bounded by `reseedTimeoutMs` (the injected
-// callback is a trust boundary like the ws impl: the replica's seedFromSnapshot self-bounds via its
-// idle abort, but a consumer-supplied reseed — the browser's OPFS seed() over an unbounded fetch —
-// can hang, and "resyncing" holds no socket and suppresses scheduleReconnect, so without this bound
+// callback is a trust boundary like the ws impl: both first-party reseeds self-bound (the node
+// replica's seedFromSnapshot and the browser replica's OPFS seed both abort on an idle body), but an
+// arbitrary consumer-supplied reseed can still hang, and "resyncing" holds no socket and suppresses
+// scheduleReconnect, so without this bound
 // it was the one remaining zero-timer state; a timed-out reseed is ABANDONED, its late settle
 // discarded, and the client re-enters backoff); (5) closeSocket() escalates past `close()` to a duck-typed `terminate()` (Bun /
 // the 'ws' package expose one; undici does not — its close-handshake wait is why teardown must not
@@ -142,8 +143,20 @@ export interface LiveSyncClientOptions {
    * verbatim (path-preserving). A trailing slash is trimmed.
    */
   baseUrl: string;
-  /** The tenant id = the mirror's name; sent as `?account=` on the connect URL. */
-  accountId: string;
+  /**
+   * The tenant id = the mirror's name; sent as `?account=` on the connect URL.
+   *
+   * OPTIONAL, and omitting it is the browser default: the OPEN read plane scopes a cookie-authed
+   * connection to the session user's own tenant, and an explicit account is the tenant-SWITCHER path.
+   * When absent the parameter is omitted entirely rather than serialized as `?account=` — an empty
+   * value is not a mirror name, and freezing it into the wire contract would leave the one nearby
+   * server-side fallback that a bare empty value can reach (`adminAccountScope`'s `|| "tenant-0"`)
+   * cross-tenant-shaped.
+   *
+   * REQUIRED for `auth: {kind:"token"}` — a host has no session to fall back to, so the constructor
+   * throws rather than letting it fail later as an opaque server 401.
+   */
+  accountId?: string;
   /**
    * The connect route. Default "/connect"; the service dual-serves it at "/api/v1/connect" too, so a
    * path-prefixed `baseUrl` ("…/api/v1") with the default "/connect" resolves to "…/api/v1/connect".
@@ -275,14 +288,19 @@ export function stripTrailingSlashes(s: string): string {
 export function buildConnectUrl(opts: {
   baseUrl: string;
   connectPath: string;
-  accountId: string;
+  accountId?: string;
   auth: AuthStrategy;
 }): string {
   const origin = toWsOrigin(stripTrailingSlashes(opts.baseUrl));
   const params = new URLSearchParams();
   if (opts.auth.kind === "token") params.set("token", opts.auth.token);
-  params.set("account", opts.accountId);
-  return `${origin}${opts.connectPath}?${params.toString()}`;
+  // Only when a tenant was actually named. `?account=` is NOT the same as no account: the server's
+  // consumers are truthiness checks, so empty takes the omitted path anyway — but it would freeze a
+  // contract in which "" is a legal mirror name, and it puts `catalyst.tenant=""` on every span.
+  if (opts.accountId) params.set("account", opts.accountId);
+  const query = params.toString();
+  // Guard the dangling "?" — with cookie auth and no account there are no params at all.
+  return `${origin}${opts.connectPath}${query ? `?${query}` : ""}`;
 }
 
 /**
@@ -318,7 +336,7 @@ const ERROR_CLOSE_GRACE_MS = 5_000;
 
 export class LiveSyncClient {
   private readonly baseUrl: string;
-  private readonly accountId: string;
+  private readonly accountId: string | undefined;
   private readonly connectPath: string;
   private readonly auth: AuthStrategy;
   private readonly reseed: () => Promise<number>;
@@ -407,6 +425,15 @@ export class LiveSyncClient {
   private reseedTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(opts: LiveSyncClientOptions) {
+    // Fail fast, and fail HERE. A token-authed client has no session to fall back to, so an omitted
+    // account is a misconfiguration, not a default. It is checked in the constructor rather than in
+    // buildConnectUrl because `connectUrl()` is called from `openSocket()` OUTSIDE its try/catch — a
+    // throw down there escapes the reconnect machinery entirely instead of surfacing to the caller.
+    if (opts.auth.kind === "token" && !opts.accountId) {
+      throw new Error(
+        "LiveSyncClient: accountId is required with token auth (only cookie auth can fall back to the session's own tenant)",
+      );
+    }
     this.baseUrl = stripTrailingSlashes(opts.baseUrl);
     this.accountId = opts.accountId;
     this.connectPath = opts.connectPath ?? "/connect";
@@ -510,6 +537,16 @@ export class LiveSyncClient {
     });
   }
 
+  /**
+   * The tenant label for telemetry. Attributes are `Record<string, string>`, and an empty string reads
+   * as a MISSING attribute in Loki/Tempo — which silently merges every session-scoped browser client
+   * into one unlabelled bucket. `"session"` names the case instead: this client is scoped to whatever
+   * tenant the cookie resolves to.
+   */
+  private get tenantAttr(): string {
+    return this.accountId ?? "session";
+  }
+
   private setStatus(status: LiveSyncStatus): void {
     try {
       this.onStatus?.(status);
@@ -524,7 +561,7 @@ export class LiveSyncClient {
     // One span per connect attempt: started here, ended OK in onopen, ERROR on construct-fail / a close
     // before open. Manual (not active) because the lifecycle spans onopen…onclose callbacks.
     this.connectSpan = this.telemetry.startSpan(REPLICA_SPAN.reconnect, {
-      [CATALYST_ATTR.tenant]: this.accountId,
+      [CATALYST_ATTR.tenant]: this.tenantAttr,
     });
     const wsUrl = this.connectUrl();
     let ws: WebSocketLike;
@@ -843,7 +880,7 @@ export class LiveSyncClient {
    *  KEY ON `escalated` ONLY (logged at ERROR); a gap that heals is routine and boring. */
   private recordGap(event: ReplicaGapEvent, gap: { seqFrom: number; seqTo: number; retries: number }): void {
     this.gapCounter.add(1, {
-      [CATALYST_ATTR.tenant]: this.accountId,
+      [CATALYST_ATTR.tenant]: this.tenantAttr,
       [CATALYST_ATTR.gapEvent]: event,
     });
     this.log(event === "escalated" ? "error" : "info", REPLICA_LOG.gap, {
@@ -913,6 +950,41 @@ export class LiveSyncClient {
   }
 
   /**
+   * Ask the client to drop the socket, re-seed, and reconnect from the fresh cursor — the same path a
+   * server `{type:"resync"}` frame drives, exposed for a consumer that discovers ON ITS OWN SIDE that
+   * its store can no longer be caught up by deltas.
+   *
+   * The browser replica is the motivating caller: when its delta queue overflows (or its applies keep
+   * rejecting) the buffered frames are dropped, so the transport's notion of what has been delivered is
+   * now ahead of what the store actually holds. Re-seeding through here — rather than calling the
+   * `reseed` callback directly — is what makes that safe: this CLOSES THE SOCKET FIRST, so no live
+   * frame interleaves with the snapshot and lands in the window that is in neither the snapshot nor the
+   * store.
+   *
+   * Delegates to the existing resync path in full — same `resyncing` re-entrancy guard, same
+   * `boundedReseed` deadline, same span, same failure→backoff behaviour. NEVER rejects: a failed
+   * re-seed is already handled internally by re-entering the reconnect path, and this is called from
+   * event handlers and `void` contexts where a rejection would surface as an unhandled promise.
+   */
+  async requestResync(): Promise<void> {
+    if (this.stopped) return;
+    // Unlike the frame path, this entry point can be called MID-BACKOFF: the queue overflowed while the
+    // client was already waiting to reconnect. handleResync would then reopen the socket itself and the
+    // pending timer would open a second one on top of it.
+    if (this.reconnectTimer != null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    try {
+      await this.handleResync();
+    } catch (err) {
+      // handleResync already catches its own reseed failure; this is the belt-and-braces guard for the
+      // contract above (never reject) against a throw from a consumer callback it invokes.
+      this.log("error", "requestResync failed", err);
+    }
+  }
+
+  /**
    * Cursor underflow: the deltas we need were evicted from the service's retained change buffer. Close the socket
    * (so no live frame interleaves with the re-seed), re-seed via the injected callback, then reconnect
    * — which re-sends {type:"sync"} from the fresh cursor. `resyncing` guards against a second resync
@@ -932,7 +1004,7 @@ export class LiveSyncClient {
       // seedFromSnapshot) auto-parents under this resync span.
       await this.telemetry.withActiveSpan(
         REPLICA_SPAN.resync,
-        { [CATALYST_ATTR.tenant]: this.accountId },
+        { [CATALYST_ATTR.tenant]: this.tenantAttr },
         async () => {
           const cursor = await this.boundedReseed();
           this.log("info", `resynced, cursor=${cursor}`);
