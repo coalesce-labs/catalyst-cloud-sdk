@@ -43,7 +43,7 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
   it("coalesces every frame that arrives while an apply is in flight into ONE next batch", async () => {
     const { apply, batches, releases } = deferredApply();
     const onDrained = vi.fn();
-    const q = new DeltaQueue({ apply, onDrained, onError: vi.fn() });
+    const q = new DeltaQueue({ apply, onDrained, onError: vi.fn(), onOverflow: vi.fn() });
 
     // First push starts an apply immediately — an idle tab pays no added latency.
     q.push(change(1));
@@ -73,6 +73,7 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
       apply,
       onDrained: vi.fn(),
       onError: vi.fn(),
+      onOverflow: vi.fn(),
       maxBatch: 10,
     });
 
@@ -109,6 +110,7 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
       apply: (c) => Promise.resolve({ cursor: c[c.length - 1]!.seq }),
       onDrained,
       onError: vi.fn(),
+      onOverflow: vi.fn(),
       maxBatch: 10,
     });
 
@@ -126,6 +128,7 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
       apply: () => Promise.resolve({ cursor: 0 }),
       onDrained,
       onError: vi.fn(),
+      onOverflow: vi.fn(),
     });
     q.push(change(42));
     await vi.waitFor(() => expect(onDrained).toHaveBeenCalledWith(42));
@@ -155,6 +158,7 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
         },
         onDrained,
         onError,
+        onOverflow: vi.fn(),
         maxBatch: 1,
         retryDelayMs: 1000,
       });
@@ -188,7 +192,7 @@ describe("DeltaQueue — coalescing (CTC-318)", () => {
   it("stop() drops the buffer and refuses further work", async () => {
     const onDrained = vi.fn();
     const { apply, releases } = deferredApply();
-    const q = new DeltaQueue({ apply, onDrained, onError: vi.fn() });
+    const q = new DeltaQueue({ apply, onDrained, onError: vi.fn(), onOverflow: vi.fn() });
 
     q.push(change(1));
     await Promise.resolve();
@@ -268,6 +272,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
       apply: () => Promise.resolve({ cursor: 0 }),
       onDrained: vi.fn(),
       onError: vi.fn(),
+      onOverflow: vi.fn(),
     });
     q.stop();
     q.resume();
@@ -330,7 +335,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
     // `splice(0, 0)` removes nothing, so `while (inbox.length > 0)` never advances: awaiting
     // `apply([])` and iterating forever, an unbounded stream of empty worker transactions that never
     // applies the queued change. Both types are public exports of `./browser`, so this is reachable.
-    const base = { apply: vi.fn(), onDrained: vi.fn(), onError: vi.fn() };
+    const base = { apply: vi.fn(), onDrained: vi.fn(), onError: vi.fn(), onOverflow: vi.fn() };
     expect(() => new DeltaQueue({ ...base, maxBatch: 0 })).toThrow(
       /maxBatch must be a positive integer/,
     );
@@ -343,6 +348,32 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
     // Negative control: a legal batch size still constructs, and the default is untouched.
     expect(() => new DeltaQueue({ ...base, maxBatch: 1 })).not.toThrow();
     expect(() => new DeltaQueue({ ...base })).not.toThrow();
+  });
+
+  it("rejects a MISSING onOverflow at construction (silently terminal otherwise)", async () => {
+    // CTC-114 review round 6. `onOverflow` was optional, and omitting it was silently terminal: the
+    // first overflow latches `overflowed`, empties the inbox, and makes every later push() a no-op —
+    // while `depth` reads 0 and nothing is raised. It is the ONLY signal that the owner must re-seed
+    // and call resume(), so a queue built without it stops syncing forever with nothing to observe.
+    // The type now requires it; this is the runtime half, for the untyped-JS consumers of the public
+    // export that the maxBatch guard above exists for. The cast models exactly that caller.
+    const noOverflow = {
+      apply: vi.fn(),
+      onDrained: vi.fn(),
+      onError: vi.fn(),
+    } as unknown as ConstructorParameters<typeof DeltaQueue>[0];
+    expect(() => new DeltaQueue(noOverflow)).toThrow(/onOverflow is required/);
+
+    // Negative control: supplying it constructs fine.
+    expect(
+      () =>
+        new DeltaQueue({
+          apply: vi.fn(),
+          onDrained: vi.fn(),
+          onError: vi.fn(),
+          onOverflow: vi.fn(),
+        }),
+    ).not.toThrow();
   });
   it("drops an in-flight batch whose apply rejects AFTER a depth overflow latched", async () => {
     // The exact interleaving (CTC-114 review): apply(batch) is in flight when push() crosses maxDepth.
@@ -496,6 +527,7 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
         throw new Error("consumer render blew up");
       },
       onError: vi.fn(),
+      onOverflow: vi.fn(),
       maxBatch: 10,
     });
     q.push(change(1));

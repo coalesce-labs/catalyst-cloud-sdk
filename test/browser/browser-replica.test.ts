@@ -41,6 +41,9 @@ class FakeWorker {
     /** Per-request-type reply delay in ms — models a SLOW worker (e.g. an OPFS commit on throttled
      *  storage) as distinct from a wedged one (`silent`). */
     private readonly delays: Record<string, number> = {},
+    /** Request types ACCEPTED and never answered — a worker wedged from a given point onward, rather
+     *  than `silent`'s all-or-nothing (which cannot get past `open`). */
+    private readonly silentFor: readonly string[] = [],
   ) {}
 
   addEventListener(type: string, fn: (e: unknown) => void): void {
@@ -55,7 +58,7 @@ class FakeWorker {
 
   postMessage(envelope: Envelope): void {
     this.received.push(envelope);
-    if (this.silent) return;
+    if (this.silent || this.silentFor.includes(envelope.request.type)) return;
     const answer = this.answers[envelope.request.type];
     // An Error-valued answer models the worker rejecting THAT request (the err envelope).
     const reply: ReplicaResponse =
@@ -871,6 +874,40 @@ describe("a queue overflow quiesces the socket and never stays latched (CTC-114 
     expect(c.statuses).toContain("live");
     expect(worker.received.map((e) => e.request.type)).not.toContain("seedAbort");
     replica.close();
+  }, 15_000);
+
+  it("a WEDGED worker fails the seed instead of hanging start() forever", async () => {
+    // CTC-114 review round 6. Scoping the idle bound to the network (round 5) left the WORKER
+    // unbounded — `call()` has no deadline — so a worker that accepts a postMessage and never replies
+    // left start() pending forever while holding the origin-wide Web Lock. Worse than a hang: the
+    // worker sits in an OPEN seed transaction with its SeedReadGate armed, so every later read waits
+    // forever and delta applies fail as nested transactions, and on a live reseed LiveSyncClient
+    // abandons the callback after its own deadline while that transaction stays open.
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("WebSocket", undefined);
+    stubFetch(() => okSnapshot([], 5));
+    // Answers `open`/`getCursor`, then goes SILENT — the seed RPCs are accepted and never answered.
+    const worker = new FakeWorker({ open: undefined, getCursor: null }, {}, [
+      "seedBegin",
+      "seedBatch",
+      "seedCommit",
+      "seedAbort",
+    ]);
+    const c = collect();
+    const replica = new BrowserReplica(
+      c.handlers,
+      opts({
+        snapshotIdleTimeoutMs: 0, // the network bound is OFF: only the worker deadline can save us
+        workerRpcTimeoutMs: 40,
+        createWorker: () => worker as unknown as Worker,
+      }),
+    );
+
+    // THE OUTCOME: start() settles. Unfixed it never does.
+    await expect(replica.start()).rejects.toThrow(/wedged/);
+    expect(c.statuses).toContain("error");
+    // And the worker is torn down, so the origin lock + OPFS handles are freed for sibling tabs.
+    expect(worker.terminated).toBe(true);
   }, 15_000);
 
   it("a THROWING lock manager boots to 'error', never to 'secondary'", async () => {

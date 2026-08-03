@@ -56,6 +56,26 @@ const CLOSE_GRACE_MS = 250;
 const DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS = 30_000;
 
 /**
+ * How long a SEED's worker RPC may go unanswered before the worker is declared dead (CTC-114 review
+ * round 6).
+ *
+ * Separate from the snapshot idle bound above, because they measure different things and one number
+ * cannot serve both. That bound watches the NETWORK and is deliberately down while the worker works —
+ * which left a worker that accepts a `postMessage` and never replies unbounded, since `call()` has no
+ * deadline of its own. That is not merely a hang: the worker is sitting in an OPEN seed transaction
+ * with its `SeedReadGate` armed, so every later read waits forever and delta applies fail as nested
+ * transactions. On a live reseed it is worse — `LiveSyncClient.boundedReseed` abandons the callback
+ * after its own deadline while that transaction and gate stay open, so the client carries on against a
+ * replica that can no longer answer anything.
+ *
+ * GENEROUS BY DESIGN: this exists to convert a WEDGED worker into a diagnosable error, not to police
+ * slow-but-progressing storage. A `seedCommit` of a ~100 MB snapshot on throttled OPFS is legitimately
+ * slow, and aborting one that is about to succeed is the exact failure the round-5 fix removed. Four
+ * times the network idle bound, and overridable.
+ */
+const DEFAULT_WORKER_RPC_TIMEOUT_MS = 120_000;
+
+/**
  * Resolve the API base to a URL — the SINGLE point of construction.
  *
  * `snapshotUrl` and `subscribe` each derived this independently, which is a real hazard once a
@@ -177,6 +197,14 @@ export interface BrowserReplicaOptions {
    * over a truncated DB, which the next cold start reads as warm and goes live over.
    */
   snapshotIdleTimeoutMs?: number;
+  /**
+   * Declare the worker dead if a SEED RPC goes unanswered this long. Default 120s; `0` disables.
+   *
+   * Distinct from `snapshotIdleTimeoutMs`, which watches the network and is deliberately down while a
+   * worker RPC is in flight. See {@link DEFAULT_WORKER_RPC_TIMEOUT_MS} — generous by design: it turns a
+   * WEDGED worker into a diagnosable error, and is not meant to police slow-but-progressing storage.
+   */
+  workerRpcTimeoutMs?: number;
 }
 
 /** Resolve `${base}/snapshot` preserving an absolute base's path (mirror of the reads' apiUrl). */
@@ -612,16 +640,15 @@ export class BrowserReplica {
      * converge at all. This restores what DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS already documents: "this
      * only fires when the server has genuinely stopped sending."
      *
-     * KNOWN GAP, deliberately not closed here: `call()` has no timeout of its own, so while this
-     * timer is down a worker that never replies is unbounded. That was never a designed bound — it
-     * was a side effect of measuring the wrong thing — and inventing an RPC deadline under review,
-     * one that could abort a commit about to succeed, is the more dangerous change to make against a
-     * release candidate. Filed separately.
+     * Taking the network timer down leaves the WORKER unbounded — `call()` has no deadline of its own
+     * — so the RPC gets its own, much longer bound instead (round 6). One number could not serve both:
+     * 30s of network silence means a dead server, while 30s inside a `seedCommit` can be honest work.
+     * See {@link DEFAULT_WORKER_RPC_TIMEOUT_MS}.
      */
     const seedCall = async (req: ReplicaRequest): Promise<unknown> => {
       clearIdle();
       try {
-        return await guardedCall(req);
+        return await this.withWorkerDeadline(req.type, guardedCall(req));
       } finally {
         // Back to waiting on the body — start a FRESH window rather than resuming a partly-spent one.
         armIdle();
@@ -796,6 +823,42 @@ export class BrowserReplica {
    * read pending forever, holding the origin's Web Lock — the single most likely first-integration
    * failure for a third party, presenting as an unbounded silent hang.
    */
+  /**
+   * Bound one in-flight worker RPC. On expiry the worker is declared DEAD, not merely slow.
+   *
+   * Tearing it down is the point (`failWorker` → `releaseResources`): a worker that has stopped
+   * answering is holding an open seed transaction with its `SeedReadGate` armed, and nothing else can
+   * settle either — the cleanup `seedAbort` is itself a worker message, so it would join the same
+   * queue of replies that are never coming. Releasing the worker also frees the origin-wide Web Lock
+   * and the OPFS handles, which would otherwise wedge every sibling tab into "secondary".
+   *
+   * Double-settle is harmless: failWorker() rejects the pending map entry too, so the underlying call
+   * rejects moments later against an already-settled promise.
+   */
+  private withWorkerDeadline<T>(label: string, call: Promise<T>): Promise<T> {
+    const ms = this.options.workerRpcTimeoutMs ?? DEFAULT_WORKER_RPC_TIMEOUT_MS;
+    if (ms <= 0) return call;
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const err = new Error(
+          `replica worker did not answer '${label}' within ${ms}ms — treating it as wedged`,
+        );
+        this.failWorker(err);
+        reject(err);
+      }, ms);
+      call.then(
+        (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        (e: unknown) => {
+          clearTimeout(timer);
+          reject(e instanceof Error ? e : new Error(String(e)));
+        },
+      );
+    });
+  }
+
   private failWorker(err: Error): void {
     if (this.workerError) return; // first cause wins; teardown is idempotent but the message is not
     this.workerError = err;

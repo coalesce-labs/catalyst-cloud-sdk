@@ -87,8 +87,18 @@ export interface DeltaQueueOptions {
    *
    * `reason` is a SECOND parameter rather than a changed first one so existing one-arg handlers keep
    * working unchanged.
+   *
+   * REQUIRED (CTC-114 review round 6). It was optional, and omitting it was silently terminal: an
+   * overflow latches `overflowed` permanently, empties the inbox, and makes every later `push()` a
+   * no-op — while `depth` reads 0 and no error is raised. This callback is the ONLY signal that the
+   * owner must re-seed and call `resume()`, so without it a `DeltaQueue` stops syncing forever with
+   * nothing to observe. `DeltaQueue` is publicly exported (`@catalyst-cloud/sdk/browser`), so that
+   * was a reachable third-party configuration, not a theoretical one. Made required rather than
+   * non-latching because the latch is load-bearing — dropping it would let a stale batch land on top
+   * of a fresh snapshot. Free to tighten now: `./browser` is new and unpublished in 0.8.0, so there
+   * is no install base to break.
    */
-  onOverflow?: (depth: number, reason: OverflowReason) => void;
+  onOverflow: (depth: number, reason: OverflowReason) => void;
   maxBatch?: number;
   maxDepth?: number;
   maxApplyRetries?: number;
@@ -122,6 +132,18 @@ export class DeltaQueue {
         `DeltaQueue: maxBatch must be a positive integer (got ${String(opts.maxBatch)})`,
       );
     }
+    // Same reasoning, at RUNTIME, for the same reason (CTC-114 review round 6): the type now requires
+    // `onOverflow`, but an untyped-JS consumer of the public export gets no help from that — which is
+    // exactly the case the maxBatch guard above exists for. Omitting it is silently TERMINAL: the
+    // first overflow latches the queue, empties the inbox, and turns every later push() into a no-op,
+    // while `depth` reads 0 and nothing is raised. This callback is the only signal that the owner
+    // must re-seed and call resume(), so failing at construction beats syncing forever-nothing.
+    if (typeof opts.onOverflow !== "function") {
+      throw new Error(
+        "DeltaQueue: onOverflow is required — it is the ONLY signal that the queue has latched and " +
+          "the owner must re-seed and call resume(); without it an overflow stops syncing silently.",
+      );
+    }
     this.maxDepth = opts.maxDepth ?? MAX_INBOX_DEPTH;
     this.maxApplyRetries = opts.maxApplyRetries ?? MAX_APPLY_RETRIES;
     this.retryDelayMs = opts.retryDelayMs ?? APPLY_RETRY_DELAY_MS;
@@ -143,7 +165,7 @@ export class DeltaQueue {
       const depth = this.inbox.length;
       this.inbox.length = 0;
       this.clearRetry();
-      this.notify("onOverflow", () => this.opts.onOverflow?.(depth, "depth"));
+      this.notify("onOverflow", () => this.opts.onOverflow(depth, "depth"));
       return;
     }
     void this.drain();
@@ -261,7 +283,7 @@ export class DeltaQueue {
           const depth = this.inbox.length;
           this.inbox.length = 0;
           this.clearRetry();
-          this.notify("onOverflow", () => this.opts.onOverflow?.(depth, "apply-failed"));
+          this.notify("onOverflow", () => this.opts.onOverflow(depth, "apply-failed"));
         } else {
           this.scheduleRetry();
         }

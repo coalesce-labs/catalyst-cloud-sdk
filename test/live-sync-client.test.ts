@@ -365,6 +365,51 @@ describe("requestResync() — the consumer-driven resync entry point (CTC-114 re
     client.stop();
   });
 
+  it("does not race the boot when telemetry resolution suspends it", async () => {
+    // CTC-114 review round 6 — the hole in round 5's fix. `started` is set at the TOP of start(), but
+    // `createTelemetry()` is awaited BEFORE the cold-seed latch, so with telemetry enabled the boot
+    // suspends in a window where `started` is already true and `resyncing` is not yet set. A
+    // requestResync() landing there passed both guards and began a second concurrent reseed; both
+    // paths then called openSocket(), and since that overwrites `this.ws` the first socket was
+    // orphaned — still delivering duplicate frames, unreachable by stop(). The latch now covers the
+    // whole boot body, telemetry included.
+    const store = makeStore(null); // cursorless → the boot also cold-seeds
+    const { sockets, factory } = recordingFactory();
+    let seeds = 0;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        seeds += 1;
+        store.setCursor(12);
+        return 12;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      // ENABLED so `createTelemetry()` takes its `await loadOtelApi()` arm — the real suspension the
+      // finding names. (The optional peer is absent here, so it warns and resolves NOOP; what matters
+      // is that the boot genuinely parks at that await.)
+      telemetry: true,
+    });
+
+    void client.start();
+    // SYNCHRONOUS, in the same tick: the boot body has run up to the telemetry await and parked, so
+    // `started` is true while the cold seed — and the latch round 4 put on it — has not been reached.
+    // handleResync()'s guard is evaluated synchronously too, so this lands squarely in the window.
+    const pending = client.requestResync();
+    expect(seeds).toBe(0);
+    expect(sockets).toHaveLength(0);
+
+    await pending;
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    // ONE seed, ONE socket: no second reseed, and no orphaned socket left behind.
+    expect(seeds).toBe(1);
+    expect(sockets).toHaveLength(1);
+    client.stop();
+  });
+
   it("never rejects when the re-seed fails", async () => {
     const { sockets, factory } = recordingFactory();
     const client = new LiveSyncClient({

@@ -490,47 +490,56 @@ export class LiveSyncClient {
       this.resolveDone = resolve;
     });
     const boot = (async () => {
-      // Resolve the OTel seam ONCE up front (before the first reseed, so the seed span exists on the
-      // cold-start path too). Keep the OFF path FULLY SYNCHRONOUS — no `await`, so a caller that opens
-      // the socket and inspects it in the same tick still sees it (the boot body runs synchronously up
-      // to its first await); only pay the async resolution (guarded dynamic import, or a
-      // CatalystReplica passing its already-resolved instance) when telemetry is on.
-      this.telemetry =
-        this.telemetryConfig === undefined || this.telemetryConfig === false
-          ? NOOP_TELEMETRY
-          : await createTelemetry(this.telemetryConfig, {
-              tracerName: DEFAULT_SCOPE_NAME,
-              meterName: DEFAULT_SCOPE_NAME,
-            });
-      this.gapCounter = this.telemetry.counter(REPLICA_METRIC.gaps, {
-        description: "Change-feed seq-gap lifecycle events (detected/healed/escalated).",
-        unit: "{gap}",
-      });
-      const saved = this.getCursor();
-      if (saved == null) {
-        this.setStatus("resyncing");
-        // Mark the COLD SEED as an in-flight resync, not just a status string (CTC-114 review round 4).
-        // `requestResync()` — public as of 0.8.0 — is callable the moment start() returns its promise,
-        // which is BEFORE this await settles. With only the status set, `handleResync()`'s `resyncing`
-        // re-entrancy guard read false and began a SECOND concurrent reseed: two seeds interleaving
-        // writes through a non-reentrant consumer callback, then each completion calling openSocket()
-        // — the second socket opened without the first being closed.
-        //
-        // Until this release the invariant held for free: a resync could only be driven by a server
-        // frame, and a frame requires a socket, which does not exist until openSocket() below. The new
-        // public entry point needs no socket, so the guard has to be set explicitly. Dropping the
-        // concurrent request is the correct answer, not queueing it — this seed IS a full re-seed from
-        // /snapshot, which is exactly what the caller is asking for.
-        this.resyncing = true;
-        try {
+      // The WHOLE boot is an in-flight resync, not just the cold seed (CTC-114 review rounds 4 + 6).
+      //
+      // `requestResync()` — public as of 0.8.0 — is callable the moment start() returns its promise,
+      // which is before ANY of this settles. Without the latch, `handleResync()`'s re-entrancy guard
+      // read false and started a SECOND concurrent reseed: two seeds interleaving writes through a
+      // non-reentrant consumer callback, then each completion calling openSocket() — and since
+      // openSocket() overwrites `this.ws`, the first socket was orphaned, still delivering duplicate
+      // frames and unreachable by stop().
+      //
+      // Round 4 latched only the cold seed. That was not enough: `createTelemetry()` below is awaited
+      // BEFORE the seed, so with telemetry enabled the boot suspends in a window where `started` is
+      // already true and the latch is not yet set. The latch therefore has to cover the entire body.
+      //
+      // Until this release the invariant held for free — a resync could only be driven by a server
+      // frame, and a frame needs a socket, which does not exist until openSocket() below.
+      //
+      // ABSORBING the request (rather than queueing it) is right on both arms. Cold: this boot IS a
+      // full re-seed from /snapshot, exactly what the caller wants. Warm: the boot opens with
+      // `{type:"sync", after:<cursor>}`, which is itself the catch-up mechanism — and if the server
+      // can no longer serve that range it answers `{type:"resync"}` and we reseed anyway. So a resync
+      // requested here is at worst a heavier version of what the boot already does.
+      this.resyncing = true;
+      try {
+        // Resolve the OTel seam ONCE up front (before the first reseed, so the seed span exists on the
+        // cold-start path too). Keep the OFF path FULLY SYNCHRONOUS — no `await`, so a caller that opens
+        // the socket and inspects it in the same tick still sees it (the boot body runs synchronously up
+        // to its first await); only pay the async resolution (guarded dynamic import, or a
+        // CatalystReplica passing its already-resolved instance) when telemetry is on.
+        this.telemetry =
+          this.telemetryConfig === undefined || this.telemetryConfig === false
+            ? NOOP_TELEMETRY
+            : await createTelemetry(this.telemetryConfig, {
+                tracerName: DEFAULT_SCOPE_NAME,
+                meterName: DEFAULT_SCOPE_NAME,
+              });
+        this.gapCounter = this.telemetry.counter(REPLICA_METRIC.gaps, {
+          description: "Change-feed seq-gap lifecycle events (detected/healed/escalated).",
+          unit: "{gap}",
+        });
+        const saved = this.getCursor();
+        if (saved == null) {
+          this.setStatus("resyncing");
           // Bounded like the resync-path reseed (CTC-281): a hanging COLD seed surfaces as a start()
           // rejection (the boot arm rejects) instead of a silent forever-"resyncing" start().
           await this.boundedReseed();
-        } finally {
-          // Must clear on the FAILURE arm too, or a failed cold seed latches the client into a state
-          // where every later resync — and scheduleReconnect — is suppressed forever.
-          this.resyncing = false;
         }
+      } finally {
+        // Must clear on the FAILURE arm too, or a failed boot latches the client into a state where
+        // every later resync — and scheduleReconnect — is suppressed forever.
+        this.resyncing = false;
       }
       this.openSocket();
     })();
