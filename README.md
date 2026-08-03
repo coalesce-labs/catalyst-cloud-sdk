@@ -138,13 +138,19 @@ apply, or seeding code in your app.
 import {
   BrowserReplica,
   isBrowserReplicaSupported,
+  type ReplicaStatus,
 } from "@catalyst-cloud/sdk/browser";
+
+let status: ReplicaStatus = "loading";
 
 if (isBrowserReplicaSupported()) {
   const replica = new BrowserReplica(
     {
       onChanged: () => void refreshList(), // after the seed and after every applied delta drain
-      onStatus: (s) => setBadge(s), // "loading" | "live" | "reconnecting" | "error" | "secondary" | …
+      onStatus: (s) => {
+        status = s; // "loading" | "live" | "reconnecting" | "error" | "secondary" | …
+        setBadge(s);
+      },
     },
     {
       baseUrl: "/api/v1", // same-origin, cookie-authed; accountId optional
@@ -156,12 +162,22 @@ if (isBrowserReplicaSupported()) {
       identity: session.user.id,
     },
   );
-  void replica.start(); // resolves once seeded (or immediately with status "secondary")
+  // AWAIT it. start() suspends on the Web Lock before the worker exists, so a query issued against a
+  // not-yet-started replica rejects with "replica client closed".
+  await replica.start(); // resolves once seeded — or immediately, with status "secondary"
 
-  const rows = await replica.queryIssues(); // read-model IssueView[], served locally
+  // Another tab already owns the origin's replica. That is a normal outcome, not an error: this tab
+  // should read via its usual fetch path and leave the local DB alone.
+  if (status !== "secondary") {
+    const rows = await replica.queryIssues(); // read-model IssueView[], served locally
+  }
   // replica.close() on teardown — cooperatively releases the OPFS handles, then terminates the worker
 }
 ```
+
+`status` above is whatever your `onStatus` handler last recorded. `start()` REJECTS if the boot fails
+(bad origin, missing worker chunk, OPFS unavailable) — it does not resolve into a broken state, so a
+`try`/`catch` around it is where you surface the error to the user.
 
 Built in, because browsers need them:
 

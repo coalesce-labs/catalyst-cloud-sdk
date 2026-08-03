@@ -152,6 +152,12 @@ export class DeltaQueue {
   /** Clear the overflow latch so the queue accepts deltas again (after the owner's re-seed lands). */
   resume(): void {
     if (this.stopped) return;
+    // Anything still buffered here is PRE-RESEED work by definition — while `overflowed` is latched
+    // push() refuses every frame, so nothing new can have arrived — and the snapshot supersedes it.
+    // Dropping it is the same reasoning the overflow paths already apply to the backlog they discard;
+    // resuming without it would let a stale batch be applied on top of the fresh DB by the next live
+    // push, where an old delete removes a row the snapshot legitimately has.
+    this.inbox.length = 0;
     this.overflowed = false;
     // The re-seed supersedes whatever could not be applied, so the failure streak starts over.
     this.applyFailures = 0;
@@ -207,6 +213,16 @@ export class DeltaQueue {
       } catch (err) {
         this.draining = false;
         if (this.stopped) return;
+        // A DEPTH overflow can latch WHILE this apply is in flight: push() cleared the inbox and the
+        // owner is already re-seeding. Requeueing here would resurrect work the incoming snapshot
+        // supersedes — and since scheduleRetry() is inert while overflowed, the batch would simply sit
+        // in the inbox until the next live push drained it ON TOP of the fresh DB, where an old delete
+        // removes a row the snapshot legitimately has. Drop it, and do not escalate again: the owner
+        // has already been told to re-seed.
+        if (this.overflowed) {
+          this.opts.onError(err);
+          return;
+        }
         // Back at the FRONT: these seqs are strictly older than anything still queued behind them,
         // and the worker applies in order.
         this.inbox.unshift(...batch);

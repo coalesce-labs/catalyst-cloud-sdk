@@ -325,4 +325,86 @@ describe("DeltaQueue — bounded retention (CTC-318)", () => {
     expect(() => new DeltaQueue({ ...base, maxBatch: 1 })).not.toThrow();
     expect(() => new DeltaQueue({ ...base })).not.toThrow();
   });
+  it("drops an in-flight batch whose apply rejects AFTER a depth overflow latched", async () => {
+    // The exact interleaving (CTC-114 review): apply(batch) is in flight when push() crosses maxDepth.
+    // push() clears the inbox, latches `overflowed`, and the owner starts a replacement snapshot. THEN
+    // the in-flight apply rejects. Requeueing that batch resurrects pre-snapshot work — and because
+    // scheduleRetry() is inert while overflowed, it simply waits in the inbox until the next live push
+    // drains it ON TOP of the fresh DB, where an old delete removes a row the snapshot legitimately has.
+    const onOverflow = vi.fn();
+    const onError = vi.fn();
+    const applied: SeqChange[][] = [];
+    let rejectFirst: ((e: Error) => void) | null = null;
+    let call = 0;
+    const apply = (changes: SeqChange[]): Promise<{ cursor: number }> => {
+      call += 1;
+      applied.push(changes);
+      if (call === 1) {
+        return new Promise((_resolve, reject) => {
+          rejectFirst = reject;
+        });
+      }
+      return Promise.resolve({ cursor: changes[changes.length - 1]?.seq ?? 0 });
+    };
+
+    const q = new DeltaQueue({
+      apply,
+      onDrained: vi.fn(),
+      onError,
+      onOverflow,
+      maxBatch: 1,
+      maxDepth: 3,
+    });
+
+    q.push(change(1)); // starts the (parked) apply of [1]
+    await Promise.resolve();
+    expect(applied[0]?.map((c) => c.seq)).toEqual([1]);
+
+    // Overflow WHILE that apply is still in flight.
+    for (let i = 2; i <= 6; i++) q.push(change(i));
+    expect(onOverflow).toHaveBeenCalledTimes(1);
+    expect(onOverflow.mock.calls[0]?.[1]).toBe("depth");
+
+    // Now the in-flight apply fails.
+    rejectFirst!(new Error("SQLITE_IOERR"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    // It must NOT be sitting in the inbox waiting to be replayed over the snapshot.
+    expect(q.depth).toBe(0);
+    expect(onError).toHaveBeenCalledTimes(1);
+    // And it must not have re-escalated — the owner is already re-seeding.
+    expect(onOverflow).toHaveBeenCalledTimes(1);
+
+    // After the owner's reseed lands, only POST-reseed frames may reach the worker.
+    q.resume();
+    q.push(change(7));
+    await new Promise((r) => setTimeout(r, 0));
+    const seqsAfter = applied.slice(1).flat().map((c) => c.seq);
+    expect(seqsAfter).toEqual([7]);
+    expect(seqsAfter).not.toContain(1);
+  });
+
+  it("resume() discards anything still buffered from before the reseed", async () => {
+    // Belt-and-braces on the same invariant, asserted at the resume() boundary rather than the catch.
+    const { apply, batches, releases } = deferredApply();
+    const q = new DeltaQueue({
+      apply,
+      onDrained: vi.fn(),
+      onError: vi.fn(),
+      onOverflow: vi.fn(),
+      maxBatch: 1,
+      maxDepth: 100,
+    });
+    q.push(change(1));
+    await Promise.resolve();
+    q.push(change(2)); // queued behind the in-flight apply of [1]
+    expect(q.depth).toBe(1);
+
+    q.resume(); // the owner re-seeded — everything buffered is superseded
+    expect(q.depth).toBe(0);
+
+    releases[0]?.();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(batches.slice(1).flat().map((c) => c.seq)).not.toContain(2);
+  });
 });
