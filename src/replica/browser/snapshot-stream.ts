@@ -49,6 +49,10 @@ function isCursorLine(o: SnapshotDataLine | SnapshotCursorLine): o is SnapshotCu
 export async function* streamSnapshotBatches(
   body: ReadableStream<Uint8Array>,
   batchSize: number = SEED_BATCH_ROWS,
+  /** Fired after every non-terminal `read()` — i.e. whenever the body actually delivered bytes. The
+   *  seed's idle timeout re-arms on this, which is what distinguishes a slow-but-live ~100 MB snapshot
+   *  from a stalled one. Optional, so every existing caller compiles unchanged. */
+  onChunk?: () => void,
 ): AsyncGenerator<SnapshotItem> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -81,6 +85,7 @@ export async function* streamSnapshotBatches(
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      onChunk?.();
       buf += decoder.decode(value, { stream: true });
       let nl: number;
       while ((nl = buf.indexOf("\n")) >= 0) {
