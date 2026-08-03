@@ -4,23 +4,22 @@
 // builds, and still passes every unit test, while the published package resolves to a path that does
 // not exist. The failure only surfaces in a consumer's bundler, after publish, on a specifier that is
 // frozen the moment it ships. These assertions are that missing check.
+//
+// Deliberately uses only `node:fs` and cwd-relative paths: this repo typechecks with `types: []` and
+// no `@types/node`, so `node:path` / `node:url` do not resolve here (`node:fs` does, via the driver
+// shims). Vitest runs with the package root as cwd, which is the only base these paths need.
 
 import { describe, it, expect } from "vitest";
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
-import pkg from "../package.json" with { type: "json" };
-
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+import * as fs from "node:fs";
+import pkg from "../package.json";
 
 /** `./dist/replica/browser/db.worker.js` → the `src/**.ts` that compiles to it. Mirrors
  *  tsconfig.build.json's `rootDir: "src"` / `outDir: "dist"`. */
 function distTargetToSource(target: string): string {
-  const rel = target
-    .replace(/^\.\/dist\//, "")
+  return target
+    .replace(/^\.\/dist\//, "src/")
     .replace(/\.d\.ts$/, ".ts")
     .replace(/\.js$/, ".ts");
-  return resolve(repoRoot, "src", rel);
 }
 
 type ConditionMap = Record<string, string>;
@@ -42,7 +41,7 @@ describe("package exports map", () => {
     for (const [subpath, conditions] of Object.entries(exportsMap)) {
       for (const [condition, target] of Object.entries(conditions)) {
         const source = distTargetToSource(target);
-        if (!existsSync(source)) {
+        if (!fs.existsSync(source)) {
           dangling.push(`${subpath} [${condition}] → ${target} (no ${source})`);
         }
       }
