@@ -422,11 +422,16 @@ describe("CatalystReplica apply-result telemetry (CTL-1402)", () => {
     );
   });
 
-  it("emits result:failed with the untruncated err_message when applyDelta throws", async () => {
+  it("emits result:skipped (not failed) for an unknown entity — CTC-393 (@catalyst-cloud/replicate ≥0.1.4)", async () => {
+    // Historically an unknown entity made applyDelta THROW, and this test asserted the resulting
+    // result:failed telemetry. CTC-393 (packages/replicate/src/replicate.ts, "⛔ CTC-393 — NEVER
+    // THROWS") deliberately changed that: a throw here propagates out of the SAME engine.transaction()
+    // callback that also calls setCursor, rolling the transaction back and wedging the replica's cursor
+    // behind that seq forever (a new entity type rolling out to a fleet that upgrades independently).
+    // An unknown entity now returns `false` — nothing written, cursor still advances — which this
+    // replica surfaces as result:skipped, same as any other no-op apply.
     const logs: LogLine[] = [];
     const { socket } = await liveReplica(logs);
-    // An unknown entity makes applyDelta throw → the catch records result:failed + the error message
-    // (the untruncated string the #127 column-drift investigation needs).
     socket.deliver({
       type: "change",
       accountId: "tenant-0",
@@ -436,9 +441,11 @@ describe("CatalystReplica apply-result telemetry (CTL-1402)", () => {
       op: "upsert",
       row: { id: "x" },
     });
-    const failed = applyLines(logs).find((l) => l["result"] === "failed");
-    expect(failed).toMatchObject({ level: "error", result: "failed", seq: 1, entity: "not_a_table" });
-    expect(String(failed!["err_message"])).toContain("unknown entity");
+    const lines = applyLines(logs);
+    expect(lines).toContainEqual(
+      expect.objectContaining({ result: "skipped", seq: 1, entity: "not_a_table" }),
+    );
+    expect(lines.find((l) => l["result"] === "failed")).toBeUndefined();
   });
 });
 
