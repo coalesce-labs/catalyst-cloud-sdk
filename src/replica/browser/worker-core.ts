@@ -124,7 +124,9 @@ export function createWorkerCore(open: ReplicaOpener): WorkerCore {
         const r = requireReplica();
         session = new SeedSession(r.write, {
           truncate: truncateReplica,
-          apply: applyChange,
+          // CTC-603: PRAGMA-derived knownColumns for the batch row's own entity, looked up per row —
+          // see OpenedReplica.knownColumnsByEntity's doc.
+          apply: (db, rec) => applyChange(db, rec, r.knownColumnsByEntity.get(rec.entity)),
           setCursor,
         });
         session.begin();
@@ -174,7 +176,8 @@ export function createWorkerCore(open: ReplicaOpener): WorkerCore {
             // catches a duplicate that repeats WITHIN one batch: the transport delivers in arrival
             // order, so an oldie always trails the original it duplicates.
             if (rec.seq <= maxSeq) continue;
-            if (applyChange(r.write, rec)) applied++;
+            // CTC-603: PRAGMA-derived knownColumns for this delta's own entity.
+            if (applyChange(r.write, rec, r.knownColumnsByEntity.get(rec.entity))) applied++;
             maxSeq = rec.seq;
           }
           // Advance to the max seq SEEN (not just applied) — a window of all-stale deltas still moves
