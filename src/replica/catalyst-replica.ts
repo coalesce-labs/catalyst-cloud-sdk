@@ -97,6 +97,41 @@ const SYNC_META_DDL = `CREATE TABLE IF NOT EXISTS sync_meta (
 const ACCOUNT_KEY = "account";
 
 /**
+ * `sync_meta` key recording HOW the stamped account was arrived at (CTC-582 review, CTL).
+ *
+ * ⛔ THE STAMP WITHOUT THIS IS A TRAP, AND IT WAS MEASURED ON THE LIVE FLEET. The host's
+ * `cloud-sync.mjs` resolves `process.env.CATALYST_CLOUD_ACCOUNT || "tenant-0"` — env-only, it never
+ * consults config — and that variable is unset on every host. So the first open under a
+ * stamp-unconditionally build would have written `tenant-0` on 100% of the fleet: a value NOBODY
+ * DECLARED. The damage lands later, when a host legitimately becomes `tenant-3` and the fence refuses
+ * it from its OWN replica on the strength of an assertion no human or config ever made.
+ *
+ * ⭐ That is the defect this whole ticket is about, turned on itself: something meaning "nobody said"
+ * recorded as if it meant "somebody said this". A stamp that cannot express its own confidence is not
+ * a fence, it is a trap that happens to be pointed the right way today.
+ */
+const ACCOUNT_SOURCE_KEY = "account_source";
+
+/**
+ * How confident the caller is that `account` is the account this replica should hold.
+ *
+ * `"declared"` — a human, a config file, or an explicit environment variable named it.
+ * `"default"`  — nothing named it; the caller fell back to a built-in.
+ */
+export type AccountSource = "declared" | "default";
+
+/**
+ * ⚠️ ABSENT MEANS `"default"`, NOT `"declared"` — the safe direction on omission.
+ *
+ * A caller that genuinely declared its account but forgets this option gets the WEAKER fence (a
+ * mismatch re-seeds instead of refusing): a lost opportunity to catch a misconfiguration loudly, but
+ * never wrong data. The opposite default converts every silent fallback in every existing caller into
+ * a permanent assertion — which is exactly the fleet-wide trap described above. When one direction
+ * costs strictness and the other costs correctness, omission must land on the first.
+ */
+const DEFAULT_ACCOUNT_SOURCE: AccountSource = "default";
+
+/**
  * Thrown when a replica file already belongs to a DIFFERENT account than the one configured.
  *
  * Its own class, not a bare Error: a caller (host-sync, a supervisor) must be able to tell "you are
@@ -108,11 +143,18 @@ export class ReplicaAccountMismatchError extends Error {
     readonly dbPath: string,
     readonly storedAccount: string,
     readonly configuredAccount: string,
+    /** How the STORED account got there — `declared` (someone asserted it) or `default` (nobody did).
+     *  A caller needs this to tell "you are pointed at another tenant's replica" from "two builds
+     *  disagree about the fallback account", which have different remedies. */
+    readonly storedAccountSource: AccountSource = "declared",
   ) {
     super(
-      `CatalystReplica: refusing to open ${dbPath} — it holds account "${storedAccount}", ` +
-        `but this writer is configured for "${configuredAccount}". ` +
-        `Check CATALYST_REPLICA_DB and the account this process was started for. ` +
+      `CatalystReplica: refusing to open ${dbPath} — it holds account "${storedAccount}" ` +
+        `(${storedAccountSource}), but this writer is configured for "${configuredAccount}". ` +
+        (storedAccountSource === "default"
+          ? `Neither account was declared, so nothing can be safely preferred — set ` +
+            `CATALYST_CLOUD_ACCOUNT (or the config equivalent) to say which is right. `
+          : `Check CATALYST_REPLICA_DB and the account this process was started for. `) +
         `Nothing was written and the existing replica was left intact.`,
     );
     this.name = "ReplicaAccountMismatchError";
@@ -126,14 +168,24 @@ export class ReplicaAccountMismatchError extends Error {
  * genuinely absent and a bare SELECT would throw. Probing `sqlite_master` first keeps "no table yet"
  * an ordinary answer instead of an exception that a `catch` would have to guess the meaning of.
  */
-function readAccountStamp(engine: ReplicaEngine): string | null {
+function readAccountStamp(
+  engine: ReplicaEngine,
+): { account: string; source: AccountSource } | null {
   const table = engine.get(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sync_meta'",
   );
   if (table == null) return null;
-  const row = engine.get("SELECT value FROM sync_meta WHERE key = ?", ACCOUNT_KEY as never);
-  const v = row?.value;
-  return typeof v === "string" && v !== "" ? v : null;
+  const read = (key: string): string | null => {
+    const row = engine.get("SELECT value FROM sync_meta WHERE key = ?", key as never);
+    const v = row?.value;
+    return typeof v === "string" && v !== "" ? v : null;
+  };
+  const account = read(ACCOUNT_KEY);
+  if (account == null) return null;
+  // ⚠️ A stamp with no source is one written by 0.8.7 before this review landed (unpublished, but a
+  // dev machine may hold one). Read it as `default` — the weaker claim — because we cannot know it
+  // was declared, and reading an unknown as the stronger claim is the very mistake being fixed.
+  return { account, source: read(ACCOUNT_SOURCE_KEY) === "declared" ? "declared" : "default" };
 }
 
 /** Rows per streamed seed transaction — bounds memory + fsync so a large tenant never OOMs the node/bun
@@ -153,6 +205,23 @@ export interface CatalystReplicaOptions {
   baseUrl: string;
   /** Tenant id = mirror name → `?account=` on every feed request. */
   account: string;
+  /**
+   * CTC-582 — whether `account` above was DECLARED (a human, a config file, or an explicit env var
+   * named it) or merely DEFAULTED (nothing named it; you fell back to a built-in).
+   *
+   * ⛔ SET THIS TO `"declared"` ONLY WHEN IT IS TRUE. It is what licenses the account fence to REFUSE,
+   * and a refusal on a value nobody chose holds a host to a fallback it never agreed to. Measured on
+   * the live fleet during review: `cloud-sync.mjs` resolves
+   * `process.env.CATALYST_CLOUD_ACCOUNT || "tenant-0"` — env-only, never consulting config — and that
+   * variable is unset everywhere, so an unconditional stamp would have written `tenant-0` on 100% of
+   * hosts as though someone had asked for it.
+   *
+   * ⚠️ Omitted means `"default"`, the SAFE direction: a caller who really did declare but forgot this
+   * flag gets a weaker fence (a mismatch re-seeds instead of refusing), which costs strictness. The
+   * opposite default would convert every silent fallback in every existing caller into a permanent
+   * assertion, which costs correctness.
+   */
+  accountSource?: AccountSource;
   /** How to authorize: {kind:'token',token} (host bearer rides /connect as ?token= and /snapshot as
    *  Authorization) | {kind:'cookie'} (same-origin session cookie). */
   auth: AuthStrategy;
@@ -428,20 +497,51 @@ export class CatalystReplica {
     // earlier and more legibly, using only host-local information. This one catches what no amount of
     // host-local config checking can see — TWO DIFFERENT HOSTS sharing ONE file, each correctly
     // configured on its own terms. Only the database knows whose data it holds.
-    const storedAccount = readAccountStamp(engine);
-    if (storedAccount != null && storedAccount !== this.opts.account) {
+    // THE DECISION IS MADE HERE, IN FULL, AND WRITES NOTHING. Only its *consequences* are applied
+    // after the migrations below — because every refusal must leave the file byte-identical, and
+    // migrations write. Deciding in one place also keeps the four outcomes legible side by side
+    // instead of split across the migration boundary.
+    const stored = readAccountStamp(engine);
+    const mySource: AccountSource = this.opts.accountSource ?? DEFAULT_ACCOUNT_SOURCE;
+
+    /**
+     * `stamp`   — no stamp yet: adopt this file.
+     * `keep`    — already ours; nothing to do (or only a `default` → `declared` upgrade).
+     * `reseed`  — the stamp is a DEFAULT that disagrees with a DECLARED account: a legitimate
+     *             transition, so wipe and cold-seed rather than rename or refuse.
+     * `refuse`  — either a DECLARED stamp disagrees (someone asserted this file is another
+     *             tenant's), or two DEFAULTS disagree (nobody asserted anything, so nothing
+     *             licenses deleting either).
+     */
+    const verdict: "stamp" | "keep" | "reseed" | "refuse" =
+      stored == null
+        ? "stamp"
+        : stored.account === this.opts.account
+          ? "keep"
+          : stored.source === "declared" || mySource !== "declared"
+            ? "refuse"
+            : "reseed";
+
+    if (verdict === "refuse") {
       // Give the file back untouched: drop the handle and the lock before throwing, so a supervisor
       // that restarts us doesn't leave a stale lock sitting on another tenant's replica.
       this.log("error", "replica account mismatch — refusing to open", {
         dbPath: this.opts.dbPath,
-        storedAccount,
+        storedAccount: stored!.account,
+        storedSource: stored!.source,
         configuredAccount: this.opts.account,
+        configuredSource: mySource,
       });
       engine.close();
       this.engine = null;
       this.writerLock?.release();
       this.writerLock = null;
-      throw new ReplicaAccountMismatchError(this.opts.dbPath, storedAccount, this.opts.account);
+      throw new ReplicaAccountMismatchError(
+        this.opts.dbPath,
+        stored!.account,
+        this.opts.account,
+        stored!.source,
+      );
     }
 
     this.writeDb = {
@@ -487,20 +587,68 @@ export class CatalystReplica {
     // unstamped file. A pre-existing replica sitting at a wrong path is adopted, not caught. The
     // fence protects everything from its first stamp onward; it cannot audit the past. CTL's
     // host-side path guard is what covers that case.
-    if (storedAccount == null) {
+    const writeStamp = (): void => {
       engine.run(
         "INSERT INTO sync_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         ACCOUNT_KEY as never,
         this.opts.account as never,
       );
+      engine.run(
+        "INSERT INTO sync_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ACCOUNT_SOURCE_KEY as never,
+        mySource as never,
+      );
+    };
+
+    if (verdict === "stamp") {
+      writeStamp();
       // Loud only when adopting a WARM replica — a cold file being stamped is the ordinary first boot
       // and does not deserve a line in the log every time.
       if (getCursor(this.writeDb) != null) {
         this.log("info", "adopting an unstamped replica — stamping it with this account", {
           dbPath: this.opts.dbPath,
           account: this.opts.account,
+          accountSource: mySource,
         });
       }
+    } else if (verdict === "keep") {
+      // Upgrade `default` → `declared` when the caller now names the account: a declaration CONFIRMS
+      // what was previously only a fallback, and from here the fence may refuse on it. Never
+      // downgrade — a declaration already made is not unmade by a later caller that forgot to say.
+      if (stored!.source === "default" && mySource === "declared") writeStamp();
+    } else {
+      // ── verdict === "reseed": a DEFAULT stamp yielding to a DECLARED account. ────────────────────
+      //
+      // Nobody ever asserted the stored value, so refusing would hold this host to a fallback it never
+      // agreed to — the fleet-wide trap `ACCOUNT_SOURCE_KEY` exists to prevent.
+      //
+      // ⛔ BUT RE-LABELLING ALONE WOULD BE WORSE THAN EITHER. The rows in this file were fetched for
+      // the STORED account; stamping the new name over them would leave real data from account A under
+      // a stamp that says B — a mislabelled replica every later check believes. CTL's review proposed
+      // "a declared value may overwrite a defaulted one exactly once", which is right about the STAMP;
+      // this is the part that makes it safe about the DATA. The transition is a wipe, not a rename.
+      //
+      // ⚠️ THIS IS THE ONLY PATH THAT DELETES ROWS, AND ITS LICENCE IS PROVENANCE — we know nobody
+      // claimed them. A `declared` mismatch still REFUSES rather than wiping, because there the rows
+      // may be another tenant's genuine replica; and two disagreeing DEFAULTS refuse too, because
+      // nothing licenses preferring either.
+      //
+      // ONE transaction, so a crash mid-wipe can never leave rows from A under a stamp saying B — the
+      // same reason the browser fence wraps its wipe (browser/worker-core.ts).
+      this.log(
+        "warn",
+        "replica was stamped from a DEFAULTED account and this one is declared — re-seeding it",
+        {
+          dbPath: this.opts.dbPath,
+          storedAccount: stored!.account,
+          configuredAccount: this.opts.account,
+        },
+      );
+      engine.transaction(() => {
+        truncateReplica(this.writeDb as never);
+        engine.run("DELETE FROM sync_meta WHERE key = 'cursor'");
+        writeStamp();
+      });
     }
 
     // CTC-603: build the PRAGMA-derived known-columns map from the table shape migrations just

@@ -61,6 +61,22 @@ function recordingFactory(): { sockets: FakeWebSocket[]; factory: WebSocketFacto
   };
   return { sockets, factory };
 }
+/** A snapshot carrying ONE issue row, so a re-seed's WIPE is observable as a row count. */
+function seededSnapshotFetch(id = "i1", cursor = 7): typeof fetch {
+  const body =
+    JSON.stringify({
+      accountId: "tenant-0",
+      entity: "issues",
+      op: "upsert",
+      row: { id, identifier: `CTC-${id}`, title: "Hello", state: "Todo", updated_at: 100 },
+    }) +
+    "\n" +
+    JSON.stringify({ accountId: "tenant-0", cursor }) +
+    "\n";
+  return (async () =>
+    ({ ok: true, status: 200, text: async () => body }) as unknown as Response) as unknown as typeof fetch;
+}
+
 function emptySnapshotFetch(): typeof fetch {
   return (async () =>
     ({
@@ -74,15 +90,18 @@ const replicas: CatalystReplica[] = [];
 function newWriter(
   dbPath: string,
   account: string,
+  accountSource?: "declared" | "default",
+  fetchImpl: typeof fetch = seededSnapshotFetch(),
 ): { replica: CatalystReplica; sockets: FakeWebSocket[] } {
   const { sockets, factory } = recordingFactory();
   const replica = new CatalystReplica({
     baseUrl: BASE,
     account,
+    accountSource,
     auth: { kind: "cookie" },
     dbPath,
     engine: nodeSqliteEngine,
-    fetchImpl: emptySnapshotFetch(),
+    fetchImpl,
     wsFactory: factory,
   });
   replicas.push(replica);
@@ -96,6 +115,53 @@ async function startToLive(replica: CatalystReplica, sockets: FakeWebSocket[]): 
 }
 
 /** Read the file directly — the assertion must not go through the code under test. */
+function readSource(dbPath: string): string | null {
+  const db = new DatabaseSync(dbPath);
+  try {
+    const row = db
+      .prepare("SELECT value FROM sync_meta WHERE key = 'account_source'")
+      .get() as { value?: string } | undefined;
+    return typeof row?.value === "string" ? row.value : null;
+  } finally {
+    db.close();
+  }
+}
+
+/** The persisted change-feed cursor, read straight from the file. */
+function readCursor(dbPath: string): string | null {
+  const db = new DatabaseSync(dbPath);
+  try {
+    const row = db.prepare("SELECT value FROM sync_meta WHERE key = 'cursor'").get() as
+      | { value?: string }
+      | undefined;
+    return typeof row?.value === "string" ? row.value : null;
+  } finally {
+    db.close();
+  }
+}
+
+/** Every issue id at rest — the wipe-vs-rename question answered by CONTENT. */
+function issueIds(dbPath: string): string[] {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return (db.prepare("SELECT id FROM issues ORDER BY id").all() as { id: string }[]).map(
+      (r) => r.id,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+/** Row count for one entity table, to prove a re-seed actually wiped. */
+function issueCount(dbPath: string): number {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return (db.prepare("SELECT count(*) AS n FROM issues").get() as { n: number }).n;
+  } finally {
+    db.close();
+  }
+}
+
 function readStamp(dbPath: string): string | null {
   const db = new DatabaseSync(dbPath);
   try {
@@ -269,5 +335,166 @@ describe("CTC-582 — a replica knows whose data it holds", () => {
     const stranger = newWriter(dbPath, "tenant-0");
     await expect(startToLive(stranger.replica, stranger.sockets)).resolves.toBeUndefined();
     expect(readStamp(dbPath)).toBe("tenant-0");
+  });
+});
+
+describe("CTC-582 review (CTL) — a stamp records HOW SURE it is, and only a declared one may refuse", () => {
+  // ⛔ THE TRAP THIS CLOSES, MEASURED ON THE LIVE FLEET. The host's `cloud-sync.mjs` resolves
+  // `process.env.CATALYST_CLOUD_ACCOUNT || "tenant-0"` — env-only, never consulting config — and that
+  // variable is unset on every host. An unconditional stamp would therefore have written `tenant-0`
+  // across 100% of the fleet as though a human had asked for it, and the fence would later refuse a
+  // host from its OWN replica on the strength of an assertion nobody ever made.
+  //
+  // ⭐ Same defect class as the ticket itself, turned on itself: something meaning "nobody said"
+  // recorded as if it meant "somebody said this".
+
+  it("records provenance alongside the account", async () => {
+    const dbPath = tmpDbPath();
+    const w = newWriter(dbPath, "tenant-3", "declared");
+    await startToLive(w.replica, w.sockets);
+    await w.replica.close();
+    expect(readStamp(dbPath)).toBe("tenant-3");
+    expect(readSource(dbPath)).toBe("declared");
+  });
+
+  it("⛔ OMITTING accountSource means `default` — the safe direction, never `declared`", async () => {
+    // If omission meant "declared", every existing caller's silent fallback would become a permanent
+    // assertion the moment it upgraded. That IS the fleet-wide trap. Asserting the default explicitly
+    // because it is a safety property, not a convenience.
+    const dbPath = tmpDbPath();
+    const w = newWriter(dbPath, "tenant-0"); // no accountSource — exactly what cloud-sync.mjs does
+    await startToLive(w.replica, w.sockets);
+    await w.replica.close();
+    expect(readSource(dbPath)).toBe("default");
+  });
+
+  it("⭐ THE FLEET SCENARIO: a defaulted stamp does NOT brick a host that later declares its account", async () => {
+    // The whole point. Host boots with CATALYST_CLOUD_ACCOUNT unset → stamps `tenant-0` as `default`.
+    // It is later legitimately configured as `tenant-3`. It must NOT be refused from its own file.
+    const dbPath = tmpDbPath();
+    const defaulted = newWriter(dbPath, "tenant-0"); // defaulted
+    await startToLive(defaulted.replica, defaulted.sockets);
+    await defaulted.replica.close();
+    expect(readSource(dbPath)).toBe("default");
+    expect(issueCount(dbPath)).toBe(1); // tenant-0's row is really there
+
+    const declared = newWriter(dbPath, "tenant-3", "declared");
+    await expect(startToLive(declared.replica, declared.sockets)).resolves.toBeUndefined();
+    expect(readStamp(dbPath)).toBe("tenant-3");
+    expect(readSource(dbPath)).toBe("declared");
+  });
+
+  it("⛔ and that transition WIPES rather than renames — a stamp must never mislabel real rows", async () => {
+    // CTL's review proposed "a declared value may overwrite a defaulted one exactly once", which is
+    // right about the STAMP. This is the part that makes it safe about the DATA: the rows in the file
+    // were fetched for tenant-0, so stamping tenant-3 over them would leave account A's data under a
+    // stamp saying B — a mislabelled replica every later check believes.
+    //
+    // ⚠️ PROVED BY CONTENT, NOT BY A TIMING WINDOW. An earlier version of this test asserted zero rows
+    // between open and the transport's re-seed; that window does not exist, because clearing the
+    // cursor makes `start()` cold-seed immediately and the fixture put an identical row straight back
+    // — the wipe was real and the assertion could not see it. Giving the second account a DIFFERENT
+    // row id makes the question answerable at rest: a wipe leaves only the new row, a rename leaves
+    // both.
+    const dbPath = tmpDbPath();
+    const defaulted = newWriter(dbPath, "tenant-0", undefined, seededSnapshotFetch("old"));
+    await startToLive(defaulted.replica, defaulted.sockets);
+    await defaulted.replica.close();
+    expect(issueIds(dbPath)).toEqual(["old"]);
+
+    const declared = newWriter(dbPath, "tenant-3", "declared", seededSnapshotFetch("new"));
+    await startToLive(declared.replica, declared.sockets);
+    await declared.replica.close();
+
+    expect(issueIds(dbPath)).toEqual(["new"]); // tenant-0's row is GONE, not relabelled
+    expect(readStamp(dbPath)).toBe("tenant-3");
+    expect(readSource(dbPath)).toBe("declared");
+  });
+
+  it("⛔ CROSS-REPO CONTRACT: the transition DROPS the cursor, it does not resume on it", async () => {
+    // ⛔ THE CURSOR-DROP IS NOT INCIDENTAL TO THE WIPE — IT IS THE ENTIRE REASON THE WIPE IS SAFE, and
+    // the reason is in ANOTHER REPO. Catalyst's host readers use "cursor present and non-empty" as the
+    // seed-completeness signal (`replica-read.mjs`, and the bash freshness gate every agent's
+    // single-ticket read goes through): cursor present ⇒ serve; cursor absent ⇒ mid-reseed, fall back
+    // to `linearis` loudly.
+    //
+    // So a future "optimisation" that PRESERVED the cursor to resume from where we were would hand
+    // every host reader a SEED-COMPLETE EMPTY replica and they would trust it. That zeroes the board:
+    // admission sees no eligible tickets and dispatch stops fleet-wide **with nothing red**. Asserted
+    // here as its own invariant, at CTL's request, rather than left as an implementation detail of the
+    // re-seed path — because the code that depends on it cannot see this file.
+    //
+    // Proved at rest by giving the two accounts snapshots with DIFFERENT cursors: if the transition
+    // resumed on the stored cursor, the old value would survive.
+    const dbPath = tmpDbPath();
+    const defaulted = newWriter(dbPath, "tenant-0", undefined, seededSnapshotFetch("old", 41));
+    await startToLive(defaulted.replica, defaulted.sockets);
+    await defaulted.replica.close();
+    expect(readCursor(dbPath)).toBe("41");
+
+    const declared = newWriter(dbPath, "tenant-3", "declared", seededSnapshotFetch("new", 99));
+    await startToLive(declared.replica, declared.sockets);
+    await declared.replica.close();
+
+    // 99 = re-seeded from scratch for the new account. 41 would mean it resumed on tenant-0's cursor
+    // and every host reader would read this file as a complete board.
+    expect(readCursor(dbPath)).toBe("99");
+    expect(issueIds(dbPath)).toEqual(["new"]);
+  });
+
+  it("⛔ a DECLARED stamp still refuses — provenance weakens nothing that was actually asserted", async () => {
+    const dbPath = tmpDbPath();
+    const owner = newWriter(dbPath, "tenant-3", "declared");
+    await startToLive(owner.replica, owner.sockets);
+    await owner.replica.close();
+
+    const intruder = newWriter(dbPath, "tenant-0", "declared");
+    await expect(intruder.replica.start()).rejects.toThrow(ReplicaAccountMismatchError);
+    expect(issueCount(dbPath)).toBe(1); // and it did NOT wipe — those rows may be a real tenant's
+  });
+
+  it("⛔ TWO DISAGREEING DEFAULTS refuse — nothing licenses deleting either", async () => {
+    // Reachable when two builds ship different built-in fallbacks. Neither side asserted anything, so
+    // there is no basis to prefer one — and therefore certainly none to wipe one.
+    const dbPath = tmpDbPath();
+    const a = newWriter(dbPath, "tenant-0");
+    await startToLive(a.replica, a.sockets);
+    await a.replica.close();
+
+    const b = newWriter(dbPath, "tenant-9"); // also defaulted, different fallback
+    await expect(b.replica.start()).rejects.toThrow(ReplicaAccountMismatchError);
+    expect(issueCount(dbPath)).toBe(1);
+    expect(readStamp(dbPath)).toBe("tenant-0");
+  });
+
+  it("upgrades default → declared for the SAME account, and never downgrades", async () => {
+    const dbPath = tmpDbPath();
+    const first = newWriter(dbPath, "tenant-3"); // defaulted
+    await startToLive(first.replica, first.sockets);
+    await first.replica.close();
+    expect(readSource(dbPath)).toBe("default");
+
+    const second = newWriter(dbPath, "tenant-3", "declared"); // now declared — confirms it
+    await startToLive(second.replica, second.sockets);
+    await second.replica.close();
+    expect(readSource(dbPath)).toBe("declared");
+
+    // ⚠️ A later caller that FORGETS to declare must not un-assert it: a declaration already made is
+    // not unmade by someone else's omission, or the fence would silently weaken over time.
+    const third = newWriter(dbPath, "tenant-3");
+    await startToLive(third.replica, third.sockets);
+    await third.replica.close();
+    expect(readSource(dbPath)).toBe("declared");
+  });
+
+  it("names the provenance in the error, so a caller can tell the two refusals apart", async () => {
+    const dbPath = tmpDbPath();
+    const a = newWriter(dbPath, "tenant-0");
+    await startToLive(a.replica, a.sockets);
+    await a.replica.close();
+    const b = newWriter(dbPath, "tenant-9");
+    // "neither was declared" and "someone declared this is another tenant's" need different remedies:
+    // the first is "go say which", the second is "you are pointed at the wrong file".
+    await expect(b.replica.start()).rejects.toThrow(/Neither account was declared/);
   });
 });
