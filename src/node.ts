@@ -15,6 +15,7 @@ export {
   // config fault that must page a human) apart from a transient open failure (retry). A consumer
   // that cannot name the difference will retry a misconfiguration forever.
   ReplicaAccountMismatchError,
+  type AccountSource,
   type CatalystReplicaOptions,
   type CatalystReplicaReadOnlyOptions,
 } from "./replica/catalyst-replica.js";
