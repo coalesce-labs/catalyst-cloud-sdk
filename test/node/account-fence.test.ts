@@ -62,7 +62,7 @@ function recordingFactory(): { sockets: FakeWebSocket[]; factory: WebSocketFacto
   return { sockets, factory };
 }
 /** A snapshot carrying ONE issue row, so a re-seed's WIPE is observable as a row count. */
-function seededSnapshotFetch(id = "i1"): typeof fetch {
+function seededSnapshotFetch(id = "i1", cursor = 7): typeof fetch {
   const body =
     JSON.stringify({
       accountId: "tenant-0",
@@ -71,7 +71,7 @@ function seededSnapshotFetch(id = "i1"): typeof fetch {
       row: { id, identifier: `CTC-${id}`, title: "Hello", state: "Todo", updated_at: 100 },
     }) +
     "\n" +
-    JSON.stringify({ accountId: "tenant-0", cursor: 7 }) +
+    JSON.stringify({ accountId: "tenant-0", cursor }) +
     "\n";
   return (async () =>
     ({ ok: true, status: 200, text: async () => body }) as unknown as Response) as unknown as typeof fetch;
@@ -121,6 +121,19 @@ function readSource(dbPath: string): string | null {
     const row = db
       .prepare("SELECT value FROM sync_meta WHERE key = 'account_source'")
       .get() as { value?: string } | undefined;
+    return typeof row?.value === "string" ? row.value : null;
+  } finally {
+    db.close();
+  }
+}
+
+/** The persisted change-feed cursor, read straight from the file. */
+function readCursor(dbPath: string): string | null {
+  const db = new DatabaseSync(dbPath);
+  try {
+    const row = db.prepare("SELECT value FROM sync_meta WHERE key = 'cursor'").get() as
+      | { value?: string }
+      | undefined;
     return typeof row?.value === "string" ? row.value : null;
   } finally {
     db.close();
@@ -398,34 +411,35 @@ describe("CTC-582 review (CTL) — a stamp records HOW SURE it is, and only a de
     expect(readSource(dbPath)).toBe("declared");
   });
 
-  it("⛔ the old tenant's rows are gone even when the RE-SEED FAILS", async () => {
-    // ⚠️ THIS TEST EXISTS BECAUSE A NEGATIVE CONTROL DIDN'T FIRE. Commenting out `truncateReplica` in
-    // the reseed path left all 16 tests green: clearing the cursor forces a cold seed, and the seed
-    // truncates on its own, so the earlier guard absorbed the mutation and the wipe looked redundant.
+  it("⛔ CROSS-REPO CONTRACT: the transition DROPS the cursor, it does not resume on it", async () => {
+    // ⛔ THE CURSOR-DROP IS NOT INCIDENTAL TO THE WIPE — IT IS THE ENTIRE REASON THE WIPE IS SAFE, and
+    // the reason is in ANOTHER REPO. Catalyst's host readers use "cursor present and non-empty" as the
+    // seed-completeness signal (`replica-read.mjs`, and the bash freshness gate every agent's
+    // single-ticket read goes through): cursor present ⇒ serve; cursor absent ⇒ mid-reseed, fall back
+    // to `linearis` loudly.
     //
-    // ⭐ It is not redundant — it is defence in depth, and the layer it defends is only reachable when
-    // the re-seed FAILS. Without it, a failed seed leaves the previous account's rows READABLE under a
-    // stamp naming the new one: `queryIssues()` would serve tenant-0's data to tenant-3. The wipe makes
-    // "wrong-account rows are unreadable" unconditional instead of contingent on a later step that may
-    // not happen. (The browser fence wraps its wipe for exactly this reason — worker-core.ts.)
+    // So a future "optimisation" that PRESERVED the cursor to resume from where we were would hand
+    // every host reader a SEED-COMPLETE EMPTY replica and they would trust it. That zeroes the board:
+    // admission sees no eligible tickets and dispatch stops fleet-wide **with nothing red**. Asserted
+    // here as its own invariant, at CTL's request, rather than left as an implementation detail of the
+    // re-seed path — because the code that depends on it cannot see this file.
+    //
+    // Proved at rest by giving the two accounts snapshots with DIFFERENT cursors: if the transition
+    // resumed on the stored cursor, the old value would survive.
     const dbPath = tmpDbPath();
-    const defaulted = newWriter(dbPath, "tenant-0", undefined, seededSnapshotFetch("old"));
+    const defaulted = newWriter(dbPath, "tenant-0", undefined, seededSnapshotFetch("old", 41));
     await startToLive(defaulted.replica, defaulted.sockets);
     await defaulted.replica.close();
-    expect(issueIds(dbPath)).toEqual(["old"]);
+    expect(readCursor(dbPath)).toBe("41");
 
-    // A snapshot that cannot land. The open still succeeds; the seed is what breaks.
-    const failing = (async () =>
-      ({ ok: false, status: 503, text: async () => "upstream down" }) as unknown as Response) as unknown as typeof fetch;
-    const declared = newWriter(dbPath, "tenant-3", "declared", failing);
-    try {
-      await startToLive(declared.replica, declared.sockets);
-    } catch {
-      /* the seed failing is the POINT — the fence's work must already be durable */
-    }
+    const declared = newWriter(dbPath, "tenant-3", "declared", seededSnapshotFetch("new", 99));
+    await startToLive(declared.replica, declared.sockets);
     await declared.replica.close();
 
-    expect(issueIds(dbPath)).toEqual([]); // ⛔ not ["old"] — tenant-0's rows must not survive
+    // 99 = re-seeded from scratch for the new account. 41 would mean it resumed on tenant-0's cursor
+    // and every host reader would read this file as a complete board.
+    expect(readCursor(dbPath)).toBe("99");
+    expect(issueIds(dbPath)).toEqual(["new"]);
   });
 
   it("⛔ a DECLARED stamp still refuses — provenance weakens nothing that was actually asserted", async () => {
