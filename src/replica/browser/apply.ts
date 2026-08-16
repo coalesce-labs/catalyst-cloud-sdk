@@ -72,7 +72,17 @@ export function clearCursor(db: ReplicaDb): void {
  * Apply ONE change-feed record to the replica via the shared, schema-driven write path. Returns true
  * iff a row was actually written (a stale upsert rejected by the updated_at guard, or a delete of an
  * already-absent row, returns false).
+ *
+ * `knownColumns` (CTC-603): the caller's PRAGMA-derived column set for `change.entity`
+ * (`OpenedReplica.knownColumnsByEntity.get(change.entity)`), overriding
+ * @catalyst-cloud/replicate's own bundled-schema default — see that map's doc for why. Omit (or pass
+ * `undefined`, the entity-not-found case) to fall back to replicate's default, same as before this
+ * override existed.
  */
-export function applyChange(db: ReplicaDb, change: WireChange): boolean {
-  return applyDelta(db, change, toBindable);
+export function applyChange(
+  db: ReplicaDb,
+  change: WireChange,
+  knownColumns?: ReadonlySet<string>,
+): boolean {
+  return applyDelta(db, change, toBindable, { knownColumns });
 }

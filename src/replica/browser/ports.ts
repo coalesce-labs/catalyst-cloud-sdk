@@ -17,6 +17,7 @@ import type { Database } from "@sqlite.org/sqlite-wasm";
 import type { SqlExecutor, SqlValue } from "@catalyst-cloud/read-model";
 import { applyMigrations, MIRROR_MIGRATIONS, type MigrationDb } from "@catalyst-cloud/schema";
 import { migrationsChangeRowShape } from "../migration-shape.js";
+import { buildKnownColumnsByTable } from "../known-columns.js";
 
 /**
  * The write port the delta-apply path (apply.ts) drives. `run` executes a mutation with positional `?`
@@ -29,6 +30,10 @@ export interface ReplicaDb {
   run(sql: string, ...bindings: SqlValue[]): number;
   /** Run a single-row query; returns the first row as an object, or undefined. */
   get(sql: string, ...bindings: SqlValue[]): Record<string, SqlValue> | undefined;
+  /** Run a MULTI-row query; returns every row as an object. CTC-603: the port capability
+   *  `buildKnownColumnsByTable` needs to enumerate `sqlite_master` + run `PRAGMA table_info(...)` —
+   *  the node engine's `ReplicaEngine.all` twin. */
+  all(sql: string, ...bindings: SqlValue[]): Record<string, SqlValue>[];
   /** Wrap `fn` in a transaction (BEGIN/COMMIT; ROLLBACK + rethrow on error). */
   transaction<T>(fn: () => T): T;
 }
@@ -59,6 +64,14 @@ export interface OpenedReplica {
   readonly write: ReplicaDb;
   /** the underlying OO1 db handle (for close / capacity introspection). */
   readonly db: Database;
+  /**
+   * CTC-603: per-entity `PRAGMA table_info`-derived column sets — the ACTUAL local table shape, built
+   * ONCE here (right after migrations run), not @catalyst-cloud/replicate's (or this SDK's own)
+   * bundled @catalyst-cloud/schema copy. Passed as `ApplyOptions.knownColumns` at every `applyChange`
+   * call site (worker-core.ts) so a dropped/unknown column reflects what SQLite itself reports the
+   * table having, not which package's schema version created it.
+   */
+  readonly knownColumnsByEntity: ReadonlyMap<string, ReadonlySet<string>>;
   /** release the handle (under OPFS SAHPool this frees the SyncAccessHandles for another tab). */
   close(): void;
 }
@@ -119,6 +132,12 @@ export function buildOpenedReplica(db: Database): OpenedReplica {
       }) as Record<string, SqlValue>[];
       return rows[0];
     },
+    all: (sql: string, ...bindings: SqlValue[]) =>
+      db.exec(sql, {
+        bind: bindArgs(bindings),
+        rowMode: "object",
+        returnValue: "resultRows",
+      }) as Record<string, SqlValue>[],
     transaction: <T>(fn: () => T): T => {
       db.exec("BEGIN");
       try {
@@ -170,10 +189,16 @@ export function buildOpenedReplica(db: Database): OpenedReplica {
     db.exec("DELETE FROM sync_meta WHERE key = 'cursor'");
   }
 
+  // CTC-603: build the PRAGMA-derived known-columns map from the table shape migrations just produced
+  // — see OpenedReplica.knownColumnsByEntity's doc. `write` is already fully constructed above, so its
+  // `all` port is usable here.
+  const knownColumnsByEntity = buildKnownColumnsByTable(write);
+
   return {
     read,
     write,
     db,
+    knownColumnsByEntity,
     close: () => db.close(),
   };
 }

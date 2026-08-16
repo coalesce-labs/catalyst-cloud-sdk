@@ -20,6 +20,7 @@
 
 import { applyMigrations, MIRROR_MIGRATIONS, type MigrationDb } from "@catalyst-cloud/schema";
 import { migrationsChangeRowShape } from "./migration-shape.js";
+import { buildKnownColumnsByTable } from "./known-columns.js";
 import {
   applyDelta,
   truncateReplica,
@@ -274,12 +275,28 @@ export class CatalystReplica {
   /** CTC-127: `table.column` keys already warned about (a mirror-ahead column this client's schema
    *  lacks), so the per-row drop signal warns ONCE, not per delta (a drifted seed would else spam). */
   private readonly warnedDrift = new Set<string>();
-  /** CTC-127: hoisted apply options passed to every applyDelta — the forward-compat column filter is
-   *  automatic inside @catalyst-cloud/replicate; this only wires the warn-once drift signal. Hoisted so
-   *  the synchronous applyFrame/seed hot paths allocate no per-row options object. */
+  /**
+   * CTC-603: per-entity `PRAGMA table_info`-derived column sets, built ONCE in `start()` right after
+   * `applyMigrations` — the ACTUAL local table shape, not @catalyst-cloud/replicate's (or this SDK's
+   * own) bundled @catalyst-cloud/schema copy. Looked up per `applyDelta` call via {@link applyOptsFor}.
+   * Empty (never populated) in read-only mode, where the write path is unreachable anyway.
+   */
+  private knownColumnsByEntity: ReadonlyMap<string, ReadonlySet<string>> = new Map();
+  /** CTC-127/CTC-603: hoisted apply options object, mutated (not reallocated) per call by
+   *  {@link applyOptsFor} — the forward-compat column filter now gets the PRAGMA-derived override for
+   *  the delta's own entity, plus the warn-once drift signal. Hoisted so the synchronous
+   *  applyFrame/seed hot paths allocate no per-row options object. */
   private readonly applyOpts: ApplyOptions = {
     onDroppedColumns: (table, dropped) => this.reportDroppedColumns(table, dropped),
   };
+
+  /** Resolve {@link applyOpts} for one delta's entity: sets `knownColumns` to that entity's
+   *  PRAGMA-derived set (or `undefined` when the entity's table wasn't found locally, which falls
+   *  back to replicate's own bundled default — the safe direction, never stripping a row to PK-only). */
+  private applyOptsFor(entity: string): ApplyOptions {
+    this.applyOpts.knownColumns = this.knownColumnsByEntity.get(entity);
+    return this.applyOpts;
+  }
 
   constructor(opts: CatalystReplicaOptions) {
     this.opts = opts;
@@ -362,6 +379,10 @@ export class CatalystReplica {
     };
     const { appliedTags } = applyMigrations(migrationDb, MIRROR_MIGRATIONS);
     engine.exec(SYNC_META_DDL);
+
+    // CTC-603: build the PRAGMA-derived known-columns map from the table shape migrations just
+    // produced — the ACTUAL local shape, not any package's bundled schema. See applyOptsFor's doc.
+    this.knownColumnsByEntity = buildKnownColumnsByTable(engine);
 
     // CTC-127 auto-reseed: a migration that CHANGES ROW SHAPE (adds a column, or a new entity table)
     // just ran on a WARM replica → existing rows lack the new column's values (they were seeded/applied
@@ -744,7 +765,7 @@ export class CatalystReplica {
           writeDb,
           { entity: frame.entity, op: frame.op, row: frame.row ?? {}, entityId: frame.entityId },
           engine.toBindable,
-          this.applyOpts, // CTC-127: forward-compat filter (auto) + warn-once drift signal.
+          this.applyOptsFor(frame.entity), // CTC-603: PRAGMA-derived knownColumns + warn-once drift signal.
         );
         // Advance to the seq we SAW (not just applied), so a stale-but-newer-seq delta still moves the
         // cursor forward and a reconnect doesn't re-request it. Safe ONLY because the transport now
@@ -926,7 +947,7 @@ export class CatalystReplica {
                       writeDb,
                       { entity: rec.entity, op: rec.op ?? "upsert", row: rec.row ?? {} },
                       engine.toBindable,
-                      this.applyOpts, // CTC-127: forward-compat filter (auto) + warn-once drift signal.
+                      this.applyOptsFor(rec.entity), // CTC-603: PRAGMA-derived knownColumns + warn-once drift signal.
                     );
                   }
                 });
