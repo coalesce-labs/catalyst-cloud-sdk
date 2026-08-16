@@ -53,6 +53,8 @@ declare module "node:fs" {
   export function unlinkSync(path: string): void;
   export function mkdtempSync(prefix: string): string;
   export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;
+  /** Tests only (CTC-582): byte size, to assert a refused open wrote nothing to the file. */
+  export function statSync(path: string): { size: number };
 }
 
 declare module "node:sqlite" {
