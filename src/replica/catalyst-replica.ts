@@ -93,6 +93,49 @@ const SYNC_META_DDL = `CREATE TABLE IF NOT EXISTS sync_meta (
   key TEXT PRIMARY KEY, value TEXT
 );`;
 
+/** `sync_meta` key naming the account whose rows this file holds (CTC-582). */
+const ACCOUNT_KEY = "account";
+
+/**
+ * Thrown when a replica file already belongs to a DIFFERENT account than the one configured.
+ *
+ * Its own class, not a bare Error: a caller (host-sync, a supervisor) must be able to tell "you are
+ * pointed at the wrong tenant's database" apart from a transient open failure, because the remedies
+ * are opposite — one is a config fix that must page a human, the other is a retry.
+ */
+export class ReplicaAccountMismatchError extends Error {
+  constructor(
+    readonly dbPath: string,
+    readonly storedAccount: string,
+    readonly configuredAccount: string,
+  ) {
+    super(
+      `CatalystReplica: refusing to open ${dbPath} — it holds account "${storedAccount}", ` +
+        `but this writer is configured for "${configuredAccount}". ` +
+        `Check CATALYST_REPLICA_DB and the account this process was started for. ` +
+        `Nothing was written and the existing replica was left intact.`,
+    );
+    this.name = "ReplicaAccountMismatchError";
+  }
+}
+
+/**
+ * Read the account stamp WITHOUT assuming `sync_meta` exists.
+ *
+ * ⚠️ This runs before `applyMigrations` and before `SYNC_META_DDL`, so on a cold file the table is
+ * genuinely absent and a bare SELECT would throw. Probing `sqlite_master` first keeps "no table yet"
+ * an ordinary answer instead of an exception that a `catch` would have to guess the meaning of.
+ */
+function readAccountStamp(engine: ReplicaEngine): string | null {
+  const table = engine.get(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sync_meta'",
+  );
+  if (table == null) return null;
+  const row = engine.get("SELECT value FROM sync_meta WHERE key = ?", ACCOUNT_KEY as never);
+  const v = row?.value;
+  return typeof v === "string" && v !== "" ? v : null;
+}
+
 /** Rows per streamed seed transaction — bounds memory + fsync so a large tenant never OOMs the node/bun
  *  process the way host-sync's buffered `await res.text()` + `split("\n")` snapshot would. */
 const SEED_BATCH_ROWS = 1000;
@@ -361,6 +404,46 @@ export class CatalystReplica {
 
     const engine = await this.resolveEngine();
     this.engine = engine;
+
+    // ── CTC-582: THE ACCOUNT FENCE ────────────────────────────────────────────────────────────────
+    //
+    // ⛔ THIS RUNS BEFORE `applyMigrations`, AND THAT ORDERING IS THE POINT. The acceptance criterion
+    // is that opening someone else's replica "refuses loudly and writes NOTHING". Migrations write —
+    // so a fence placed after them would already have altered another tenant's file before deciding
+    // it had no right to. There is nothing to read here that needs migrating first: the stamp lives
+    // in `sync_meta`, which is host-only bookkeeping, and `readAccountStamp` tolerates its absence.
+    //
+    // ⛔ AND IT REFUSES RATHER THAN REPAIRING. Re-seeding "to fix it" would destroy the other tenant's
+    // replica to resolve OUR misconfiguration — deleting real data to paper over a path typo.
+    //
+    // WHY THIS EXISTS AT ALL: today's fixed `~/catalyst/catalyst-replica.db` makes a wrong path
+    // harmless (one path, one file, everyone correct). CTL-1893 derives the path from the account, at
+    // which point a stale launchd plist or a typo'd override silently points account B's writer at
+    // account A's file — and the single-writer lock CANNOT object, because it is claimed as
+    // `dbPath + '.writer.lock'`: same path, same lock. It looks like correct exclusion while mixing
+    // tenants, and the output is plausible data rather than an error.
+    //
+    // ⚠️ COMPLEMENTARY TO CTL's HOST-SIDE GUARD, NOT A DUPLICATE OF IT. That guard compares an
+    // explicit `CATALYST_REPLICA_DB` against the path derived for the resolved account: it fails
+    // earlier and more legibly, using only host-local information. This one catches what no amount of
+    // host-local config checking can see — TWO DIFFERENT HOSTS sharing ONE file, each correctly
+    // configured on its own terms. Only the database knows whose data it holds.
+    const storedAccount = readAccountStamp(engine);
+    if (storedAccount != null && storedAccount !== this.opts.account) {
+      // Give the file back untouched: drop the handle and the lock before throwing, so a supervisor
+      // that restarts us doesn't leave a stale lock sitting on another tenant's replica.
+      this.log("error", "replica account mismatch — refusing to open", {
+        dbPath: this.opts.dbPath,
+        storedAccount,
+        configuredAccount: this.opts.account,
+      });
+      engine.close();
+      this.engine = null;
+      this.writerLock?.release();
+      this.writerLock = null;
+      throw new ReplicaAccountMismatchError(this.opts.dbPath, storedAccount, this.opts.account);
+    }
+
     this.writeDb = {
       run: (sql, ...bindings) => engine.run(sql, ...bindings),
       get: (sql, ...bindings) => engine.get(sql, ...bindings),
@@ -379,6 +462,46 @@ export class CatalystReplica {
     };
     const { appliedTags } = applyMigrations(migrationDb, MIRROR_MIGRATIONS);
     engine.exec(SYNC_META_DDL);
+
+    // CTC-582, the other half: ADOPT an unstamped replica — never reject one.
+    //
+    // ⛔ ABSENT IS NOT MISMATCHED. Every replica seeded before this shipped has no stamp, so treating
+    // a missing one as a conflict would refuse to open on every existing host the moment they
+    // upgrade — bricking the fleet to protect against a hazard that does not exist yet.
+    //
+    // ⚠️ THE BROWSER FENCE DOES THE OPPOSITE ON PURPOSE, AND THE TWO MUST NOT BE "HARMONISED".
+    // `browser/worker-core.ts` treats `stored === null` as a mismatch and WIPES — correct there, and
+    // corrected TO that during CTC-114 review. The threat models genuinely differ:
+    //
+    //   • Browser: dbPath/directory default to constants, so every tenant on an origin shares ONE
+    //     OPFS database. A null stamp there may well be a different cookie user's data, and the cost
+    //     of being wrong is a truncate over tables that re-seed from the network anyway.
+    //   • Node: an operator-chosen file on one host. A null stamp means "written before this feature
+    //     existed", the data may be very large, and the cost of being wrong is deleting a real
+    //     tenant's replica — which is also why the MISMATCH path above refuses instead of wiping.
+    //
+    // Making either side match the other re-opens the hole it was written to close. If you are here
+    // to unify them, the thing to unify is the doc, not the behaviour.
+    //
+    // ⚠️ RESIDUAL, STATED SO IT IS NOT MISTAKEN FOR COVERAGE: adoption cannot retroactively verify an
+    // unstamped file. A pre-existing replica sitting at a wrong path is adopted, not caught. The
+    // fence protects everything from its first stamp onward; it cannot audit the past. CTL's
+    // host-side path guard is what covers that case.
+    if (storedAccount == null) {
+      engine.run(
+        "INSERT INTO sync_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ACCOUNT_KEY as never,
+        this.opts.account as never,
+      );
+      // Loud only when adopting a WARM replica — a cold file being stamped is the ordinary first boot
+      // and does not deserve a line in the log every time.
+      if (getCursor(this.writeDb) != null) {
+        this.log("info", "adopting an unstamped replica — stamping it with this account", {
+          dbPath: this.opts.dbPath,
+          account: this.opts.account,
+        });
+      }
+    }
 
     // CTC-603: build the PRAGMA-derived known-columns map from the table shape migrations just
     // produced — the ACTUAL local shape, not any package's bundled schema. See applyOptsFor's doc.

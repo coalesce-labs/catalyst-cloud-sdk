@@ -11,6 +11,10 @@
 
 export {
   CatalystReplica,
+  // CTC-582 — exported so a caller can tell "you are pointed at the wrong tenant's database" (a
+  // config fault that must page a human) apart from a transient open failure (retry). A consumer
+  // that cannot name the difference will retry a misconfiguration forever.
+  ReplicaAccountMismatchError,
   type CatalystReplicaOptions,
   type CatalystReplicaReadOnlyOptions,
 } from "./replica/catalyst-replica.js";
