@@ -215,8 +215,12 @@ describe("applyDelta over the ReplicaEngine (host-sync apply.ts port)", () => {
     });
   });
 
-  it("throws on an unknown entity", () => {
-    expect(() => apply(engine, { entity: "not_a_table", op: "upsert", row: { id: "x" } })).toThrow(/unknown entity/);
+  it("does NOT throw on an unknown entity — returns false (CTC-393, @catalyst-cloud/replicate ≥0.1.4)", () => {
+    // Was "throws on an unknown entity" pre-CTC-393. A throw here propagates out of the caller's
+    // engine.transaction() (see catalyst-replica.ts applyFrame), rolling back the setCursor in the same
+    // transaction and wedging the replica's cursor behind that seq with no self-heal — the exact CTC-393
+    // fix. applyDelta now returns false (nothing written; the caller's cursor still advances).
+    expect(apply(engine, { entity: "not_a_table", op: "upsert", row: { id: "x" } })).toBe(false);
   });
 
   describe("replica helpers", () => {
