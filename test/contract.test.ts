@@ -20,8 +20,23 @@ import {
 // caught at SDK CI time (we can't import the internal package to compare against it directly).
 
 describe("wire contract", () => {
-  it("EntityName covers exactly the 15 canonical mirror tables, in order", () => {
-    // Byte-for-byte the @catalyst-cloud/types EntityName union (packages/types/src/index.ts 69-84).
+  it("EntityName covers exactly the 24 canonical mirror tables, in order", () => {
+    // Byte-for-byte the @catalyst-cloud/types EntityName union (packages/types/src/index.ts).
+    //
+    // ⛔ CTC-643 — THIS ASSERTION WAS GREEN WHILE THE UNION WAS STALE BY NINE, and that is the
+    // lesson worth keeping. It claims to check the SDK against the service's union, but what it
+    // actually compares is one hard-coded copy against another hard-coded copy — both of them here,
+    // in this repo, neither of them the thing they are about. The service added nine entities over
+    // several months; nothing in this file could notice, because nothing in this file reads it.
+    // It kept passing every single day it was wrong.
+    //
+    // ⚠️ IT IS STILL A LITERAL, and deliberately so — the SDK is published standalone and genuinely
+    // cannot import `@catalyst-cloud/types` to diff against (that is the header's own note). So the
+    // honest statement of what this test does is: it pins the SDK's union against DELIBERATE
+    // change — an edit to `types.ts` must be matched here, so no one widens the wire contract by
+    // accident. It CANNOT detect the service moving first. That gap is real, it is what CTC-643
+    // was, and closing it needs a generated artifact or a published contract fixture, not a
+    // better literal. Filed rather than papered over.
     expect([...ENTITY_NAMES]).toEqual([
       "issues",
       "labels",
@@ -38,8 +53,17 @@ describe("wire contract", () => {
       "check_runs",
       "commit_statuses",
       "reviews",
+      "fleet_activity",
+      "agent_sessions",
+      "agent_activities",
+      "pr_review_comments",
+      "pr_commits",
+      "pr_conversation_comments",
+      "pr_events",
+      "workflow_states",
+      "team_workflow_mapping",
     ]);
-    expect(ENTITY_NAMES).toHaveLength(15);
+    expect(ENTITY_NAMES).toHaveLength(24);
     // No duplicates (the union has none).
     expect(new Set(ENTITY_NAMES).size).toBe(ENTITY_NAMES.length);
   });

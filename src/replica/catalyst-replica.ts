@@ -692,6 +692,7 @@ export class CatalystReplica {
       auth: this.opts.auth,
       reseed: () => this.seedFromSnapshot(),
       getCursor: () => getCursor(this.writeDb as ReplicaWriteDb<unknown>),
+      connectParams: () => this.workflowRevParams(),
       onChange: (frame) => this.applyFrame(frame),
       onStatus: (status) => this.handleStatus(status),
       backoffMs: this.opts.backoffMs,
@@ -992,6 +993,48 @@ export class CatalystReplica {
       description: "Rows applied per seed batch transaction.",
       unit: "{row}",
     });
+  }
+
+  /**
+   * CTC-628 — the receipt this host echoes on `/connect`: the newest workflow-mapping revision this
+   * replica has ACTUALLY APPLIED, read from the replica at connect time (and at every reconnect).
+   *
+   * ⭐ READ FROM THE DATABASE, NEVER FROM CONFIG OR FROM MEMORY. The whole point of the check on the
+   * service side is that "we pushed the mapping" is unfalsifiable without a receipt from the thing
+   * that had to receive it. A value cached at startup, or copied from a config file, would answer
+   * the question "what did someone intend this host to have" — the question that was already
+   * answerable and already useless. This answers "what does the replica hold right now".
+   *
+   * ⛔ ACCOUNT-WIDE `max`, matching the service's `projectedWorkflowRev()` exactly: a host applies
+   * one feed and holds one high-water mark, so it echoes ONE scalar meaning "I have everything up
+   * to N". Note this deliberately does NOT filter `removed_at` — and neither does the service.
+   * Cleared slots are SOFT-deleted on both sides (`applyDelete` branches on the table's `removed_at`
+   * column and issues an UPDATE, not a DELETE), so the row and its `workflow_rev` survive in the
+   * replica exactly as they do in the mirror. Filtering here would make the two sides `max()` over
+   * different row sets and paint a current host `behind` after any slot was cleared.
+   *
+   * The three cases, and why none of them guesses:
+   *  • no rows at all → the replica genuinely holds no mapping. The service projects `0` for that
+   *    same state, so `0` is the MATCHING answer, not a placeholder — `0` is a real revision.
+   *  • rows with a numeric max → that max.
+   *  • rows whose `workflow_rev` is all NULL (a row written by something older than CTC-624) →
+   *    report NOTHING. We hold mapping rows but cannot say which revision they are; `unreported` is
+   *    the only true answer, and `0` here would claim "current" while holding unknown data.
+   * A missing table throws out of `db.get` and is caught by the caller — see `resolveConnectParams`
+   * in live-sync-client.ts. That is the CURRENT fleet state, not a hypothetical: a host on a schema
+   * older than `0024_long_spencer_smythe` has no `team_workflow_mapping` table at all.
+   */
+  private workflowRevParams(): Record<string, string> | undefined {
+    const db = this.writeDb;
+    if (!db) return undefined;
+    const row = db.get(
+      "SELECT count(*) AS n, max(workflow_rev) AS rev FROM team_workflow_mapping",
+    );
+    const n = row?.["n"];
+    const rev = row?.["rev"];
+    if (typeof rev === "number") return { workflow_rev: String(rev) };
+    if (n === 0) return { workflow_rev: "0" };
+    return undefined;
   }
 
   /** Land one delta + advance the durable cursor atomically (a crash can't skip a seq), then signal. */
