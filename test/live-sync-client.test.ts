@@ -132,6 +132,92 @@ describe("buildConnectUrl auth strategy", () => {
     expect(url.indexOf("token=")).toBeLessThan(url.indexOf("account="));
   });
 
+  // ── CTC-628 — extraParams / connectParams ──────────────────────────────────────────────────────
+  it("⭐ CTC-628 — appends extraParams alongside token/account", () => {
+    const url = buildConnectUrl({
+      baseUrl: "https://h.example/api/v1",
+      connectPath: "/connect",
+      accountId: "tenant-7",
+      auth: { kind: "token", token: "svc-tok" },
+      extraParams: { workflow_rev: "42" },
+    });
+    const u = new URL(url);
+    expect(u.searchParams.get("workflow_rev")).toBe("42");
+    expect(u.searchParams.get("token")).toBe("svc-tok");
+    expect(u.searchParams.get("account")).toBe("tenant-7");
+  });
+
+  it("⛔ CTC-628 — an extra param can NEVER overwrite token or account", () => {
+    // These two decide WHO the connection is. A consumer-supplied extra that could rewrite them
+    // would turn a diagnostic hook into a tenant-crossing one.
+    const url = buildConnectUrl({
+      baseUrl: "https://h.example/api/v1",
+      connectPath: "/connect",
+      accountId: "tenant-7",
+      auth: { kind: "token", token: "svc-tok" },
+      extraParams: { token: "attacker", account: "tenant-EVIL", workflow_rev: "9" },
+    });
+    const u = new URL(url);
+    expect(u.searchParams.get("token")).toBe("svc-tok");
+    expect(u.searchParams.get("account")).toBe("tenant-7");
+    expect(u.searchParams.get("workflow_rev")).toBe("9"); // the legitimate one still lands
+  });
+
+  it("⛔ CTC-628 — an empty-string extra is OMITTED, never sent as `?k=`", () => {
+    // Absent means "unreported" to the service; "" is a different thing its strict parsers reject.
+    // Sending "" would turn "I have nothing to say" into a malformed claim.
+    const url = buildConnectUrl({
+      baseUrl: "https://h.example/api/v1",
+      connectPath: "/connect",
+      accountId: "t",
+      auth: { kind: "cookie" },
+      extraParams: { workflow_rev: "" },
+    });
+    expect(new URL(url).searchParams.has("workflow_rev")).toBe(false);
+  });
+
+  it("⭐ CTC-628 — connectParams is re-resolved on EVERY connectUrl(), not read once", () => {
+    // The property that makes the receipt honest across a reconnect: a host that advances while
+    // running must report the NEW rev when it reconnects, not the one it had at construction.
+    let rev = 1;
+    const client = new LiveSyncClient({
+      baseUrl: "https://h.example",
+      accountId: "tenant-7",
+      auth: { kind: "token", token: "tok" },
+      reseed: async () => 0,
+      getCursor: () => 0,
+      onChange: () => {},
+      connectParams: () => ({ workflow_rev: String(rev) }),
+    });
+    expect(new URL(client.connectUrl()).searchParams.get("workflow_rev")).toBe("1");
+    rev = 7;
+    expect(new URL(client.connectUrl()).searchParams.get("workflow_rev")).toBe("7");
+  });
+
+  it("⛔ CTC-628 — a THROWING connectParams degrades to no params and never escapes", () => {
+    // connectUrl() is called from openSocket() OUTSIDE its try/catch, so an uncaught throw here
+    // would wedge the transport permanently — "I can't read my workflow_rev" becoming "this host
+    // never reconnects". The expected trigger is real and current: a host whose schema predates
+    // team_workflow_mapping has no such table, and querying it throws.
+    const client = new LiveSyncClient({
+      baseUrl: "https://h.example",
+      accountId: "tenant-7",
+      auth: { kind: "token", token: "tok" },
+      reseed: async () => 0,
+      getCursor: () => 0,
+      onChange: () => {},
+      connectParams: () => {
+        throw new Error("no such table: team_workflow_mapping");
+      },
+      log: () => {},
+    });
+    const u = new URL(client.connectUrl());
+    expect(u.searchParams.has("workflow_rev")).toBe(false);
+    // …and the connection is still fully addressable — degraded, not broken.
+    expect(u.searchParams.get("token")).toBe("tok");
+    expect(u.searchParams.get("account")).toBe("tenant-7");
+  });
+
   it("appends NOTHING for cookie kind — no token can ever leak from the browser path", () => {
     const url = buildConnectUrl({
       baseUrl: "https://app.example/api/v1",

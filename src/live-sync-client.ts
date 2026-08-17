@@ -162,6 +162,24 @@ export interface LiveSyncClientOptions {
    * path-prefixed `baseUrl` ("…/api/v1") with the default "/connect" resolves to "…/api/v1/connect".
    */
   connectPath?: string;
+  /**
+   * CTC-628 — extra `/connect` query params, resolved **on every connect and every RECONNECT**.
+   *
+   * ⭐ A CALLBACK, NOT AN OBJECT, AND THAT IS THE WHOLE POINT. The value this exists to carry is the
+   * replica's `max(workflow_rev)` — "the newest mapping revision I have actually applied" — and it
+   * changes underneath a running client. An object read once at construction would report the rev
+   * the host had at STARTUP forever, which is worst precisely when it matters: a host that fell
+   * behind and reconnected would re-assert its old, now-wrong receipt and the service would read it
+   * as current. Same LOADED-not-LOCKED discipline the schema identity uses for the migration tail.
+   *
+   * ⛔ RETURN NOTHING RATHER THAN A GUESS. Omitting a param means "I am not reporting this", which
+   * the service reads as `unreported` — an honest unknown. Never substitute a placeholder: `0` is a
+   * LEGITIMATE `workflow_rev` (a tenant with no mapping saved), so a host that cannot read the value
+   * and sends `0` would paint itself green while being unable to hold the data at all.
+   *
+   * Never overwrites `token` or `account`.
+   */
+  connectParams?: () => Record<string, string> | undefined;
   /** How to authorize the upgrade. token → ?token= (host); cookie → nothing (browser). */
   auth: AuthStrategy;
   /**
@@ -325,6 +343,13 @@ export function buildConnectUrl(opts: {
   connectPath: string;
   accountId?: string;
   auth: AuthStrategy;
+  /**
+   * CTC-628 — extra params the consumer wants on THIS connect, resolved at CALL time. A plain object
+   * would be read once at construction and then be a lie on every reconnect: the values these carry
+   * (the replica's `max(workflow_rev)`) change while the client is running, and a reconnect is
+   * exactly when a stale one would be reported as fresh. See `connectParams` on the options.
+   */
+  extraParams?: Record<string, string>;
 }): string {
   const origin = toWsOrigin(stripTrailingSlashes(opts.baseUrl));
   const params = new URLSearchParams();
@@ -333,6 +358,14 @@ export function buildConnectUrl(opts: {
   // consumers are truthiness checks, so empty takes the omitted path anyway — but it would freeze a
   // contract in which "" is a legal mirror name, and it puts `catalyst.tenant=""` on every span.
   if (opts.accountId) params.set("account", opts.accountId);
+  // Last, and never overwriting `token`/`account` — a consumer-supplied extra must not be able to
+  // rewrite the two params that decide WHO this connection is. Skipped entirely when absent, so a
+  // consumer with nothing to report sends nothing rather than an empty value the server would have
+  // to guess at (the service's parsers are strict: absent → "unreported", "" → invalid).
+  for (const [k, v] of Object.entries(opts.extraParams ?? {})) {
+    if (k === "token" || k === "account" || !v) continue;
+    params.set(k, v);
+  }
   const query = params.toString();
   // Guard the dangling "?" — with cookie auth and no account there are no params at all.
   return `${origin}${opts.connectPath}${query ? `?${query}` : ""}`;
@@ -373,6 +406,7 @@ export class LiveSyncClient {
   private readonly baseUrl: string;
   private readonly accountId: string | undefined;
   private readonly connectPath: string;
+  private readonly connectParams?: () => Record<string, string> | undefined;
   private readonly auth: AuthStrategy;
   private readonly reseed: (signal?: AbortSignal) => Promise<number>;
   private readonly getCursor: () => number | null | undefined;
@@ -505,6 +539,7 @@ export class LiveSyncClient {
     this.baseUrl = stripTrailingSlashes(opts.baseUrl);
     this.accountId = opts.accountId;
     this.connectPath = opts.connectPath ?? "/connect";
+    this.connectParams = opts.connectParams;
     this.auth = opts.auth;
     this.reseed = opts.reseed;
     this.getCursor = opts.getCursor;
@@ -660,14 +695,41 @@ export class LiveSyncClient {
     abandon?.();
   }
 
-  /** The ws(s):// URL this client opens, for diagnostics/tests. Re-derived from the options. */
+  /** The ws(s):// URL this client opens, for diagnostics/tests. Re-derived from the options — and,
+   *  since CTC-628, re-RESOLVED: `connectParams` is invoked here, so every reconnect reports the
+   *  consumer's CURRENT state rather than the state it had when the client was constructed. */
   connectUrl(): string {
     return buildConnectUrl({
       baseUrl: this.baseUrl,
       connectPath: this.connectPath,
       accountId: this.accountId,
       auth: this.auth,
+      extraParams: this.resolveConnectParams(),
     });
+  }
+
+  /**
+   * Invoke the consumer's `connectParams` callback, treating ANY failure as "nothing to report".
+   *
+   * ⛔ THE CATCH IS LOAD-BEARING AND IS NOT A SILENT FAILURE. `connectUrl()` is called from
+   * `openSocket()` **outside** its try/catch (see the constructor's own note on why `accountId` is
+   * validated in the constructor rather than in `buildConnectUrl`) — so a callback that throws
+   * would escape the reconnect machinery entirely and wedge the transport, turning "I could not
+   * read my workflow_rev" into "this host never reconnects again". A replica that cannot answer is
+   * the EXPECTED case today, not an exotic one: a host whose schema predates the
+   * `team_workflow_mapping` migration has no such table, and querying it throws.
+   *
+   * Degrading to no params is the honest outcome — the service reads an absent param as
+   * `unreported`, which is exactly true. Logged at warn so it is observable rather than invisible.
+   */
+  private resolveConnectParams(): Record<string, string> | undefined {
+    if (!this.connectParams) return undefined;
+    try {
+      return this.connectParams();
+    } catch (err) {
+      this.log("warn", "connectParams threw; connecting without them", err);
+      return undefined;
+    }
   }
 
   /**

@@ -32,7 +32,32 @@ export type EntityName =
   | "pull_requests"
   | "check_runs"
   | "commit_statuses"
-  | "reviews";
+  | "reviews"
+  // ⛔ CTC-643 — EVERYTHING BELOW WAS MISSING, AND THE UNION WAS STALE BY NINE. The service has been
+  // broadcasting these on `/connect` for months while this union stopped at "reviews": a consumer
+  // narrowing a frame against `EntityName` saw a type that says these entities cannot arrive, and a
+  // `switch` exhaustive over it silently had no arm for them. The contract test below asserted the
+  // list "byte-for-byte" against the service's union — but as a HARD-CODED LITERAL, so it kept
+  // passing every day it drifted further. An assertion pinned to a copy of the thing it is checking
+  // stops being a check the moment the original moves; it cannot report what it does not read.
+  // CTC-350: fleet coordination current-state (one row per host_id/ticket).
+  | "fleet_activity"
+  // CTC-524: Linear agent sessions and their activity stream — BOTH, always.
+  | "agent_sessions"
+  | "agent_activities"
+  // CTC-575: inline (diff-anchored) PR review comments, and the PR's commit list.
+  | "pr_review_comments"
+  | "pr_commits"
+  // CTC-577: PR conversation-tab comments — deliberately NOT "comments" (that name is Linear's table).
+  | "pr_conversation_comments"
+  // CTC-575: a PR's timeline events (ready_for_review/merged/closed/reopened/review_requested).
+  | "pr_events"
+  // CTC-630 / CTC-308: a team's Linear workflow states.
+  | "workflow_states"
+  // CTC-624 / ADR-0033: the tenant's per-team workflow DECISION, projected from the D1 registry —
+  // the one entity whose authority is the registry rather than a provider. It carries `workflow_rev`,
+  // which is the scalar a host echoes back on /connect (CTC-628, `workflowRevParams` below).
+  | "team_workflow_mapping";
 
 /**
  * The `EntityName` union as a runtime array, in the SAME ORDER as the type above. Frozen so consumers
@@ -55,6 +80,16 @@ export const ENTITY_NAMES = [
   "check_runs",
   "commit_statuses",
   "reviews",
+  // CTC-643 — kept in the SAME ORDER as the union above (and as the service's own union).
+  "fleet_activity",
+  "agent_sessions",
+  "agent_activities",
+  "pr_review_comments",
+  "pr_commits",
+  "pr_conversation_comments",
+  "pr_events",
+  "workflow_states",
+  "team_workflow_mapping",
 ] as const satisfies readonly EntityName[];
 
 /** The change op — the change-feed wire contract. */

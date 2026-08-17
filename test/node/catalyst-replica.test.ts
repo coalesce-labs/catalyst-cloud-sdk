@@ -677,8 +677,111 @@ describe("CatalystReplica resync + auth", () => {
       }),
     );
     await startToLive(cookieReplica, cookieCtx.sockets);
-    expect(cookieCtx.urls[0]).toBe("wss://app.example/api/v1/connect?account=tenant-0");
+    // CTC-628 added `&workflow_rev=` to every host connect, so this is no longer a whole-string
+    // equality. Asserted per-param instead — which is the better test anyway: the original would
+    // have reddened for ANY future param, including a correct one, and said nothing about which.
+    const cookieUrl = new URL(cookieCtx.urls[0]!);
+    expect(cookieUrl.origin + cookieUrl.pathname).toBe("wss://app.example/api/v1/connect");
+    expect(cookieUrl.searchParams.get("account")).toBe("tenant-0");
     expect(cookieCtx.urls[0]).not.toContain("token");
+  });
+});
+
+// ── CTC-628 — the workflow_rev receipt, measured against a REAL bun/node:sqlite replica ──────────
+describe("CTC-628 — the host echoes the workflow_rev it has actually applied", () => {
+  it("⭐ a replica holding NO mapping rows reports 0 — a real revision, not a placeholder", async () => {
+    // The service projects 0 for an account with no mapping saved, so 0 here is the MATCHING answer
+    // and such a host classifies `current`. Reporting nothing instead would paint every fresh
+    // tenant amber forever.
+    const ctx = recordingFactory();
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: "https://h.example/api/v1",
+        account: "tenant-7",
+        auth: { kind: "token", token: "svc-tok" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: bufferedSnapshotFetch([], 0).fetchImpl,
+        wsFactory: ctx.factory,
+      }),
+    );
+    await startToLive(replica, ctx.sockets);
+    expect(new URL(ctx.urls[0]!).searchParams.get("workflow_rev")).toBe("0");
+  });
+
+  it("⭐ a replica seeded with mapping rows reports their MAX, account-wide", async () => {
+    // Account-wide max, not per team: team A at rev 5 and team B at rev 3 means this host is
+    // missing A's update, and answering "3" (team B's) would clear it. The seed carries both.
+    const ctx = recordingFactory();
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: "https://h.example/api/v1",
+        account: "tenant-7",
+        auth: { kind: "token", token: "svc-tok" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: bufferedSnapshotFetch(
+          [
+            {
+              entity: "team_workflow_mapping",
+              row: {
+                team_id: "B",
+                slot: "dispatch",
+                linear_state_id: "s2",
+                workflow_rev: 3,
+                updated_at: 1,
+              },
+            },
+            {
+              entity: "team_workflow_mapping",
+              row: {
+                team_id: "A",
+                slot: "dispatch",
+                linear_state_id: "s1",
+                workflow_rev: 5,
+                updated_at: 1,
+              },
+            },
+          ],
+          9,
+        ).fetchImpl,
+        wsFactory: ctx.factory,
+      }),
+    );
+    await startToLive(replica, ctx.sockets);
+    expect(new URL(ctx.urls[0]!).searchParams.get("workflow_rev")).toBe("5");
+  });
+
+  it("⛔ a replica with NO team_workflow_mapping table reports NOTHING, and still connects", async () => {
+    // THE CURRENT FLEET STATE, not a hypothetical: both minis are on a schema older than
+    // 0024_long_spencer_smythe, so the table does not exist and the read throws. The host must
+    // degrade to `unreported` — honest — rather than send 0 (a false "current") or wedge the
+    // transport (connectUrl() runs outside openSocket()'s try/catch).
+    const ctx = recordingFactory();
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: "https://h.example/api/v1",
+        account: "tenant-7",
+        auth: { kind: "token", token: "svc-tok" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: bufferedSnapshotFetch([], 0).fetchImpl,
+        wsFactory: ctx.factory,
+        log: () => {},
+      }),
+    );
+    await startToLive(replica, ctx.sockets);
+    // Drop the table out from under the running replica, then force a fresh connect URL.
+    (replica as unknown as { writeDb: { run(sql: string): number } }).writeDb.run(
+      "DROP TABLE team_workflow_mapping",
+    );
+    const url = new URL(
+      (replica as unknown as { client: { connectUrl(): string } }).client.connectUrl(),
+    );
+    expect(url.searchParams.has("workflow_rev")).toBe(false);
+    // Degraded, not broken — the connection is still fully addressable.
+    expect(url.searchParams.get("token")).toBe("svc-tok");
+    expect(url.searchParams.get("account")).toBe("tenant-7");
   });
 });
 
