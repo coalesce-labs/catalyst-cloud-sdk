@@ -65,9 +65,17 @@ export type EntityName =
   // because it acts on the ARRIVAL of a transition; `pr_review_threads` carries the RESOLUTION state
   // that `pr_review_comments` has no column for — the merge gate AGENTS.md describes.
   | "pushes"
+  // CTC-704: one row per push DELIVERY, append-only next to the per-ref `pushes` row. A feed producer
+  // emits one edge per row, so a per-ref row caps the feed at one edge per ref per tick — CTL-48
+  // measured 101 of 138 unmatched smee events as pushes, which made GitHub parity INCONCLUSIVE.
+  | "push_events"
   | "deployments"
   | "deployment_statuses"
-  | "pr_review_threads";
+  | "pr_review_threads"
+  // CTC-667 item 4: GitHub's OWN check-suite rollup — the highest-volume signal in the census and
+  // what every phase agent's CI wait blocks on. ⛔ The row is contractual; a derivation from
+  // `check_runs` is NOT (neutral/skipped are non-failing; required-ness is not a check_runs fact).
+  | "check_suites";
 
 /**
  * The `EntityName` union as a runtime array, in the SAME ORDER as the type above. Frozen so consumers
@@ -102,9 +110,13 @@ export const ENTITY_NAMES = [
   "team_workflow_mapping",
   // CTC-667 — kept in the SAME ORDER as the union above (and as the service's own feed list).
   "pushes",
+  // CTC-704.
+  "push_events",
   "deployments",
   "deployment_statuses",
   "pr_review_threads",
+  // CTC-667 item 4.
+  "check_suites",
 ] as const satisfies readonly EntityName[];
 
 /** The change op — the change-feed wire contract. */

@@ -72,9 +72,13 @@ describe("wire contract", () => {
       // machine), pr_review_threads (the merge gate's resolution state). Deliberate change, matched
       // here on purpose — that is this file's whole job.
       "pushes",
+      // CTC-704: the per-DELIVERY push row — deliberate change, matched here on purpose.
+      "push_events",
       "deployments",
       "deployment_statuses",
       "pr_review_threads",
+      // CTC-667 item 4: GitHub's own check-suite rollup — same, deliberate.
+      "check_suites",
     ];
     expect([...ENTITY_NAMES]).toEqual(expected);
     // ⛔ NO HAND-TYPED COUNT HERE. CTC-643's own ticket: "`toHaveLength(15)` must not simply become
