@@ -1,0 +1,82 @@
+# CTC-672 — does the SDK's published entity list still match the LATEST PUBLISHED schema?
+#
+# ⛔ WHY THIS IS A SEPARATE, SCHEDULED WORKFLOW AND NOT A STEP IN ci.yml.
+# `ci.yml` installs `--frozen-lockfile` and is otherwise offline; this job deliberately reaches the
+# network to fetch a package version this repo does NOT pin. Putting it in the PR gate would make
+# every PR's result depend on npm being up and on work happening in another repo — a red that the PR
+# author cannot fix. The per-PR check stays `test/entity-names-drift.test.ts`.
+#
+# ⭐ THE PROPERTY IT EXISTS FOR: the expected set comes from OUTSIDE this repository, so no edit to
+# package.json, bun.lock, or the detector itself can make it pass. That is CTC-672's own acceptance
+# control, and it is the difference between this and the check it complements.
+name: Entity drift watch
+
+on:
+  schedule:
+    # Daily, 13:20 UTC. Off the hour on purpose — the top of the hour is the busiest slot on shared
+    # runners and this job is not urgent to the minute.
+    - cron: "20 13 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: entity-drift-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: SDK ENTITY_NAMES vs latest published schema
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Compare against the latest published @catalyst-cloud/schema
+        id: drift
+        run: |
+          set -o pipefail
+          bun scripts/check-entity-drift.ts 2>&1 | tee drift.log
+
+      # ⛔ Only on failure, and it carries the detector's OWN output — which names the entities.
+      # An issue that said "drift detected, see logs" would make someone open the run to learn the
+      # one fact that matters.
+      - name: Open an issue naming the drift
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = 'The entity-drift watch failed before it could produce a report.';
+            try { body = fs.readFileSync('drift.log', 'utf8'); } catch {}
+            const title = 'CTC-672: SDK ENTITY_NAMES has drifted from the published schema';
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'entity-drift',
+            });
+            // One open issue at a time — a daily cron would otherwise file the same drift every day
+            // until someone fixed it, which trains people to ignore it.
+            if (existing.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing[0].number,
+                body: `Still drifting as of ${context.sha.slice(0, 7)}:\n\n\`\`\`\n${body}\n\`\`\``,
+              });
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title,
+              labels: ['entity-drift'],
+              body: `\`\`\`\n${body}\n\`\`\`\n\nRaised by \`.github/workflows/entity-drift-watch.yml\` (CTC-672).`,
+            });
