@@ -57,7 +57,17 @@ export type EntityName =
   // CTC-624 / ADR-0033: the tenant's per-team workflow DECISION, projected from the D1 registry —
   // the one entity whose authority is the registry rather than a provider. It carries `workflow_rev`,
   // which is the scalar a host echoes back on /connect (CTC-628, `workflowRevParams` below).
-  | "team_workflow_mapping";
+  | "team_workflow_mapping"
+  // CTC-667: the four payload types the orchestrator's host dispatch consumes that the mirror did not
+  // carry, so the last GitHub smee tunnel could be retired (CTL-1929). `pushes` is the rebase-detection
+  // signal (current head per repo+ref); `deployments` + `deployment_statuses` are what the deploy state
+  // machine keys on (`environment`, `state`, `target_url`, `environment_url`), the statuses append-only
+  // because it acts on the ARRIVAL of a transition; `pr_review_threads` carries the RESOLUTION state
+  // that `pr_review_comments` has no column for — the merge gate AGENTS.md describes.
+  | "pushes"
+  | "deployments"
+  | "deployment_statuses"
+  | "pr_review_threads";
 
 /**
  * The `EntityName` union as a runtime array, in the SAME ORDER as the type above. Frozen so consumers
@@ -90,6 +100,11 @@ export const ENTITY_NAMES = [
   "pr_events",
   "workflow_states",
   "team_workflow_mapping",
+  // CTC-667 — kept in the SAME ORDER as the union above (and as the service's own feed list).
+  "pushes",
+  "deployments",
+  "deployment_statuses",
+  "pr_review_threads",
 ] as const satisfies readonly EntityName[];
 
 /** The change op — the change-feed wire contract. */
