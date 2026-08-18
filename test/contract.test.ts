@@ -34,10 +34,16 @@ describe("wire contract", () => {
     // cannot import `@catalyst-cloud/types` to diff against (that is the header's own note). So the
     // honest statement of what this test does is: it pins the SDK's union against DELIBERATE
     // change — an edit to `types.ts` must be matched here, so no one widens the wire contract by
-    // accident. It CANNOT detect the service moving first. That gap is real, it is what CTC-643
-    // was, and closing it needs a generated artifact or a published contract fixture, not a
-    // better literal. Filed rather than papered over.
-    expect([...ENTITY_NAMES]).toEqual([
+    // accident.
+    //
+    // ⭐ THE "IT CANNOT DETECT THE SERVICE MOVING FIRST" GAP IS NOW CLOSED, and this comment used to
+    // say it needed "a generated artifact or a published contract fixture". It did not: the SDK
+    // already depends on `@catalyst-cloud/schema`, whose `MIRROR_TABLE_META` is derived from the
+    // mirror's own Drizzle definitions via `getTableConfig`. `entity-names-drift.test.ts` reads that
+    // and fails naming the delta. This file keeps the literal (deliberate-change detection); that
+    // one owns tracking the service. Correcting the note rather than leaving a stale "unsolvable"
+    // beside a solved problem.
+    const expected = [
       "issues",
       "labels",
       "users",
@@ -62,8 +68,14 @@ describe("wire contract", () => {
       "pr_events",
       "workflow_states",
       "team_workflow_mapping",
-    ]);
-    expect(ENTITY_NAMES).toHaveLength(24);
+    ];
+    expect([...ENTITY_NAMES]).toEqual(expected);
+    // ⛔ NO HAND-TYPED COUNT HERE. CTC-643's own ticket: "`toHaveLength(15)` must not simply become
+    // `toHaveLength(24)` — a hand-typed count is what let this drift for four ticket generations."
+    // The count that tracks the mirror lives in entity-names-drift.test.ts, DERIVED from the schema.
+    // This file's job is the literal wire contract; asserting a length here as well would put a
+    // second hand-maintained number beside the list it is meant to guard.
+    expect(ENTITY_NAMES).toHaveLength(expected.length);
     // No duplicates (the union has none).
     expect(new Set(ENTITY_NAMES).size).toBe(ENTITY_NAMES.length);
   });
