@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  // CTC-672 — a SEPARATE tsconfig for `scripts/`, deliberately.
+  //
+  // ⛔ The root tsconfig sets `"types": []` and includes only `src`/`test`, which is what keeps the
+  // PUBLISHED package free of an ambient Node dependency — a browser consumer of this SDK must not
+  // inherit `@types/node`. The drift detector is a CI tool that legitimately uses node:fs, node:os
+  // and node:child_process, so it gets its own config rather than widening the package's.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // `esnext` + `bundler` matches how bun actually loads these files: extension-less
+    // relative imports, and import attributes for the JSON read.
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": ["node"]
+  },
+  "include": ["scripts"]
+}

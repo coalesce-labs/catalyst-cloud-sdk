@@ -34,5 +34,11 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      # CTC-672 — the drift detector lives in scripts/, which the package tsconfig deliberately
+      # excludes (it must stay free of @types/node so browser consumers do not inherit it). Without
+      # this step the detector could stop compiling and nothing would say so until the cron ran.
+      - name: Typecheck scripts/
+        run: bun run typecheck:scripts
+
       - name: Test
         run: bunx vitest run

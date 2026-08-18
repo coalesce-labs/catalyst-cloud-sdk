@@ -54,7 +54,8 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "typecheck:scripts": "tsc --noEmit -p tsconfig.scripts.json"
   },
   "keywords": [
     "catalyst",
@@ -72,6 +73,7 @@
     "@opentelemetry/sdk-metrics": "^2.8.0",
     "@opentelemetry/sdk-trace-base": "^2.8.0",
     "@sqlite.org/sqlite-wasm": "^3.53.0-build1",
+    "@types/node": "^26.2.0",
     "typescript": "^5.6.3",
     "vitest": "^2.1.8"
   },
