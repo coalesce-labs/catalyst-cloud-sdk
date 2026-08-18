@@ -20,7 +20,7 @@ import {
 // caught at SDK CI time (we can't import the internal package to compare against it directly).
 
 describe("wire contract", () => {
-  it("EntityName covers exactly the 24 canonical mirror tables, in order", () => {
+  it("EntityName covers exactly the canonical mirror feed tables, in order", () => {
     // Byte-for-byte the @catalyst-cloud/types EntityName union (packages/types/src/index.ts).
     //
     // ⛔ CTC-643 — THIS ASSERTION WAS GREEN WHILE THE UNION WAS STALE BY NINE, and that is the
@@ -68,6 +68,13 @@ describe("wire contract", () => {
       "pr_events",
       "workflow_states",
       "team_workflow_mapping",
+      // CTC-667: pushes (rebase detection), deployments + deployment_statuses (the deploy state
+      // machine), pr_review_threads (the merge gate's resolution state). Deliberate change, matched
+      // here on purpose — that is this file's whole job.
+      "pushes",
+      "deployments",
+      "deployment_statuses",
+      "pr_review_threads",
     ];
     expect([...ENTITY_NAMES]).toEqual(expected);
     // ⛔ NO HAND-TYPED COUNT HERE. CTC-643's own ticket: "`toHaveLength(15)` must not simply become

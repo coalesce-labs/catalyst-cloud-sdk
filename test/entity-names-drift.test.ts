@@ -42,7 +42,11 @@
 // it.
 
 import { describe, expect, it } from "vitest";
-import { MIRROR_TABLE_META } from "@catalyst-cloud/schema";
+import {
+  FEED_ENTITY_NAMES,
+  MIRROR_TABLE_META,
+  NON_FEED_ENTITY_NAMES,
+} from "@catalyst-cloud/schema";
 import { ENTITY_NAMES, type EntityName } from "../src/index";
 
 /**
@@ -56,30 +60,29 @@ type TypesAreEqual<A, B> =
 const exactEquality: TypesAreEqual<EntityName, (typeof ENTITY_NAMES)[number]> = true;
 
 /**
- * Tables that are in the mirror's schema but must NEVER appear on the ACCOUNT-WIDE change feed.
+ * ⭐ CTC-671 — THE EXCLUSION LIST THAT USED TO LIVE HERE IS GONE, and that is the fix.
  *
- * ⛔ `push_subscriptions` IS A SECURITY EXCLUSION, NOT AN OVERSIGHT — and it is the reason this file
- * derives-minus-a-list rather than deriving wholesale. A row carries `endpoint` + `p256dh` + `auth`,
- * which together are the complete capability to push arbitrary notifications to that person's
- * browser. CTC-641 found them being appended to `change_log` and broadcast account-wide to every
- * host replica and every OTHER member's browser OPFS DB, and fixed it by narrowing
- * `MirrorDO.appendAndBroadcast` to the service's `EntityName` — the union whose whole job is "this
- * row is safe for every reader of the account's feed".
+ * This file previously declared `NOT_ON_THE_ACCOUNT_FEED = ["push_subscriptions"]` — a THIRD
+ * hand-maintained list, added because the mirror's two lists disagreed. `mirrorEntityTables` (which
+ * derives `MIRROR_TABLE_META`) contained `push_subscriptions` under a comment saying it "rides the
+ * change feed like any other entity", while the service's own `EntityName` deliberately excluded it:
+ * CTC-641 had found those rows — `endpoint` + `p256dh` + `auth`, together the complete capability to
+ * push arbitrary notifications to a person's browser — being broadcast account-wide to every host
+ * replica and every OTHER member's browser OPFS DB. Deriving this SDK's published list from
+ * `MIRROR_TABLE_META` wholesale would have re-published exactly what CTC-641 removed, in a diff that
+ * looked like one added string.
  *
- * ⚠️ SO THE NAIVE DERIVATION IS WRONG, AND CTC-643's PREFERRED WORDING ASKS FOR IT. `MIRROR_TABLE_META`
- * still contains `push_subscriptions` (CTC-641 narrowed the seam's type and left the schema's own
- * membership — and a comment there asserting it "rides the change feed like any other entity" —
- * untouched). Deriving `ENTITY_NAMES` straight from it would republish that table as a public feed
- * entity, re-asserting at the type level exactly the claim CTC-641 removed. The two lists disagreeing
- * in writing is filed as CTC-671; until that is decided, the exclusion is named HERE, once, with the
- * reason, and the control below fails if anyone quietly drops it.
+ * ⛔ CTC-671 collapsed that into ONE definition, structurally: `@catalyst-cloud/schema` now splits
+ * `feedEntityTables` from `nonFeedEntityTables`, exports `FEED_ENTITY_NAMES` as the single feed
+ * contract, and `MIRROR_TABLE_META` still covers BOTH (so `@catalyst-cloud/replicate`'s
+ * forward-compat `knownColumns` path is unchanged). So this file no longer names the exclusion — it
+ * READS it, which means it can no longer be wrong about it, and the naive-derivation control below
+ * still proves the distinction is doing something.
  */
-const NOT_ON_THE_ACCOUNT_FEED = ["push_subscriptions"] as const;
 
-/** The entity set the SDK should publish, derived from the mirror's own schema. */
+/** The entity set the SDK should publish — the mirror's own feed contract, read not transcribed. */
 function derivedFeedEntities(): string[] {
-  const excluded = new Set<string>(NOT_ON_THE_ACCOUNT_FEED);
-  return Object.keys(MIRROR_TABLE_META).filter((name) => !excluded.has(name));
+  return [...FEED_ENTITY_NAMES];
 }
 
 describe("CTC-643 — the published entity list tracks the mirror's schema", () => {
@@ -101,9 +104,14 @@ describe("CTC-643 — the published entity list tracks the mirror's schema", () 
   it("⛔⛔ SECURITY CONTROL — push_subscriptions is in the schema and must NOT be published", () => {
     // Both halves matter. The first proves the exclusion is still DOING something: if
     // push_subscriptions ever leaves MIRROR_TABLE_META, this fires and whoever removed it is told to
-    // come here and delete the exclusion deliberately, rather than leaving a dead guard behind.
+    // come here and delete the guard deliberately, rather than leaving a dead one behind.
     expect(Object.keys(MIRROR_TABLE_META)).toContain("push_subscriptions");
     expect([...ENTITY_NAMES]).not.toContain("push_subscriptions");
+    // ⭐ CTC-671: and it is excluded STRUCTURALLY, at the schema, not by a filter this file applies.
+    // If someone moves it into `feedEntityTables`, `FEED_ENTITY_NAMES` gains it and the assertion
+    // above fires here — the SDK can no longer silently disagree with the mirror about this table.
+    expect([...NON_FEED_ENTITY_NAMES]).toContain("push_subscriptions");
+    expect([...FEED_ENTITY_NAMES]).not.toContain("push_subscriptions");
   });
 
   it("⛔⛔ NEGATIVE CONTROL — the NAIVE derivation is detectably wrong, and differs by exactly the exclusions", () => {
@@ -113,8 +121,11 @@ describe("CTC-643 — the published entity list tracks the mirror's schema", () 
     // merely "they differ".
     const naive = Object.keys(MIRROR_TABLE_META);
     const published = new Set<string>(ENTITY_NAMES);
-    expect(naive.filter((n) => !published.has(n)).sort()).toEqual([...NOT_ON_THE_ACCOUNT_FEED].sort());
+    expect(naive.filter((n) => !published.has(n)).sort()).toEqual([...NON_FEED_ENTITY_NAMES].sort());
     expect(naive).not.toEqual([...ENTITY_NAMES]);
+    // ⛔ And the exclusion must be NON-EMPTY. If `nonFeedEntityTables` were ever emptied, every
+    // assertion in this file would still pass while the feed list quietly became the naive one.
+    expect(NON_FEED_ENTITY_NAMES.length).toBeGreaterThan(0);
   });
 
   it("⭐ EntityName and ENTITY_NAMES are EXACTLY equal — a compile-time check, not a cast", () => {
