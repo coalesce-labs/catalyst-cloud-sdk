@@ -129,10 +129,7 @@ Requires a platform `WebSocket` (browser, Bun, or Node ≥22). On older Node, in
 
 ### Browser — managed OPFS replica (`/browser`)
 
-`BrowserReplica` is the browser twin of `/node`'s `CatalystReplica`: an OPFS-persisted SQLite replica
-in a dedicated Web Worker, seeded from `/snapshot` in bounded streamed batches, kept live off the same
-change feed, and read through the same `@catalyst-cloud/read-model` views — no hand-written worker,
-apply, or seeding code in your app.
+`BrowserReplica` is the browser twin of `/node`'s `CatalystReplica`: an OPFS-persisted SQLite replica in a dedicated Web Worker, seeded from `/snapshot` in bounded streamed batches, kept live off the same change feed, and read through the same `@catalyst-cloud/read-model` views — no hand-written worker, apply, or seeding code in your app.
 
 ```ts
 import {
@@ -175,32 +172,20 @@ if (isBrowserReplicaSupported()) {
 }
 ```
 
-`status` above is whatever your `onStatus` handler last recorded. `start()` REJECTS if the boot fails
-(bad origin, missing worker chunk, OPFS unavailable) — it does not resolve into a broken state, so a
-`try`/`catch` around it is where you surface the error to the user.
+`status` above is whatever your `onStatus` handler last recorded. `start()` REJECTS if the boot fails (bad origin, missing worker chunk, OPFS unavailable) — it does not resolve into a broken state, so a `try`/`catch` around it is where you surface the error to the user.
 
 Built in, because browsers need them:
 
-- **Single-owner election** (Web Locks): OPFS SAHPool is single-connection-per-origin, so exactly one
-  tab boots the replica; every other tab gets status `"secondary"` (a clean state, not an error) and
-  should read via its normal fetch path.
-- **Backpressure**: live deltas are coalesced into batched, single-flight applies with a bounded
-  buffer; a backlog too deep to replay escalates to a fresh snapshot instead of growing.
+- **Single-owner election** (Web Locks): OPFS SAHPool is single-connection-per-origin, so exactly one tab boots the replica; every other tab gets status `"secondary"` (a clean state, not an error) and should read via its normal fetch path.
+- **Backpressure**: live deltas are coalesced into batched, single-flight applies with a bounded buffer; a backlog too deep to replay escalates to a fresh snapshot instead of growing.
 
-**Peer dependency**: install [`@sqlite.org/sqlite-wasm`](https://www.npmjs.com/package/@sqlite.org/sqlite-wasm)
-yourself — the SDK never bundles the wasm.
+**Peer dependency**: install [`@sqlite.org/sqlite-wasm`](https://www.npmjs.com/package/@sqlite.org/sqlite-wasm) yourself — the SDK never bundles the wasm.
 
-**Bundlers**: the worker is created with `new Worker(new URL("./db.worker.js", import.meta.url),
-{ type: "module" })`, which Vite, webpack 5, and Rollup detect statically and split into its own chunk
-(nothing wasm-related touches your main bundle; `/node` consumers never see it at all). Notes:
+**Bundlers**: the worker is created with `new Worker(new URL("./db.worker.js", import.meta.url), { type: "module" })`, which Vite, webpack 5, and Rollup detect statically and split into its own chunk (nothing wasm-related touches your main bundle; `/node` consumers never see it at all). Notes:
 
-- **Vite**: works out of the box in `build`. In dev, if pre-bundling interferes with the worker URL,
-  add `optimizeDeps: { exclude: ["@catalyst-cloud/sdk"] }`.
-- **webpack 5 / Rollup**: the `new Worker(new URL(...))` syntax is supported natively (Rollup needs
-  worker support in your config, e.g. `@surma/rollup-plugin-off-main-thread` or equivalent).
-- **Exotic bundlers**: pass `createWorker` in `BrowserReplicaOptions` and construct the worker
-  however your toolchain requires. The worker module is published at the dedicated subpath
-  **`@catalyst-cloud/sdk/browser/db-worker`** — that specifier is the supported entry point:
+- **Vite**: works out of the box in `build`. In dev, if pre-bundling interferes with the worker URL, add `optimizeDeps: { exclude: ["@catalyst-cloud/sdk"] }`.
+- **webpack 5 / Rollup**: the `new Worker(new URL(...))` syntax is supported natively (Rollup needs worker support in your config, e.g. `@surma/rollup-plugin-off-main-thread` or equivalent).
+- **Exotic bundlers**: pass `createWorker` in `BrowserReplicaOptions` and construct the worker however your toolchain requires. The worker module is published at the dedicated subpath **`@catalyst-cloud/sdk/browser/db-worker`** — that specifier is the supported entry point:
 
   ```ts
   // Vite
@@ -215,9 +200,7 @@ yourself — the SDK never bundles the wasm.
     );
   ```
 
-  The worker is a **side-effect module** (it registers a message handler and exports nothing), so it
-  is listed in the package's `sideEffects` array — do not configure your bundler to tree-shake it, or
-  it will load and register nothing and every replica call will hang.
+  The worker is a **side-effect module** (it registers a message handler and exports nothing), so it is listed in the package's `sideEffects` array — do not configure your bundler to tree-shake it, or it will load and register nothing and every replica call will hang.
 
 ## API
 
