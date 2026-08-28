@@ -1,0 +1,23 @@
+{
+  "lastUpdated": "2026-06-30T02:34:49Z",
+  "currentTicket": "CTC-139",
+  "orchestration": null,
+  "mostRecentDocument": {
+    "type": "handoffs",
+    "path": "/Users/ryan/code-repos/github/coalesce-labs/catalyst-cloud/thoughts/shared/handoffs/CTC-139/2026-06-29_21-32-41_linear-webhook-staleness-and-sdk-monitoring.md",
+    "created": "2026-06-30T02:34:49Z",
+    "ticket": "CTC-139"
+  },
+  "workflow": {
+    "research": [],
+    "plans": [],
+    "handoffs": [
+      {
+        "path": "/Users/ryan/code-repos/github/coalesce-labs/catalyst-cloud/thoughts/shared/handoffs/CTC-139/2026-06-29_21-32-41_linear-webhook-staleness-and-sdk-monitoring.md",
+        "created": "2026-06-30T02:34:49Z",
+        "ticket": "CTC-139"
+      }
+    ],
+    "prs": []
+  }
+}
