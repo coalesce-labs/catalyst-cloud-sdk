@@ -6,8 +6,8 @@
       "name": "@catalyst-cloud/sdk",
       "dependencies": {
         "@catalyst-cloud/read-model": "^0.1.0",
-        "@catalyst-cloud/replicate": "0.1.24",
-        "@catalyst-cloud/schema": "0.1.30",
+        "@catalyst-cloud/replicate": "0.1.25",
+        "@catalyst-cloud/schema": "0.1.31",
       },
       "devDependencies": {
         "@opentelemetry/api": "^1.9.0",
@@ -35,9 +35,9 @@
   "packages": {
     "@catalyst-cloud/read-model": ["@catalyst-cloud/read-model@0.1.0", "", {}, "sha512-TODVDFkY5moO0qnWnb/G6+7AI/X9Bl2Zp/2+ymBQDraf1aAjmXloem3qj/FPURjfakx1aDEVEFULO+PpKnC6JQ=="],
 
-    "@catalyst-cloud/replicate": ["@catalyst-cloud/replicate@0.1.24", "", { "dependencies": { "@catalyst-cloud/schema": "0.1.30" } }, "sha512-SzXDZ9b5qmXeUBopFHAwsWESl68hQlpLfcS8W7fHIdG3G0IX+K5rAJqThs1jq9PEbEHLqF4g0O39o/JlypSH9g=="],
+    "@catalyst-cloud/replicate": ["@catalyst-cloud/replicate@0.1.25", "", { "dependencies": { "@catalyst-cloud/schema": "0.1.31" } }, "sha512-WrhN0CwG5eLsdGPv9v1+C2QvNDyXU7kUG8y/yQTYfTerqh+ZWyJh3X5DtzAwvA8cBhvvD+UwJ3v/532U6ulSIw=="],
 
-    "@catalyst-cloud/schema": ["@catalyst-cloud/schema@0.1.30", "", { "dependencies": { "drizzle-orm": "0.45.2" } }, "sha512-ogH9k2TbBkDp7cMWAwzfjPljqeEJo/jJBBJfC31+LOPseuz3FJzIYgC47Sf9xLhv7Y/60PK8Jp5xJ2oS2ZS0TQ=="],
+    "@catalyst-cloud/schema": ["@catalyst-cloud/schema@0.1.31", "", { "dependencies": { "drizzle-orm": "0.45.2" } }, "sha512-+W9xhET3VIF5oourkTpTX9yGlpvbmvkYQ/lGc7hBvc6D8zXTNdWJjyLaJ+GdoeF/HbmkRYezYzrEU4C8UdKeYw=="],
 
     "@esbuild/aix-ppc64": ["@esbuild/aix-ppc64@0.21.5", "", { "os": "aix", "cpu": "ppc64" }, "sha512-1SDgH6ZSPTlggy1yI6+Dbkiz8xzpHJEVAlF/AM1tHPLsf5STom9rwtjE4hKAF20FfXXNTFqEYXyJNWh1GiZedQ=="],
 
