@@ -79,6 +79,10 @@ describe("wire contract", () => {
       "pr_review_threads",
       // CTC-667 item 4: GitHub's own check-suite rollup — same, deliberate.
       "check_suites",
+      // CTC-355 — the two fleet-liveness feed entities, added here in step with types.ts because
+      // this literal exists to make a widening of the wire contract DELIBERATE.
+      "fleet_host_liveness",
+      "fleet_anomalies",
     ];
     expect([...ENTITY_NAMES]).toEqual(expected);
     // ⛔ NO HAND-TYPED COUNT HERE. CTC-643's own ticket: "`toHaveLength(15)` must not simply become
