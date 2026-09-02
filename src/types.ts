@@ -75,7 +75,11 @@ export type EntityName =
   // CTC-667 item 4: GitHub's OWN check-suite rollup — the highest-volume signal in the census and
   // what every phase agent's CI wait blocks on. ⛔ The row is contractual; a derivation from
   // `check_runs` is NOT (neutral/skipped are non-failing; required-ness is not a check_runs fact).
-  | "check_suites";
+  | "check_suites"
+  // CTC-355 — per-host fleet liveness and its open anomaly signals. Feed entities, not browser-only:
+  // the tenant DO broadcasts both on /connect so an operator board updates without a reload.
+  | "fleet_host_liveness"
+  | "fleet_anomalies";
 
 /**
  * The `EntityName` union as a runtime array, in the SAME ORDER as the type above. Frozen so consumers
@@ -117,6 +121,9 @@ export const ENTITY_NAMES = [
   "pr_review_threads",
   // CTC-667 item 4.
   "check_suites",
+  // CTC-355 — same order as the union above.
+  "fleet_host_liveness",
+  "fleet_anomalies",
 ] as const satisfies readonly EntityName[];
 
 /** The change op — the change-feed wire contract. */
