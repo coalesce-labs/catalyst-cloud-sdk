@@ -202,6 +202,48 @@ Built in, because browsers need them:
 
   The worker is a **side-effect module** (it registers a message handler and exports nothing), so it is listed in the package's `sideEffects` array — do not configure your bundler to tree-shake it, or it will load and register nothing and every replica call will hang.
 
+### Tenant client — typed reads and writes over HTTP
+
+`createTenantClient` is one implementation of every tenant read and write, so a CLI, a skill script, an MCP tool and your own code share it instead of each carrying a bearer, a base URL and a response parser. Every call resolves to a discriminated union on `outcome` — nothing throws for a server answer — and every `agent.*` write's path is resolved from the tenant's own contract (`GET /api/v1/agent/contract`, read once and cached under the document's own ETag policy), never a literal.
+
+```ts
+import { createTenantClient, stageIdForSlot, teamForTicket } from "@catalyst-cloud/sdk";
+
+const client = createTenantClient({
+  key: process.env.CATALYST_CLOUD_TOKEN!,        // an organization-tier key for agent.* writes
+  baseUrl: "https://staging.catalystcloud.dev",
+});
+
+// A keyset-paged read: follow `nextCursor` (typed, read off X-Mirror-Next-Cursor) until it is null.
+let after = undefined;
+do {
+  const page = await client.issues.list({ teamKey: "ENG", state: "active", limit: 100, after });
+  if (page.outcome !== "ok") throw new Error(`${page.outcome}: ${"reason" in page ? page.reason : ""}`);
+  for (const row of page.rows) console.log(row.identifier, row.title);
+  after = page.nextCursor ?? undefined;
+} while (after);
+
+// A write as the app actor. The state id comes from the contract by SLOT, never by a display name.
+const contract = await client.contract();
+if (contract.outcome !== "ok") throw new Error(`contract: ${contract.outcome}`);
+const team = teamForTicket(contract.doc, "ENG-12");
+const stage = team.outcome === "ok" ? stageIdForSlot(team.team, "research") : team;
+if (stage.outcome !== "ok") throw new Error(stage.outcome);   // "slot-unmapped" / "slot-stale" / "team-unknown"
+
+const issue = await client.issues.get("ENG-12");
+if (issue.outcome !== "ok") throw new Error(issue.outcome);
+const moved = await client.agent.issueState({ issueId: issue.issue.id, stateId: stage.stateId });
+switch (moved.outcome) {
+  case "succeeded":     break;                                  // moved.attempts
+  case "rate-limited":  /* moved.retryAfterSeconds may be null */ break;
+  case "forbidden":     /* moved.required names a missing scope */ break;
+  case "route-unknown": /* this tenant's contract lists no issue-state route */ break;
+  default:              /* rejected | exhausted | failed | unauthorized | network | shape | http | stale | missing */ break;
+}
+```
+
+The contract cache is in memory per client by default; pass `contractCache: { get, set }` to keep it on disk (the bundle does). `fetch`, `now` and `timeoutMs` are injectable so a test never opens a socket.
+
 ## API
 
 | Export | What it is |
@@ -211,6 +253,9 @@ Built in, because browsers need them:
 | `AuthStrategy` | `{ kind: "token"; token }` (backend) or `{ kind: "cookie" }` (browser). |
 | `LiveSyncStatus` | `"connecting"` · `"live"` · `"reconnecting"` · `"resyncing"` · `"error"` · `"stopped"`. |
 | `ChangeFrame` · `EntityName` · `ChangeOp` | The change shape + the entity/op contract. |
+| `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `issues.list/get`, `pulls.list/get`, `projects.list`, `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept). |
+| `TenantContract` · `routeByName` · `teamByKey` · `teamForTicket` · `stageIdForSlot` · `labelIdFor` | The contract document's shape and the pure accessors over it, each returning a typed miss rather than throwing. |
+| `TenantClientFailure` · `PageCursor` · `pageCursor` · `memoryContractCache` | The shared failure arms, the opaque page token, and the default contract cache store. |
 
 `start()` resolves only when `stop()` is called. On a backend, `await` it to keep the process alive; in a browser, never await it — just call `stop()` on teardown.
 
