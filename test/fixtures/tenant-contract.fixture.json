@@ -1,0 +1,579 @@
+{
+  "contractVersion": "1.0.0",
+  "protocolVersion": 4,
+  "cache": {
+    "maxAgeSeconds": 900,
+    "staleRefusalSeconds": 3600
+  },
+  "account": {
+    "id": "acct-fixture",
+    "slug": "acme-fixture",
+    "name": "Acme (contract fixture)",
+    "linearWorkspaceId": "lw-fixture",
+    "linearWorkspaceSlug": "acme"
+  },
+  "apiPrefix": "/api/v1",
+  "slots": [
+    "dispatch",
+    "intake",
+    "research",
+    "plan",
+    "implement",
+    "remediate",
+    "verify",
+    "review",
+    "pr",
+    "done",
+    "canceled"
+  ],
+  "routes": [
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/delegate",
+      "takesWriteBudgetUnit": false,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/issue-state",
+      "takesWriteBudgetUnit": true,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/issue-label",
+      "takesWriteBudgetUnit": true,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/issue-comment",
+      "takesWriteBudgetUnit": true,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/ask-accept",
+      "takesWriteBudgetUnit": true,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/ask",
+      "takesWriteBudgetUnit": true,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/attachment",
+      "takesWriteBudgetUnit": true,
+      "since": "1.0.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/attachments",
+      "takesWriteBudgetUnit": false,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/session",
+      "takesWriteBudgetUnit": true,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/reaction",
+      "takesWriteBudgetUnit": true,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/issue-create",
+      "takesWriteBudgetUnit": true,
+      "since": "1.0.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/linear/read",
+      "takesWriteBudgetUnit": false,
+      "since": "1.0.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/contract",
+      "takesWriteBudgetUnit": false,
+      "since": "1.0.0"
+    }
+  ],
+  "teams": [
+    {
+      "id": "team-eng",
+      "key": "ENG",
+      "name": "Engineering",
+      "workflowMode": "auto",
+      "gitAutomation": "full",
+      "stages": {
+        "dispatch": {
+          "stateId": "state-todo",
+          "name": "Todo",
+          "type": "unstarted",
+          "stateStillExists": true,
+          "source": "matched"
+        },
+        "intake": {
+          "stateId": "state-intake",
+          "name": "Intake",
+          "type": "unstarted",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "research": {
+          "stateId": "state-research",
+          "name": "Research",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "plan": {
+          "stateId": "state-plan",
+          "name": "Plan",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "implement": {
+          "stateId": "state-implement",
+          "name": "In Progress",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "chosen"
+        },
+        "remediate": {
+          "stateId": "state-remediate",
+          "name": "Remediate",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "verify": {
+          "stateId": "state-verify",
+          "name": "Validate",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "review": {
+          "stateId": "state-deleted",
+          "name": null,
+          "type": null,
+          "stateStillExists": false,
+          "source": "matched"
+        },
+        "pr": {
+          "stateId": "state-pr",
+          "name": "In Review",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "matched"
+        },
+        "done": {
+          "stateId": "state-done",
+          "name": "Done",
+          "type": "completed",
+          "stateStillExists": true,
+          "source": "matched"
+        }
+      },
+      "labels": {
+        "ask": [
+          {
+            "name": "catalyst-ask",
+            "unscopedId": "label-ask-unscoped",
+            "teamScopedId": "label-ask-eng",
+            "scope": "unscoped",
+            "preferredId": "label-ask-unscoped"
+          }
+        ],
+        "hold": [
+          {
+            "name": "hold:needs-remediation",
+            "unscopedId": null,
+            "teamScopedId": "label-remediate-eng",
+            "scope": "team",
+            "preferredId": "label-remediate-eng"
+          }
+        ],
+        "release": [
+          {
+            "name": "catalyst-not-an-ask",
+            "unscopedId": null,
+            "teamScopedId": null,
+            "scope": "absent",
+            "preferredId": null
+          }
+        ]
+      },
+      "readiness": {
+        "status": "ready",
+        "checks": [
+          {
+            "id": "oauth_scope",
+            "state": "pass"
+          },
+          {
+            "id": "mapping_total",
+            "state": "pass"
+          },
+          {
+            "id": "webhook_covers_team",
+            "state": "unknown"
+          }
+        ],
+        "checkedAt": 1756000000000,
+        "expiresAt": 1756003600000,
+        "workflowRev": 7
+      }
+    },
+    {
+      "id": "team-ops",
+      "key": "OPS",
+      "name": "Operations",
+      "workflowMode": "manual",
+      "gitAutomation": "off",
+      "stages": {},
+      "labels": {
+        "ask": [
+          {
+            "name": "catalyst-ask",
+            "unscopedId": "label-ask-unscoped",
+            "teamScopedId": null,
+            "scope": "unscoped",
+            "preferredId": "label-ask-unscoped"
+          }
+        ],
+        "hold": [
+          {
+            "name": "hold:needs-remediation",
+            "unscopedId": null,
+            "teamScopedId": null,
+            "scope": "absent",
+            "preferredId": null
+          }
+        ],
+        "release": [
+          {
+            "name": "catalyst-not-an-ask",
+            "unscopedId": null,
+            "teamScopedId": null,
+            "scope": "absent",
+            "preferredId": null
+          }
+        ]
+      },
+      "readiness": {
+        "status": "unchecked",
+        "checks": [],
+        "checkedAt": null,
+        "expiresAt": null,
+        "workflowRev": null
+      }
+    }
+  ],
+  "vocabulary": {
+    "askLabelPrefix": "ask/",
+    "askPhaseLabelPrefix": "ask/phase:",
+    "askMarkerLabel": "catalyst-ask",
+    "releaseLabel": "catalyst-not-an-ask",
+    "bookkeeping": {
+      "marker": "[bookkeeping]",
+      "prefixOnly": true,
+      "asciiCaseInsensitive": true,
+      "leadingWhitespaceTrimmed": true
+    }
+  },
+  "askTemplate": {
+    "headings": {
+      "ask": "**Ask:**",
+      "options": "**Options:**",
+      "defaultIfSilent": "**Default if silent:**",
+      "howToAnswer": "**How to answer:**"
+    },
+    "howToAnswer": {
+      "withOptions": "**How to answer:** reply in this thread with the option letter on its own (`A`), `(A)`, `option A`, or the option's own text pasted back. For an answer that is not on the list, reply `DECIDED: <your answer>`.",
+      "withoutOptions": "**How to answer:** reply in this thread with `DECIDED: <your answer>` to record your decision."
+    },
+    "optionBulletFormat": "- **A** — <label>",
+    "maxLetteredOptions": 26,
+    "maxAskGenerations": 25,
+    "example": "**Ask:** Should we adopt approach A or approach B?\n\nContext for the decision goes here.\n\n**Options:**\n- **A** — Option A\n- **B** — Option B\n\n**Default if silent:** Option A\n\n**How to answer:** reply in this thread with the option letter on its own (`A`), `(A)`, `option A`, or the option's own text pasted back. For an answer that is not on the list, reply `DECIDED: <your answer>`."
+  },
+  "ladder": {
+    "phases": [
+      "intake",
+      "research",
+      "plan",
+      "implement",
+      "validate",
+      "pr",
+      "remediate",
+      "merge"
+    ],
+    "keying": "trailing",
+    "keyingScope": "fleet",
+    "intakeEnabled": true,
+    "advance": [
+      {
+        "phase": "intake",
+        "result": "ok",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "CTC-1530 — intake's board moves (Todo→Intake at claim, Intake→Research on completion) are a PARALLEL mechanism (apps/mirror/src/do/intake-state-move.ts), never this table, for the same reason ADR-0069 gives for remediate: a move this table does not own must not desynchronize fromSlots matching here."
+      },
+      {
+        "phase": "intake",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "research",
+        "result": "ok",
+        "fromSlots": [
+          "dispatch"
+        ],
+        "toSlot": "research",
+        "because": "the ticket leaves Todo the moment research lands"
+      },
+      {
+        "phase": "research",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "plan",
+        "result": "ok",
+        "fromSlots": [
+          "research"
+        ],
+        "toSlot": "plan",
+        "because": "the plan artifact exists — the ticket moves into Plan"
+      },
+      {
+        "phase": "plan",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "implement",
+        "result": "ok",
+        "fromSlots": [
+          "plan"
+        ],
+        "toSlot": "implement",
+        "because": "implementation commits landed — the ticket moves into Implement"
+      },
+      {
+        "phase": "implement",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "validate",
+        "result": "ok",
+        "fromSlots": [
+          "implement"
+        ],
+        "toSlot": "review",
+        "because": "review and verify both collapse onto the tenant's Validate stage"
+      },
+      {
+        "phase": "validate",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "pr",
+        "result": "ok",
+        "fromSlots": [
+          "review"
+        ],
+        "toSlot": "pr",
+        "because": "this row is what unblocks evaluateTicket's not_at_pr_stage gate"
+      },
+      {
+        "phase": "pr",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "remediate",
+        "result": "ok",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a remediate round fixes findings and resolves threads on an already-PR'd ticket — it is an interrupt, not a ladder step, and never advances workflow state; only merge moves the ticket past pr"
+      },
+      {
+        "phase": "remediate",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "merge",
+        "result": "ok",
+        "fromSlots": [
+          "pr"
+        ],
+        "toSlot": null,
+        "because": "CTC-1187 — the merge PHASE succeeding means `queue:ready` was applied (apps/runner/src/executors/merge.ts: \"never 'PR merged'\"), not that the PR merged. Mergify can still dequeue it on a red Check (full). The terminal Done write is keyed to the real merge webhook instead — see resolveMergedPrAdvance below and ADR-20260902T031406."
+      },
+      {
+        "phase": "merge",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      }
+    ]
+  },
+  "thresholds": {
+    "scope": "fleet",
+    "parkAfterConsecutiveFailures": 3,
+    "remediateRoundCap": 3,
+    "remediateEscalatedRoundBudget": 1,
+    "remediateRewindBudget": 1,
+    "retryBackoffMs": [
+      120000,
+      300000,
+      900000
+    ],
+    "hostDailyWriteBudget": 3000
+  },
+  "merge": {
+    "policies": [
+      "codex-attestation",
+      "codex-attestation-strict",
+      "checks-and-threads"
+    ],
+    "defaultPolicy": "codex-attestation",
+    "repositories": [
+      {
+        "repoId": "repo-api",
+        "owner": "acme",
+        "name": "api",
+        "policy": "codex-attestation-strict",
+        "policySource": "repo"
+      },
+      {
+        "repoId": "repo-web",
+        "owner": "acme",
+        "name": "web",
+        "policy": "checks-and-threads",
+        "policySource": "tenant"
+      }
+    ],
+    "reviewerLogin": "chatgpt-codex-connector[bot]",
+    "cleanPassShapes": [
+      {
+        "kind": "reaction:+1",
+        "description": "a 👍 reaction from chatgpt-codex-connector[bot], posted at or after the head commit's own timestamp",
+        "honoured": true,
+        "ticket": null
+      },
+      {
+        "kind": "comment:no-major-issues",
+        "description": "a terse \"no major issues\" issue comment from chatgpt-codex-connector[bot] in place of opening review threads",
+        "honoured": false,
+        "ticket": "CTC-1919"
+      }
+    ],
+    "cloudRemediateRequiredChecks": [
+      "Check",
+      "Check (full)"
+    ],
+    "prLabels": {
+      "queueReady": "queue:ready",
+      "handStepsHold": "hold:hand-steps",
+      "hold": "hold",
+      "preview": "hold:preview"
+    }
+  },
+  "readinessChecks": [
+    {
+      "id": "oauth_scope",
+      "severity": "blocking",
+      "needsAnswer": true
+    },
+    {
+      "id": "token_live",
+      "severity": "blocking",
+      "needsAnswer": true
+    },
+    {
+      "id": "team_visible",
+      "severity": "blocking",
+      "needsAnswer": true
+    },
+    {
+      "id": "mapped_states_exist",
+      "severity": "blocking",
+      "needsAnswer": true
+    },
+    {
+      "id": "mapping_total",
+      "severity": "blocking",
+      "needsAnswer": true
+    },
+    {
+      "id": "types_compatible",
+      "severity": "blocking",
+      "needsAnswer": true
+    },
+    {
+      "id": "labels_present",
+      "severity": "degrading",
+      "needsAnswer": false
+    },
+    {
+      "id": "writes_land",
+      "severity": "blocking",
+      "needsAnswer": false
+    },
+    {
+      "id": "webhook_covers_team",
+      "severity": "degrading",
+      "needsAnswer": false
+    },
+    {
+      "id": "hosts_current",
+      "severity": "degrading",
+      "needsAnswer": false
+    }
+  ],
+  "humans": [
+    {
+      "linearUserId": "u-fixture-owner",
+      "role": "owner"
+    },
+    {
+      "linearUserId": "u-fixture-admin",
+      "role": "admin"
+    }
+  ],
+  "asks": {
+    "approvalsTeamId": "team-eng"
+  }
+}
