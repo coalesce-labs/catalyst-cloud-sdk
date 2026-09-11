@@ -148,6 +148,50 @@ describe("contract() — the cache policy", () => {
     expect(res.outcome === "stale" && res.cause.outcome === "network" && res.cause.reason).toContain("ECONNREFUSED");
   });
 
+  it("⛔ P1 (Codex #65 r1) — a transient 5xx/429 on revalidation inside staleRefusalSeconds serves the cache", async () => {
+    const { c, store } = await primed();
+    const net2 = scriptedFetch([
+      () => json(502, { outcome: "failed", reason: "teams_unreadable" }),
+      () => text(503, "upstream unavailable"),
+      () => json(429, { error: "rate limited" }, { "Retry-After": "7" }),
+    ]);
+    const client2 = createTenantClient({ key: KEY, baseUrl: BASE, fetch: net2.fetch, contractCache: store, now: c.now });
+    c.advanceSeconds(MAX_AGE);
+    for (const _ of [502, 503, 429]) {
+      expect(await client2.contract()).toMatchObject({ outcome: "ok", source: "cache", ageSeconds: MAX_AGE, etag: ETAG });
+    }
+    expect(net2.calls).toHaveLength(3);
+    expect(net2.calls[0]!.headers["if-none-match"]).toBe(ETAG);
+  });
+
+  it("⛔ P1 (Codex #65 r1) — a transient 5xx on revalidation PAST staleRefusalSeconds is the typed `stale`, carrying the failure as its cause", async () => {
+    const { c, store } = await primed();
+    const net2 = scriptedFetch([() => json(503, { outcome: "failed", reason: "could not reach Linear" })]);
+    const client2 = createTenantClient({ key: KEY, baseUrl: BASE, fetch: net2.fetch, contractCache: store, now: c.now });
+    c.advanceSeconds(STALE_AFTER);
+    expect(await client2.contract()).toEqual({
+      outcome: "stale",
+      ageSeconds: STALE_AFTER,
+      staleRefusalSeconds: STALE_AFTER,
+      cause: { outcome: "failed", status: 503, reason: "could not reach Linear" },
+    });
+  });
+
+  it("a credential refusal on revalidation is NOT papered over by the cache: 401/403 come back as themselves", async () => {
+    // The cache policy covers the SERVER being unavailable, not the KEY having been revoked or
+    // re-scoped — serving a cached document to a caller whose credential no longer reads it would
+    // hide exactly the fact the operator needs.
+    const { c, store } = await primed();
+    const net2 = scriptedFetch([
+      () => json(403, { error: "forbidden", reason: "missing-scope", required: "mirror:read" }),
+      () => json(401, { error: "unauthorized", reason: "credential-not-accepted", ref: "x1" }),
+    ]);
+    const client2 = createTenantClient({ key: KEY, baseUrl: BASE, fetch: net2.fetch, contractCache: store, now: c.now });
+    c.advanceSeconds(MAX_AGE);
+    expect(await client2.contract()).toMatchObject({ outcome: "forbidden", required: "mirror:read" });
+    expect(await client2.contract()).toMatchObject({ outcome: "unauthorized", ref: "x1" });
+  });
+
   it("offline:true serves the cache when there is one and answers `missing` when there is none", async () => {
     const { c, store } = await primed();
     const net2 = scriptedFetch([() => new Error("must not be called")]);
@@ -225,6 +269,22 @@ describe("contract() — the server's refusals, as typed arms", () => {
     const net = scriptedFetch([() => text(500, "internal error")]);
     const client = createTenantClient({ key: KEY, baseUrl: BASE, fetch: net.fetch });
     expect(await client.contract()).toEqual({ outcome: "http", status: 500, reason: "internal error" });
+  });
+
+  it("⛔ P2 (Codex #65 r1) — a body stream that fails AFTER the headers arrived is `network`, not a throw", async () => {
+    const broken = new Response(
+      new ReadableStream({
+        pull(controller) {
+          controller.error(new Error("body reset by peer"));
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+    const net = scriptedFetch([() => broken]);
+    const client = createTenantClient({ key: KEY, baseUrl: BASE, fetch: net.fetch });
+    const res = await client.contract();
+    expect(res.outcome).toBe("network");
+    expect(res.outcome === "network" && res.reason).toContain("body reset by peer");
   });
 
   it("a fetch that throws with no cache → network", async () => {

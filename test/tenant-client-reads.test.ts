@@ -117,6 +117,18 @@ describe("issues.list", () => {
     expect(await client.issues.list()).toMatchObject({ outcome: "shape", status: 200 });
   });
 
+  it("⛔ P2 (Codex #65 r1) — a non-object row anywhere in the page is a `shape` failure for the whole page, never a silently dropped row", async () => {
+    const net = scriptedFetch([
+      () => json(200, [ROW, 42], { "X-Mirror-Next-Cursor": "tok2", "X-Mirror-Total": "2" }),
+      () => json(200, [null], { "X-Mirror-Total": "1" }),
+      () => json(200, ["str"]),
+    ]);
+    const client = createTenantClient({ key: KEY, baseUrl: BASE, fetch: net.fetch });
+    expect(await client.issues.list()).toMatchObject({ outcome: "shape", status: 200 });
+    expect(await client.pulls.list()).toMatchObject({ outcome: "shape", status: 200 });
+    expect(await client.projects.list()).toMatchObject({ outcome: "shape", status: 200 });
+  });
+
   it("a 401 on a read is the same unauthorized arm the contract read answers", async () => {
     const net = scriptedFetch([() => json(401, { error: "unauthorized", reason: "credential-not-accepted", ref: "r1" })]);
     const client = createTenantClient({ key: KEY, baseUrl: BASE, fetch: net.fetch });

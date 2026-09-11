@@ -571,6 +571,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     };
     if (body !== undefined) headers["content-type"] = "application/json";
     let res: Response;
+    let text: string;
     try {
       res = await fetchImpl(target, {
         method,
@@ -578,11 +579,15 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: AbortSignal.timeout(timeoutMs),
       });
+      // ⛔ THE BODY READ IS INSIDE THE TRY (Codex #65 r1, P2). `fetch` resolves once the HEADERS
+      // arrive; the stream can still fail, or the deadline fire, while `text()` consumes it — and
+      // that rejection is a transport failure exactly like a refused connect, not an exception the
+      // public call may leak.
+      text = await res.text();
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       return { ok: false, failure: { outcome: "network", reason: `could not reach ${target}: ${reason}` } };
     }
-    const text = await res.text();
     let json: unknown;
     if (text !== "") {
       try {
@@ -617,15 +622,24 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
       return { outcome: "missing", reason: "no cached contract and network reads are disabled" };
     }
 
-    const sent = await send("GET", url(CONTRACT_ROUTE), cached?.etag ? { "if-none-match": cached.etag } : {});
-    if (!sent.ok) {
-      if (cached === null) return sent.failure;
+    // A revalidation that could not complete — the transport failed, or the server answered a
+    // TRANSIENT non-2xx (5xx, 429) — leaves the cached document exactly as usable as the policy says:
+    // served until `staleRefusalSeconds`, refused by name as `stale` past it (Codex #65 r1, P1:
+    // every agent.* call loads the contract first, so a brief server failure at the max-age
+    // boundary must not disable every write). A credential refusal (401/403) or a 400 is NOT
+    // transient and is returned as itself: the cache covers the server being away, never the key
+    // having been revoked or re-scoped.
+    const unavailable = (cause: TenantClientFailure): ContractResult => {
+      if (cached === null) return cause;
       if (ageSeconds >= cached.doc.cache.staleRefusalSeconds) {
-        return { outcome: "stale", ageSeconds, staleRefusalSeconds: cached.doc.cache.staleRefusalSeconds, cause: sent.failure };
+        return { outcome: "stale", ageSeconds, staleRefusalSeconds: cached.doc.cache.staleRefusalSeconds, cause };
       }
       return fromCache(cached);
-    }
+    };
+    const sent = await send("GET", url(CONTRACT_ROUTE), cached?.etag ? { "if-none-match": cached.etag } : {});
+    if (!sent.ok) return unavailable(sent.failure);
     const { answer } = sent;
+    if (answer.status === 429 || answer.status >= 500) return unavailable(classify(answer));
 
     if (answer.status === 304) {
       if (cached === null) {
@@ -662,10 +676,19 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     };
   }
 
-  function rowsOf<T>(rows: unknown[]): T[] {
-    // The mirror's list bodies are the read-model's own view rows; the only shape check a client can
-    // make without re-declaring the view is "an array of objects".
-    return rows.filter((r): r is T => isRecord(r));
+  /**
+   * The mirror's list bodies are the read-model's own view rows; the only shape check a client can
+   * make without re-declaring the view is "every row is an object". ⛔ ONE bad row fails the WHOLE
+   * page (Codex #65 r1, P2): the cursor and the totals describe the server's page, so a silently
+   * dropped row could never be recovered by paging — `ok` with fewer rows would be a lie.
+   */
+  function rowsOf<T extends object>(rows: unknown[]): T[] | null {
+    const out: T[] = [];
+    for (const r of rows) {
+      if (!isRecord(r)) return null;
+      out.push(asView<T>(r));
+    }
+    return out;
   }
 
   async function issuesList(params: IssueListParams = {}): Promise<IssueListResult> {
@@ -691,8 +714,11 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     if (!sent.ok) return sent.failure;
     if (sent.answer.status !== 200) return classify(sent.answer);
     const page = keysetPage(sent.answer);
-    if (page === null) return { outcome: "shape", status: 200, reason: "GET /api/v1/issues did not answer an array" };
-    return { outcome: "ok", rows: rowsOf<IssueView>(page.rows), nextCursor: page.nextCursor, total: page.total, head: page.head };
+    const rows = page === null ? null : rowsOf<IssueView>(page.rows);
+    if (page === null || rows === null) {
+      return { outcome: "shape", status: 200, reason: "GET /api/v1/issues did not answer an array of rows" };
+    }
+    return { outcome: "ok", rows, nextCursor: page.nextCursor, total: page.total, head: page.head };
   }
 
   async function issuesGet(identifier: string): Promise<IssueGetResult> {
@@ -714,10 +740,13 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     if (!sent.ok) return sent.failure;
     if (sent.answer.status !== 200) return classify(sent.answer);
     const page = keysetPage(sent.answer);
-    if (page === null) return { outcome: "shape", status: 200, reason: "GET /api/v1/pulls did not answer an array" };
+    const rows = page === null ? null : rowsOf<PullView>(page.rows);
+    if (page === null || rows === null) {
+      return { outcome: "shape", status: 200, reason: "GET /api/v1/pulls did not answer an array of rows" };
+    }
     return {
       outcome: "ok",
-      rows: rowsOf<PullView>(page.rows),
+      rows,
       nextCursor: page.nextCursor,
       total: page.total,
       blockedOnAskTotal: integerHeader(sent.answer.headers, BLOCKED_ON_ASK_TOTAL_HEADER),
@@ -739,8 +768,9 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     const sent = await send("GET", url("/api/v1/projects", { limit: params.limit, cursor: params.offset }), {});
     if (!sent.ok) return sent.failure;
     if (sent.answer.status !== 200) return classify(sent.answer);
-    if (!Array.isArray(sent.answer.json)) return { outcome: "shape", status: 200, reason: "GET /api/v1/projects did not answer an array" };
-    return { outcome: "ok", rows: rowsOf<ProjectView>(sent.answer.json), head: integerHeader(sent.answer.headers, HEAD_SEQ_HEADER) };
+    const rows = Array.isArray(sent.answer.json) ? rowsOf<ProjectView>(sent.answer.json) : null;
+    if (rows === null) return { outcome: "shape", status: 200, reason: "GET /api/v1/projects did not answer an array of rows" };
+    return { outcome: "ok", rows, head: integerHeader(sent.answer.headers, HEAD_SEQ_HEADER) };
   }
 
   async function me(): Promise<MeResult> {

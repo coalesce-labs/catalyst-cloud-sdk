@@ -62,6 +62,23 @@ describe("CTC-2004 — the SDK's TenantContract tracks the cloud's committed fix
     expect(readTenantContract({ ...fixture, cache: { maxAgeSeconds: "900" } })).toBeNull();
   });
 
+  it("⛔ P2 (Codex #65 r1) — the guard refuses a team whose nested legs are malformed, before any accessor can throw", () => {
+    const team = fixture.teams[0]!;
+    const withTeam = (patch: Record<string, unknown>) => ({ ...fixture, teams: [{ ...team, ...patch }] });
+    expect(readTenantContract(withTeam({ labels: {} }))).toBeNull();
+    expect(readTenantContract(withTeam({ labels: { ask: [], hold: "nope", release: [] } }))).toBeNull();
+    expect(readTenantContract(withTeam({ labels: { ...team.labels, ask: [{ name: 1 }] } }))).toBeNull();
+    expect(readTenantContract(withTeam({ key: 5 }))).toBeNull();
+    expect(readTenantContract(withTeam({ stages: { research: {} } }))).toBeNull();
+    expect(readTenantContract(withTeam({ stages: { research: { ...team.stages.research, stateStillExists: "yes" } } }))).toBeNull();
+    expect(readTenantContract(withTeam({ readiness: {} }))).toBeNull();
+    expect(readTenantContract(withTeam({ readiness: { ...team.readiness, checks: "none" } }))).toBeNull();
+    // Positive control for the instrument: the untouched team still reads, and so does one with a
+    // null key and an empty (but well-formed) stage map — both legal on the wire.
+    expect(readTenantContract(withTeam({}))).not.toBeNull();
+    expect(readTenantContract(withTeam({ key: null, stages: {} }))).not.toBeNull();
+  });
+
   it("the one path a consumer knows a priori is the contract route itself", () => {
     expect(CONTRACT_ROUTE).toBe("/api/v1/agent/contract");
     expect(loaded().routes.some((r) => r.path === CONTRACT_ROUTE)).toBe(true);

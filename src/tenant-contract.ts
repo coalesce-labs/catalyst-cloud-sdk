@@ -258,19 +258,7 @@ export function isTenantContract(value: unknown): value is TenantContract {
   const slots = value["slots"];
   if (!Array.isArray(slots) || !slots.every((s: unknown) => typeof s === "string")) return false;
   const teams = value["teams"];
-  if (
-    !Array.isArray(teams) ||
-    !teams.every(
-      (t: unknown) =>
-        isRecord(t) &&
-        typeof t["id"] === "string" &&
-        isRecord(t["stages"]) &&
-        isRecord(t["labels"]) &&
-        isRecord(t["readiness"]),
-    )
-  ) {
-    return false;
-  }
+  if (!Array.isArray(teams) || !teams.every(isContractTeam)) return false;
   const vocabulary = value["vocabulary"];
   if (
     !isRecord(vocabulary) ||
@@ -280,6 +268,57 @@ export function isTenantContract(value: unknown): value is TenantContract {
     return false;
   }
   return isRecord(value["thresholds"]) && isRecord(value["merge"]) && isRecord(value["ladder"]);
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isContractLabel(value: unknown): value is ContractLabel {
+  return (
+    isRecord(value) &&
+    typeof value["name"] === "string" &&
+    isNullableString(value["preferredId"]) &&
+    (value["scope"] === "unscoped" || value["scope"] === "team" || value["scope"] === "absent")
+  );
+}
+
+function isContractStage(value: unknown): value is ContractStage {
+  return (
+    isRecord(value) &&
+    typeof value["stateId"] === "string" &&
+    typeof value["stateStillExists"] === "boolean"
+  );
+}
+
+/**
+ * ⛔ THE NESTED LEGS ARE CHECKED, NOT JUST THEIR PRESENCE (Codex #65 r1, P2). The typed accessors
+ * spread `team.labels.ask` and upper-case `team.key`; a document that passed the guard with
+ * `labels: {}` or `key: 5` would reach them as `ok` and throw there, one call later, instead of
+ * answering `shape` at the one place that read the wire.
+ */
+function isContractTeam(value: unknown): value is ContractTeam {
+  if (!isRecord(value) || typeof value["id"] !== "string" || !isNullableString(value["key"])) {
+    return false;
+  }
+  const stages = value["stages"];
+  if (!isRecord(stages) || !Object.values(stages).every(isContractStage)) return false;
+  const labels = value["labels"];
+  if (
+    !isRecord(labels) ||
+    !(["ask", "hold", "release"] as const).every((k) => {
+      const list = labels[k];
+      return Array.isArray(list) && list.every(isContractLabel);
+    })
+  ) {
+    return false;
+  }
+  const readiness = value["readiness"];
+  return (
+    isRecord(readiness) &&
+    typeof readiness["status"] === "string" &&
+    Array.isArray(readiness["checks"])
+  );
 }
 
 /** {@link isTenantContract} as a read: the typed document, or `null` — never a throw, because the
