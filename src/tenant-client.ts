@@ -531,8 +531,16 @@ function classify(answer: Answer): TenantClientFailure {
   return { outcome: "http", status, reason };
 }
 
-function normalizeBaseUrl(baseUrl: string): string {
-  return baseUrl.replace(/\/+$/, "");
+/**
+ * Trim trailing slashes from the configured origin so route paths (absolute, leading-slash) append
+ * cleanly. ⛔ A plain scan, NOT `/\/+$/`: on library input that regex backtracks from every start
+ * position when the string ends in a non-slash — measured 4.2 s on 100k slashes (CodeQL
+ * security/code-scanning/4 on #65). This is O(n).
+ */
+export function normalizeBaseUrl(baseUrl: string): string {
+  let end = baseUrl.length;
+  while (end > 0 && baseUrl.charCodeAt(end - 1) === 47 /* "/" */) end -= 1;
+  return baseUrl.slice(0, end);
 }
 
 export function createTenantClient(opts: TenantClientOptions): TenantClient {

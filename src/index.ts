@@ -58,6 +58,7 @@ export {
 export {
   createTenantClient,
   memoryContractCache,
+  normalizeBaseUrl,
   DEFAULT_TIMEOUT_MS,
   NEXT_CURSOR_HEADER,
   HEAD_SEQ_HEADER,

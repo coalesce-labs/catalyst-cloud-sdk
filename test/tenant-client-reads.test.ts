@@ -14,6 +14,7 @@ import {
   NEXT_CURSOR_HEADER,
   TOTAL_HEADER,
   createTenantClient,
+  normalizeBaseUrl,
   pageCursor,
 } from "../src/index";
 
@@ -204,5 +205,25 @@ describe("projects.list and me", () => {
     const net = scriptedFetch([() => json(403, { error: "forbidden", reason: "account-not-operational", account: "acct-1" })]);
     const client = createTenantClient({ key: KEY, baseUrl: BASE, fetch: net.fetch });
     expect(await client.me()).toEqual({ outcome: "forbidden", status: 403, reason: "account-not-operational", required: null, account: "acct-1" });
+  });
+});
+
+describe("normalizeBaseUrl — linear time on a pathological input (CodeQL security/code-scanning/4 on #65)", () => {
+  it("⛔ trims trailing slashes in linear time: 100k slashes must not take seconds", () => {
+    // `/\/+$/` backtracks from every start position when the string ends in a non-slash: measured
+    // 4.2 s on this input. A slice loop is O(n). Timing IS the assertion here, generously bounded —
+    // the regex form is two orders of magnitude over it.
+    const pathological = `https://cloud.example${"/".repeat(100_000)}b`;
+    const started = Date.now();
+    expect(normalizeBaseUrl(pathological)).toBe(pathological); // ends in "b": nothing to trim
+    expect(normalizeBaseUrl(`https://cloud.example${"/".repeat(100_000)}`)).toBe("https://cloud.example");
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  it("the client itself builds URLs off the trimmed origin", async () => {
+    const net = scriptedFetch([() => json(200, [])]);
+    const client = createTenantClient({ key: KEY, baseUrl: `${BASE}///`, fetch: net.fetch });
+    await client.issues.list();
+    expect(net.calls[0]!.url).toBe(`${BASE}/api/v1/issues`);
   });
 });
