@@ -154,6 +154,16 @@ export class AuthError extends Error {
  *  socket must be re-opened with a fresh token, not blindly reconnected. */
 export const CLOSE_REAUTHENTICATE = 4401;
 
+/** Internal sentinel (CTC-2111): a bearer `getToken()` that did not settle within the connect deadline.
+ *  Distinguished from a getToken REJECTION so the two get different treatment — a hang is a bounded
+ *  backoff reconnect (transient), a rejection is a park in auth-required (re-auth needed). Not exported. */
+class BearerTokenTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`bearer getToken() did not settle within ${ms}ms`);
+    this.name = "BearerTokenTimeoutError";
+  }
+}
+
 /** Connection lifecycle, surfaced via `onStatus` so a consumer can drive UI. */
 export type LiveSyncStatus =
   | "connecting"
@@ -260,7 +270,8 @@ export interface LiveSyncClientOptions {
    * Optional (CTC-2111): a typed authorization failure. Fires when a bearer socket is closed 4401
    * (`AuthError{code:4401, reason}`) or the initial /snapshot is rejected 401/403 — paired with the
    * `"auth-required"` status, which is when the reconnect loop STOPS. A consumer re-authorizes the
-   * person (its `getToken` will resolve a fresh token) and then calls `start()` again to resume.
+   * person (so its `getToken` will resolve a fresh token) and then calls `resume()` — which re-opens
+   * the transport reusing the original run, whereas a second `start()` would strand the first promise.
    */
   onAuthError?: (err: AuthError) => void;
   /** Base reconnect backoff in ms; doubles each failed attempt up to maxBackoffMs. Default 1000. */
@@ -526,6 +537,13 @@ export class LiveSyncClient {
    */
   private bootFailed = false;
   private resyncing = false;
+  /** CTC-2111 — parked in `"auth-required"` after a 4401 / a getToken rejection / a 401-403 seed. Only
+   *  `resume()` (or a fresh `start()`) leaves this state; a normal reconnect never sets it. */
+  private authRequired = false;
+  /** CTC-2111 — a monotonically-increasing connect-attempt id. A bearer connect resolves getToken()
+   *  asynchronously; this stamps each attempt so a late/stale resolution (superseded by a newer
+   *  attempt, a stop(), or a start()) is dropped rather than opening an orphan socket. */
+  private connectAttempt = 0;
   private backoff: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private resolveDone: (() => void) | null = null;
@@ -642,6 +660,7 @@ export class LiveSyncClient {
   start(): Promise<void> {
     this.stopped = false;
     this.started = true;
+    this.authRequired = false; // a fresh run is never still parked from a previous one (CTC-2111)
     // RESET per boot. `start()` is restartable after `stop()`, and a stale `true` from a previous
     // cold boot would make the NEXT boot — warm, and therefore re-seeding nothing — absorb a resync
     // it should have honoured. Found while re-reading this path rather than reported; the same class
@@ -750,6 +769,11 @@ export class LiveSyncClient {
   /** Stop the client: close the socket, cancel any pending reconnect, resolve start(). Idempotent. */
   stop(): void {
     this.stopped = true;
+    // CTC-2111 — invalidate any in-flight bearer connect attempt IMMEDIATELY, so a getToken() resolving
+    // after a stop()+start() (its telemetry await can outlast this) is dropped rather than connecting
+    // under the new run. The new run bumps this again in openSocket(), but bumping here closes the
+    // window between start() resetting `stopped` and openSocket() re-stamping the attempt.
+    this.connectAttempt++;
     if (this.reconnectTimer != null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -769,6 +793,40 @@ export class LiveSyncClient {
     const abandon = this.abandonReseed;
     this.abandonReseed = null;
     abandon?.();
+  }
+
+  /**
+   * CTC-2111 — resume a run parked in `"auth-required"` (a 4401 close, a `getToken()` rejection, or a
+   * 401/403 initial /snapshot). The supported recovery after `onAuthError`: refresh whatever credential
+   * `getToken()` draws on, then call this. A bearer `getToken()` is resolved FRESH on the re-open, so
+   * the newly-authorized token is the one used.
+   *
+   * It REUSES the original run rather than starting a second one — calling `start()` again from a
+   * parked-but-still-pending run would overwrite `resolveDone` and strand the promise `start()` first
+   * returned (it would never settle). Progress surfaces through `onStatus` (connecting → live), the
+   * same way `start()` reports it.
+   *
+   *  • Never started, or already stopped → this is a fresh `start()` (nothing to resume).
+   *  • Not parked (a live/reconnecting run) → a no-op; there is nothing to resume.
+   *  • Parked with a durable cursor (the 4401 mid-run case) → re-open the socket, reusing the deferred.
+   *  • Parked with NO cursor (an initial-connect auth failure, whose `start()` already REJECTED) → a
+   *    fresh `start()` re-runs the cold seed; its old promise already settled, so nothing is stranded.
+   */
+  resume(): void {
+    if (this.stopped || !this.started) {
+      void this.start().catch(() => {}); // fresh run — its failure surfaces via onStatus / onAuthError
+      return;
+    }
+    if (!this.authRequired) return; // a live/reconnecting run has nothing to resume
+    this.authRequired = false;
+    if (this.getCursor() == null) {
+      // The cold seed never completed (the initial /snapshot was what failed): a fresh run re-seeds.
+      // Its previous promise already rejected, so a new deferred strands nothing.
+      void this.start().catch(() => {});
+      return;
+    }
+    // Seeded already: re-open the socket REUSING the original run's deferred (never a second start()).
+    this.openSocket();
   }
 
   /** The ws(s):// URL this client opens, for diagnostics/tests. Re-derived from the options — and,
@@ -835,16 +893,54 @@ export class LiveSyncClient {
     }
   }
 
-  /** CTC-2111 — go `"auth-required"` and hand the consumer a typed `AuthError`. The reconnect loop is
-   *  the CALLER's decision (it is NOT scheduled here): every caller of this stops it. The onAuthError
-   *  handler is guarded like onStatus — a throwing consumer callback never wedges the transport. */
-  private raiseAuthError(err: AuthError): void {
+  /** CTC-2111 — enter the parked `"auth-required"` state: no socket, no reconnect scheduled (the CALLER
+   *  never schedules one), and `authRequired` latched so `resume()` knows there is a run to resume. */
+  private parkAuthRequired(): void {
+    this.authRequired = true;
     this.setStatus("auth-required");
+  }
+
+  /** CTC-2111 — park in `"auth-required"` AND hand the consumer a typed `AuthError` (a wire code:
+   *  4401 close, or a 401/403 /snapshot). The onAuthError handler is guarded like onStatus — a throwing
+   *  consumer callback never wedges the transport. */
+  private raiseAuthError(err: AuthError): void {
+    this.parkAuthRequired();
     try {
       this.onAuthError?.(err);
     } catch (e) {
       this.log("warn", "onAuthError handler threw", e);
     }
+  }
+
+  /** CTC-2111 — await a bearer `getToken()` but never longer than the connect/open deadline, so a token
+   *  endpoint that never settles cannot wedge the client in `"connecting"` with no timer pending (the
+   *  `openTimeoutMs` deadline is armed LATER, inside `connect()`, only once the token is in hand). A
+   *  disabled deadline (`openTimeoutMs <= 0`) leaves the acquisition unbounded — the caller's own
+   *  choice to run without connect deadlines. The timer is local and self-clears on settle. */
+  private awaitTokenBounded(p: Promise<string>): Promise<string> {
+    if (this.openTimeoutMs <= 0) return p;
+    return new Promise<string>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+        timer = null;
+        reject(new BearerTokenTimeoutError(this.openTimeoutMs));
+      }, this.openTimeoutMs);
+      const clear = (): void => {
+        if (timer != null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      };
+      p.then(
+        (v) => {
+          clear();
+          resolve(v);
+        },
+        (e) => {
+          clear();
+          reject(e);
+        },
+      );
+    });
   }
 
   private openSocket(): void {
@@ -858,33 +954,48 @@ export class LiveSyncClient {
     // Every guarded entry point that calls out and then continues needs this; this is the one that
     // creates a resource afterwards.
     if (this.stopped) return;
+    // A deliberate (re)connect leaves the parked auth-required state (resume() cleared it too).
+    this.authRequired = false;
     // CTC-2111: a bearer strategy must resolve a FRESH token before it can build the connect URL, so
     // its connect leg is async. token/cookie stay fully synchronous — no await between the "connecting"
     // status and the socket construction — so the byte-identical URL and same-tick-socket both hold.
     if (this.auth.kind === "bearer") {
-      void this.resolveBearerAndConnect(this.auth.getToken);
+      // Stamp THIS attempt: a late token resolution superseded by a newer attempt / stop() / start()
+      // must be dropped rather than connect (which would orphan this.ws).
+      const attempt = ++this.connectAttempt;
+      void this.resolveBearerAndConnect(this.auth.getToken, attempt);
       return;
     }
     this.connect(undefined);
   }
 
   /**
-   * CTC-2111 — resolve a fresh bearer token, then connect. A `getToken()` that REJECTS must not become
-   * a busy loop: the client stays in `"auth-required"` with no reconnect scheduled, until a later
-   * deliberate `start()` drives another connect. That is the honest outcome — a client that cannot
-   * prove who it is does not hammer the mirror.
+   * CTC-2111 — resolve a fresh bearer token (bounded by the connect deadline), then connect IFF this is
+   * still the current attempt. Three failure modes, each returning the state machine to an actionable
+   * state — never a busy loop, never a permanent wedge:
+   *   • superseded (a newer attempt, a stop(), or a stop()+start() cycle) → drop the stale resolution;
+   *   • `getToken()` timed out (never settled) → a bounded backoff reconnect (transient, retryable);
+   *   • `getToken()` rejected → park in `"auth-required"` (re-auth needed) until `resume()`.
    */
-  private async resolveBearerAndConnect(getToken: () => Promise<string>): Promise<void> {
+  private async resolveBearerAndConnect(getToken: () => Promise<string>, attempt: number): Promise<void> {
     let token: string;
     try {
-      token = await getToken();
+      token = await this.awaitTokenBounded(getToken());
     } catch (err) {
-      this.log("warn", "bearer getToken() rejected; staying auth-required until re-authorized", err);
-      this.setStatus("auth-required");
+      // Superseded: its late value must never open a socket the current run does not expect.
+      if (this.stopped || attempt !== this.connectAttempt) return;
+      if (err instanceof BearerTokenTimeoutError) {
+        this.log("warn", "bearer getToken() did not settle within the connect deadline; backing off", err);
+        this.setStatus("reconnecting");
+        this.scheduleReconnect();
+        return;
+      }
+      this.log("warn", "bearer getToken() rejected; auth-required until resume()", err);
+      this.parkAuthRequired();
       return;
     }
-    // A consumer may have torn down during the await — same discipline as the "connecting" re-check.
-    if (this.stopped) return;
+    // Superseded during the await (a newer attempt, or a stop()/start()) — drop the stale resolution.
+    if (this.stopped || attempt !== this.connectAttempt) return;
     this.connect(token);
   }
 
@@ -1495,6 +1606,7 @@ export class LiveSyncClient {
     this.setStatus("resyncing");
     this.closeSocket();
     let reseeded = false;
+    let authErr: AuthError | undefined; // CTC-2111 — a 401/403 /snapshot routes to auth-required
     try {
       // The reseed runs inside an ACTIVE span so the replica's seed span (the injected reseed IS
       // seedFromSnapshot) auto-parents under this resync span.
@@ -1508,11 +1620,20 @@ export class LiveSyncClient {
       );
       reseeded = true;
     } catch (err) {
-      this.log("error", "resync reseed failed; will retry on reconnect", err);
+      // CTC-2111 — a 401/403 /snapshot during a RESYNC is the SAME re-auth signal as a 4401 close, not
+      // a transient failure. Routing it through the generic "reconnecting + backoff" branch below would
+      // re-enter the exact reconnect loop this change stops. Park in auth-required instead; every other
+      // failure still backs off and retries.
+      if (err instanceof AuthError) authErr = err;
+      else this.log("error", "resync reseed failed; will retry on reconnect", err);
     } finally {
       this.resyncing = false;
     }
     if (this.stopped) return;
+    if (authErr) {
+      this.raiseAuthError(authErr); // NO reconnect — the token must be re-authorized (resume())
+      return;
+    }
     if (reseeded) {
       // A completed re-seed reopens immediately — the store is fresh and the endpoint just served us.
       this.openSocket();

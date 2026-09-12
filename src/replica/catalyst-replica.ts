@@ -241,7 +241,8 @@ export interface CatalystReplicaOptions {
   onStatus?: (status: LiveSyncStatus) => void;
   /** CTC-2111 — a typed authorization failure from a `{kind:'bearer'}` replica: a 4401 socket close
    *  (revocation/inactivity) or a 401/403 initial /snapshot. Paired with the `"auth-required"` status,
-   *  which is where the reconnect loop STOPS; re-authorize the person and call `start()` again. */
+   *  which is where the reconnect loop STOPS; re-authorize the person and call `resume()` (start() is
+   *  refused once the replica is already started). */
   onAuthError?: (err: AuthError) => void;
   /** Base reconnect backoff in ms. Default 1000. */
   backoffMs?: number;
@@ -766,6 +767,20 @@ export class CatalystReplica {
         },
       );
     });
+  }
+
+  /**
+   * CTC-2111 — resume a replica parked in `"auth-required"` after `onAuthError` (a 4401 socket close,
+   * or a 401/403 /snapshot). `start()` cannot do this — it throws once the replica is already started —
+   * so this is the supported recovery: refresh whatever credential the bearer `getToken()` draws on,
+   * then call `resume()`. It re-opens the transport with a freshly-resolved token; progress surfaces
+   * through `onStatus` (connecting → live), the same way `start()` reports it. A no-op on a reader or
+   * after `close()`.
+   */
+  resume(): void {
+    if (this.readonlyMode || this.closed) return;
+    if (!this.client) throw new Error("CatalystReplica: resume() before start()");
+    this.client.resume();
   }
 
   /** Stop the socket, release the writer lock, close the DB. Idempotent. Rejects a still-pending

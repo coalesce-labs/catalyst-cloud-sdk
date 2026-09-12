@@ -2768,3 +2768,165 @@ describe("bearer auth strategy (CTC-2111)", () => {
     client.stop();
   });
 });
+
+// ── CTC-2111 round 2 — Codex findings: bearer-connect concurrency, the never-settling getToken wedge,
+//    the reauth resume primitive, and 401/403 on a RESYNC /snapshot. ─────────────────────────────────
+describe("bearer auth round 2 (CTC-2111 — Codex r1 fixes)", () => {
+  it("C — a 401/403 /snapshot during a RESYNC routes to auth-required, not a reconnect", async () => {
+    // A server {type:"resync"} frame drives runResync → reseed. If that /snapshot is rejected 401/403
+    // it must park in auth-required (the token needs re-auth), NOT re-enter the reconnect loop this
+    // change stops — the generic failure branch would have set "reconnecting" + scheduled a reconnect.
+    const store = makeStore(7); // warm cursor → live without a cold seed; the reseed here IS the resync
+    const { sockets, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
+    const authErrors: AuthError[] = [];
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "bearer", getToken: async () => "tok" },
+      reseed: async () => {
+        throw new AuthError(403, "/snapshot 403");
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      onStatus: (s) => statuses.push(s),
+      onAuthError: (e) => authErrors.push(e),
+      backoffMs: 5,
+      maxBackoffMs: 5,
+      log: () => {},
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver({ type: "resync" }); // server asks for a full re-seed
+    await vi.waitFor(() => expect(authErrors).toHaveLength(1));
+
+    expect(authErrors[0]!.code).toBe(403);
+    expect(statuses[statuses.length - 1]).toBe("auth-required");
+    // No new socket: the reconnect loop did NOT re-enter.
+    await new Promise((r) => setTimeout(r, 40));
+    expect(sockets).toHaveLength(1);
+    client.stop();
+  });
+
+  it("A2 — a getToken() that never settles backs off (bounded), never wedges in 'connecting'", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = makeStore(7);
+      const { sockets, factory } = recordingFactory();
+      const statuses: LiveSyncStatus[] = [];
+      let calls = 0;
+      const client = new LiveSyncClient({
+        baseUrl: BASE,
+        accountId: "tenant-0",
+        auth: {
+          kind: "bearer",
+          getToken: () => {
+            calls += 1;
+            return new Promise<string>(() => {}); // never settles
+          },
+        },
+        reseed: store.reseedTo(12),
+        getCursor: store.getCursor,
+        onChange: store.onChange,
+        wsFactory: factory,
+        onStatus: (s) => statuses.push(s),
+        openTimeoutMs: 50,
+        backoffMs: 10,
+        maxBackoffMs: 10,
+        log: () => {},
+      });
+
+      void client.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls).toBe(1);
+      expect(sockets).toHaveLength(0); // no socket — getToken hasn't resolved
+
+      // The token-acquisition deadline fires → NOT wedged in "connecting": a bounded backoff instead.
+      await vi.advanceTimersByTimeAsync(50);
+      expect(statuses).toContain("reconnecting");
+
+      // …and the backoff retries: getToken is called AGAIN (bounded loop, not a permanent wedge).
+      await vi.advanceTimersByTimeAsync(10);
+      expect(calls).toBe(2);
+      client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("A1 — a stop() then start() drops the STALE getToken resolution (no orphaned second socket)", async () => {
+    // If an earlier getToken() is still pending when stop() then start() runs, its late resolution must
+    // NOT connect: stopped is already reset to false, so a stale connect would open a socket the current
+    // run does not expect and orphan this.ws (unreachable by stop(), duplicate frames).
+    const store = makeStore(7);
+    const { sockets, urls, factory } = recordingFactory();
+    const resolvers: ((v: string) => void)[] = [];
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "bearer", getToken: () => new Promise<string>((r) => resolvers.push(r)) },
+      reseed: store.reseedTo(12),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      openTimeoutMs: 0, // no token deadline — this test drives resolution by hand
+      log: () => {},
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(resolvers).toHaveLength(1)); // attempt 1's getToken is pending
+    client.stop();
+    void client.start();
+    await vi.waitFor(() => expect(resolvers).toHaveLength(2)); // attempt 2's getToken is pending
+
+    resolvers[0]!("stale-token"); // the SUPERSEDED attempt resolves late — must be dropped
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sockets).toHaveLength(0); // the stale resolution opened NOTHING
+
+    resolvers[1]!("fresh-token"); // the current attempt resolves — this one connects
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    expect(new URL(urls[0]!).searchParams.get("token")).toBe("fresh-token");
+    client.stop();
+  });
+
+  it("resume() after a 4401 re-opens with a fresh token and never strands the original start() promise", async () => {
+    // The supported recovery (findings 3 + 5): after onAuthError, refresh the credential and resume().
+    // It re-opens REUSING the original run's deferred — so the promise start() returned still settles
+    // on stop() rather than being stranded by a second start() overwriting resolveDone.
+    const store = makeStore(7);
+    const { sockets, urls, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
+    let token = "tok-1";
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "bearer", getToken: async () => token },
+      reseed: store.reseedTo(12),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      onStatus: (s) => statuses.push(s),
+      backoffMs: 5,
+      maxBackoffMs: 5,
+    });
+
+    const startP = client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    sockets[0]!.fireServerClose(4401, "reauthenticate");
+    expect(statuses[statuses.length - 1]).toBe("auth-required");
+
+    token = "tok-2"; // the consumer refreshed the credential
+    client.resume();
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+    expect(new URL(urls[1]!).searchParams.get("token")).toBe("tok-2"); // a FRESH token on resume
+    sockets[1]!.fireOpen();
+    expect(statuses[statuses.length - 1]).toBe("live");
+
+    client.stop();
+    await startP; // the ORIGINAL start() promise settled — never stranded
+  });
+});

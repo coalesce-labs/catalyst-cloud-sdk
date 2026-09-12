@@ -1428,3 +1428,49 @@ describe("CatalystReplica bearer auth (CTC-2111)", () => {
     expect(sockets).toHaveLength(0); // never opened a socket on an unseeded store
   });
 });
+
+// ── CTC-2111 round 2 — the supported reauth resume on the managed replica (Codex finding 3). ─────────
+describe("CatalystReplica bearer resume (CTC-2111 — Codex r1 fix)", () => {
+  it("resume() re-opens the transport after a 4401 close (start() alone rejects when already started)", async () => {
+    const { sockets, factory } = recordingFactory();
+    const seed = bufferedSnapshotFetch(
+      [{ entity: "issues", row: { id: "i1", identifier: "CTC-1", title: "Seed", updated_at: 1 } }],
+      5,
+    );
+    const statuses: string[] = [];
+    const authErrors: AuthError[] = [];
+    let token = "oauth-1";
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "bearer", getToken: async () => token },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: seed.fetchImpl,
+        wsFactory: factory,
+        onStatus: (s) => statuses.push(s),
+        onAuthError: (e) => authErrors.push(e),
+        log: () => {},
+      }),
+    );
+
+    await startToLive(replica, sockets);
+    expect(replica.status).toBe("live");
+
+    // The mirror closes the socket 4401 — the access token was revoked / went inactive.
+    sockets[0]!.onclose?.({ code: 4401, reason: "reauthenticate" });
+    await vi.waitFor(() => expect(authErrors).toHaveLength(1));
+    expect(authErrors[0]!.code).toBe(4401);
+    expect(replica.status).toBe("auth-required");
+
+    // start() again is refused (already started) — resume() is the supported recovery.
+    await expect(replica.start()).rejects.toThrow(/already called/);
+
+    token = "oauth-2"; // consumer refreshed the credential
+    replica.resume();
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+    sockets[1]!.fireOpen();
+    await vi.waitFor(() => expect(replica.status).toBe("live"));
+  });
+});
