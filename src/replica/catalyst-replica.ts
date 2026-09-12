@@ -239,10 +239,11 @@ export interface CatalystReplicaOptions {
   onChange?: () => void;
   /** Connection lifecycle, for UI/logging. */
   onStatus?: (status: LiveSyncStatus) => void;
-  /** CTC-2111 — a typed authorization failure from a `{kind:'bearer'}` replica: a 4401 socket close
-   *  (revocation/inactivity) or a 401/403 initial /snapshot. Paired with the `"auth-required"` status,
-   *  which is where the reconnect loop STOPS; re-authorize the person and call `resume()` (start() is
-   *  refused once the replica is already started). */
+  /** CTC-2111 — a typed authorization failure, `{kind:'bearer'}` ONLY: a 4401 socket close
+   *  (revocation/inactivity) or a bearer 401/403 /snapshot (initial or resync). Paired with the
+   *  `"auth-required"` status, which is where the reconnect loop STOPS; re-authorize the person and
+   *  call `resume()` (start() is refused once the replica is already started). A token/cookie 401/403
+   *  keeps reconnect-with-backoff and never fires this. */
   onAuthError?: (err: AuthError) => void;
   /** Base reconnect backoff in ms. Default 1000. */
   backoffMs?: number;
@@ -1246,10 +1247,13 @@ export class CatalystReplica {
           const res = await this.fetchImpl(url, { headers: await this.feedHeaders(), signal: abort.signal });
           armIdle(); // headers arrived — progress
           if (!res.ok) {
-            // CTC-2111 — an authorization failure is a TYPED AuthError a consumer can act on
-            // (re-authenticate), not the opaque Error("/snapshot 401") it used to be (retry). Every
-            // other status stays a plain Error — the transport retries those through backoff.
-            if (res.status === 401 || res.status === 403) {
+            // CTC-2111 — for a BEARER auth, an authorization failure is a TYPED AuthError the consumer
+            // can act on (refresh the token, resume()). BEARER-ONLY: a token/cookie credential has no
+            // refresh path, so its 401/403 stays a plain Error and keeps the legacy reconnect-with-
+            // backoff posture — parking an org-tier host-sync daemon on a WorkOS blip would strand it,
+            // and the mirror's 401 does not separate "invalid" from "unavailable" (CTC-792-grammar).
+            // Every other status is a plain Error too — the transport retries those through backoff.
+            if ((res.status === 401 || res.status === 403) && this.opts.auth.kind === "bearer") {
               throw new AuthError(res.status, `/snapshot ${res.status}`);
             }
             throw new Error(`/snapshot ${res.status}`);

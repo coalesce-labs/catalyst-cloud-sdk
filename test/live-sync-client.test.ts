@@ -2930,3 +2930,44 @@ describe("bearer auth round 2 (CTC-2111 — Codex r1 fixes)", () => {
     await startP; // the ORIGINAL start() promise settled — never stranded
   });
 });
+
+// ── CTC-2111 — the /snapshot 401/403 → auth-required narrowing is BEARER-ONLY. A token/cookie
+//    credential has no refresh path and nothing calls resume() on a host-sync daemon, so parking it on
+//    a WorkOS blip (the mirror's 401 does not separate "invalid" from "unavailable" — CTC-792-grammar)
+//    would strand the org-tier daemons. Legacy reconnect-with-backoff is preserved. ──────────────────
+describe("bearer-only auth-required narrowing (CTC-2111)", () => {
+  it("token — a 401/403 /snapshot during a RESYNC reconnects with backoff, NOT auth-required (legacy pin)", async () => {
+    // Guarded at the CLIENT by the active strategy, so even an AuthError-throwing reseed cannot flip a
+    // non-bearer client to auth-required — the no-behaviour-change guarantee for legacy token clients.
+    const store = makeStore(7); // warm → live without a cold seed; the reseed here IS the resync
+    const { sockets, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
+    const authErrors: AuthError[] = [];
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "token", token: "svc-tok" },
+      reseed: async () => {
+        throw new AuthError(401, "/snapshot 401");
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      onStatus: (s) => statuses.push(s),
+      onAuthError: (e) => authErrors.push(e),
+      backoffMs: 5,
+      maxBackoffMs: 5,
+      log: () => {},
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver({ type: "resync" }); // server-driven resync → reseed rejects 401
+
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThanOrEqual(2)); // reconnected, as today
+    expect(statuses).not.toContain("auth-required");
+    expect(authErrors).toHaveLength(0);
+    client.stop();
+  });
+});

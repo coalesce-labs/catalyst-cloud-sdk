@@ -267,9 +267,11 @@ export interface LiveSyncClientOptions {
   /** Optional: connection lifecycle, for UI ("live"/"reconnecting"/…). */
   onStatus?: (status: LiveSyncStatus) => void;
   /**
-   * Optional (CTC-2111): a typed authorization failure. Fires when a bearer socket is closed 4401
-   * (`AuthError{code:4401, reason}`) or the initial /snapshot is rejected 401/403 — paired with the
-   * `"auth-required"` status, which is when the reconnect loop STOPS. A consumer re-authorizes the
+   * Optional (CTC-2111): a typed authorization failure, BEARER strategy only. Fires when a bearer
+   * socket is closed 4401 (`AuthError{code:4401, reason}`) or a bearer /snapshot is rejected 401/403
+   * (initial seed or resync) — paired with the `"auth-required"` status, which is when the reconnect
+   * loop STOPS. A token/cookie 401/403 keeps reconnect-with-backoff and never reaches here (no refresh
+   * path, and nothing calls `resume()` on a daemon). A consumer re-authorizes the
    * person (so its `getToken` will resolve a fresh token) and then calls `resume()` — which re-opens
    * the transport reusing the original run, whereas a second `start()` would strand the first promise.
    */
@@ -729,10 +731,12 @@ export class LiveSyncClient {
           try {
             await this.boundedReseed();
           } catch (err) {
-            // CTC-2111 — the initial /snapshot was rejected 401/403: CatalystReplica raises a typed
-            // AuthError. Surface it as "auth-required" + onAuthError (not an endless retry), then
-            // still reject the boot — an unseeded store cannot go live, and no socket is opened.
-            if (err instanceof AuthError) this.raiseAuthError(err);
+            // CTC-2111 — the initial /snapshot was rejected 401/403: for a BEARER client, surface it as
+            // "auth-required" + onAuthError so the consumer can refresh and resume() (not an endless
+            // retry). BEARER-ONLY (see runResync): a token/cookie initial-seed failure stays today's
+            // start() rejection, never auth-required. Either way, still reject the boot — an unseeded
+            // store cannot go live, and no socket is opened.
+            if (err instanceof AuthError && this.auth.kind === "bearer") this.raiseAuthError(err);
             throw err;
           }
           // Only NOW may a request that waited on this boot be absorbed — this really was a full
@@ -1620,11 +1624,13 @@ export class LiveSyncClient {
       );
       reseeded = true;
     } catch (err) {
-      // CTC-2111 — a 401/403 /snapshot during a RESYNC is the SAME re-auth signal as a 4401 close, not
-      // a transient failure. Routing it through the generic "reconnecting + backoff" branch below would
-      // re-enter the exact reconnect loop this change stops. Park in auth-required instead; every other
-      // failure still backs off and retries.
-      if (err instanceof AuthError) authErr = err;
+      // CTC-2111 — a 401/403 /snapshot during a RESYNC is the SAME re-auth signal as a 4401 close for a
+      // BEARER client (getToken() is its recovery: park → refresh → resume()), so route it to
+      // auth-required instead of re-entering the reconnect loop. BEARER-ONLY: a token/cookie credential
+      // has no refresh path and nothing calls resume() on a host-sync daemon, so parking it on a WorkOS
+      // blip would strand it — and the mirror's 401 does not separate "invalid" from "unavailable"
+      // (CTC-792-grammar). Legacy clients keep reconnect-with-backoff. Every other failure retries too.
+      if (err instanceof AuthError && this.auth.kind === "bearer") authErr = err;
       else this.log("error", "resync reseed failed; will retry on reconnect", err);
     } finally {
       this.resyncing = false;
