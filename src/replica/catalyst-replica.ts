@@ -1385,7 +1385,20 @@ export class CatalystReplica {
   private async feedHeaders(): Promise<Record<string, string>> {
     const h: Record<string, string> = { accept: "application/x-ndjson" };
     if (this.opts.auth.kind === "token") h["authorization"] = `Bearer ${this.opts.auth.token}`;
-    else if (this.opts.auth.kind === "bearer") h["authorization"] = `Bearer ${await this.opts.auth.getToken()}`;
+    else if (this.opts.auth.kind === "bearer") {
+      // CTC-2111 — a getToken() REJECTION while building the headers (interaction-required, a failed
+      // refresh at boot) is an authorization failure, not a transport fault: raise it as a typed
+      // AuthError so it flows through the same auth-required park as a 401/403 response. Without this a
+      // COLD-boot reject bypassed the park entirely — the client never set authRequired, so start()
+      // refused a retry and resume() was a no-op, leaving startup unrecoverable without reconstruction.
+      let token: string;
+      try {
+        token = await this.opts.auth.getToken();
+      } catch (err) {
+        throw new AuthError(401, `bearer getToken() rejected: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      h["authorization"] = `Bearer ${token}`;
+    }
     return h;
   }
 }

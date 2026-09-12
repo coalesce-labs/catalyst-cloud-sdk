@@ -612,6 +612,10 @@ export class LiveSyncClient {
    *  (It used to rely on "the boot seed runs before any socket exists" — true only while a resync
    *  needed a server frame. The public `requestResync()` added in 0.8.0 needs no socket.) */
   private reseedTimer: ReturnType<typeof setTimeout> | null = null;
+  /** CTC-2111 — the in-flight bearer getToken() deadline (awaitTokenBounded). Tracked so stop() clears
+   *  it (ask 4: teardown leaves NOTHING pending) rather than letting it hold a process alive for up to
+   *  openTimeoutMs after an otherwise-clean shutdown. */
+  private bearerTokenTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(opts: LiveSyncClientOptions) {
     // Fail fast, and fail HERE. A token-authed client has no session to fall back to, so an omitted
@@ -786,6 +790,11 @@ export class LiveSyncClient {
     // reseedTimeoutMs. With it cleared a still-hanging reseed simply never settles its (now
     // irrelevant) await — every post-await path in handleResync/boot checks `stopped` first.
     this.clearReseedTimer();
+    // CTC-2111 — a still-pending bearer token deadline must not outlive the client (leak/hold-open).
+    if (this.bearerTokenTimer != null) {
+      clearTimeout(this.bearerTokenTimer);
+      this.bearerTokenTimer = null;
+    }
     this.closeSocket();
     this.setStatus("stopped");
     const done = this.resolveDone;
@@ -825,8 +834,20 @@ export class LiveSyncClient {
     this.authRequired = false;
     if (this.getCursor() == null) {
       // The cold seed never completed (the initial /snapshot was what failed): a fresh run re-seeds.
-      // Its previous promise already rejected, so a new deferred strands nothing.
-      void this.start().catch(() => {});
+      // But a SYNCHRONOUS resume() from onAuthError fires while the failing boot is still mid-reject —
+      // its `finally` (resyncing=false) and its `.catch` (bootFailed=true) have NOT run yet. Starting
+      // the replacement now would let that teardown clobber the resumed run's SHARED latches, and a
+      // later requestResync() would be wrongly ignored as "startup failed". So wait for the old boot to
+      // settle first: its cleanup continuations were registered before this one and run ahead of it, so
+      // the fresh start() below has the last word on bootFailed/resyncing. (Nothing pending → now.)
+      const pending = this.bootTask;
+      if (pending) {
+        void pending.catch(() => {}).then(() => {
+          if (!this.stopped) void this.start().catch(() => {});
+        });
+      } else {
+        void this.start().catch(() => {});
+      }
       return;
     }
     // Seeded already: re-open the socket REUSING the original run's deferred (never a second start()).
@@ -924,15 +945,16 @@ export class LiveSyncClient {
   private awaitTokenBounded(p: Promise<string>): Promise<string> {
     if (this.openTimeoutMs <= 0) return p;
     return new Promise<string>((resolve, reject) => {
-      let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-        timer = null;
+      const timer = setTimeout(() => {
+        if (this.bearerTokenTimer === timer) this.bearerTokenTimer = null;
         reject(new BearerTokenTimeoutError(this.openTimeoutMs));
       }, this.openTimeoutMs);
+      // Never let a pending token deadline hold a supervised process's exit open on its own (CTC-2111).
+      (timer as unknown as { unref?: () => void }).unref?.();
+      this.bearerTokenTimer = timer;
       const clear = (): void => {
-        if (timer != null) {
-          clearTimeout(timer);
-          timer = null;
-        }
+        clearTimeout(timer);
+        if (this.bearerTokenTimer === timer) this.bearerTokenTimer = null;
       };
       p.then(
         (v) => {

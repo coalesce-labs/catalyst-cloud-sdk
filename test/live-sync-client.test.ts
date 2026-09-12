@@ -2971,3 +2971,79 @@ describe("bearer-only auth-required narrowing (CTC-2111)", () => {
     client.stop();
   });
 });
+
+// ── CTC-2111 round 3 — Codex round-2 findings: cold-boot getToken reject recovery, the token-deadline
+//    timer leak on stop(), and a synchronous resume() racing the failed boot's cleanup. ───────────────
+describe("bearer auth round 3 (CTC-2111 — Codex r2 fixes)", () => {
+  it("finding 2 — stop() clears the pending bearer-token deadline (no timer left to hold the process)", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = makeStore(7);
+      const { factory } = recordingFactory();
+      const client = new LiveSyncClient({
+        baseUrl: BASE,
+        accountId: "tenant-0",
+        auth: { kind: "bearer", getToken: () => new Promise<string>(() => {}) }, // never settles
+        reseed: store.reseedTo(12),
+        getCursor: store.getCursor,
+        onChange: store.onChange,
+        wsFactory: factory,
+        openTimeoutMs: 50,
+        log: () => {},
+      });
+
+      void client.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(1); // the token-acquisition deadline is armed
+      client.stop();
+      expect(vi.getTimerCount()).toBe(0); // stop() cleared it — nothing left pending
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("finding 3 — a resume() called synchronously from onAuthError after an initial 401 leaves requestResync working", async () => {
+    // The replacement cold boot must not start before the failing boot finishes rejecting: otherwise
+    // the old boot's catch resets the SHARED bootFailed latch (and its finally clears resyncing) under
+    // the resumed run, so a later requestResync() is wrongly ignored as "startup failed".
+    const store = makeStore(null); // cursorless → cold seed
+    const { sockets, factory } = recordingFactory();
+    let seedCalls = 0;
+    let failNext = true;
+    let client!: LiveSyncClient;
+    client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "bearer", getToken: async () => "tok" },
+      reseed: async () => {
+        seedCalls += 1;
+        if (failNext) {
+          failNext = false;
+          throw new AuthError(401, "/snapshot 401");
+        }
+        store.setCursor(12);
+        return 12;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      onAuthError: () => client.resume(), // SYNCHRONOUS resume from the handler
+      backoffMs: 5,
+      maxBackoffMs: 5,
+      log: () => {},
+    });
+
+    // The initial cold seed fails 401, so this original run's promise REJECTS (the documented
+    // scenario-2 outcome) — the recovery is the resumed run, not this promise.
+    void client.start().catch(() => {});
+    // The re-seed after resume succeeds and opens a socket.
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThan(0));
+    sockets[sockets.length - 1]!.fireOpen();
+    await vi.waitFor(() => expect(seedCalls).toBe(2)); // initial fail + resumed re-seed
+
+    // The resumed run is healthy: a requestResync() re-seeds (it is NOT ignored as "startup failed").
+    await client.requestResync();
+    expect(seedCalls).toBe(3);
+    client.stop();
+  });
+});

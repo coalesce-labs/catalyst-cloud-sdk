@@ -1474,3 +1474,51 @@ describe("CatalystReplica bearer resume (CTC-2111 — Codex r1 fix)", () => {
     await vi.waitFor(() => expect(replica.status).toBe("live"));
   });
 });
+
+// ── CTC-2111 round 3 — a cold-boot getToken() rejection must park auth-required and be resumable
+//    (Codex round-2 finding 1): the common interaction-required / refresh-failed-at-boot path. ────────
+describe("CatalystReplica bearer cold-boot getToken recovery (CTC-2111 — Codex r2 fix)", () => {
+  it("a getToken() rejection while building /snapshot headers parks auth-required and recovers via resume()", async () => {
+    const { sockets, factory } = recordingFactory();
+    const seed = bufferedSnapshotFetch(
+      [{ entity: "issues", row: { id: "i1", identifier: "CTC-1", title: "Seed", updated_at: 1 } }],
+      5,
+    );
+    const statuses: string[] = [];
+    const authErrors: AuthError[] = [];
+    let tokenOk = false;
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: {
+          kind: "bearer",
+          getToken: async () => {
+            if (!tokenOk) throw new Error("refresh failed at boot");
+            return "oauth";
+          },
+        },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: seed.fetchImpl,
+        wsFactory: factory,
+        onStatus: (s) => statuses.push(s),
+        onAuthError: (e) => authErrors.push(e),
+        log: () => {},
+      }),
+    );
+
+    // The cold boot fails building the snapshot headers — but as a recoverable park, not a dead end.
+    await expect(replica.start()).rejects.toBeTruthy();
+    expect(replica.status).toBe("auth-required");
+    expect(authErrors).toHaveLength(1);
+
+    // Recover: the credential is refreshed and resume() re-runs the cold seed with a fresh token.
+    tokenOk = true;
+    replica.resume();
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThan(0));
+    sockets[sockets.length - 1]!.fireOpen();
+    await vi.waitFor(() => expect(replica.status).toBe("live"));
+    expect(replica.issues().map((v) => v.id)).toEqual(["i1"]);
+  });
+});
