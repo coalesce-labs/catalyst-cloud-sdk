@@ -7,6 +7,7 @@ import {
 import { applyDelta, setCursor, type ReplicaWriteDb } from "@catalyst-cloud/replicate";
 import {
   CatalystReplica,
+  AuthError,
   nodeSqliteEngine,
   type ReplicaEngine,
   type EngineFactory,
@@ -1367,4 +1368,185 @@ describe("CatalystReplica bounded teardown + seed abort (CTC-281)", () => {
     expect(view).toHaveLength(1);
     expect(view[0]!.title).toBe("replayed");
   });
+});
+
+// ── CTC-2111 — the OAuth bearer strategy on the managed replica: a rotating access token rides the
+//    /snapshot fetch fresh, and a 401/403 becomes a typed AuthError (never Error("/snapshot 401")). ──
+describe("CatalystReplica bearer auth (CTC-2111)", () => {
+  it("rides a FRESH bearer token as Authorization on the /snapshot fetch (getToken awaited per fetch)", async () => {
+    const { sockets, factory } = recordingFactory();
+    const seed = bufferedSnapshotFetch(
+      [{ entity: "issues", row: { id: "i1", identifier: "CTC-1", title: "Seed", updated_at: 1 } }],
+      5,
+    );
+    let calls = 0;
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "bearer", getToken: async () => `oauth-${++calls}` },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: seed.fetchImpl,
+        wsFactory: factory,
+      }),
+    );
+
+    await startToLive(replica, sockets);
+
+    expect(seed.calls.count).toBe(1);
+    // The /snapshot fetch awaited getToken() and rode its FRESH result as the Authorization header —
+    // the seed is the first token consumer, so it carries oauth-1. (The /connect URL then resolves its
+    // own fresh token, so `calls` ends > 1 — a rotating token is never captured once.)
+    expect(seed.headersSeen[0]?.["authorization"]).toBe("Bearer oauth-1");
+    expect(calls).toBeGreaterThanOrEqual(1);
+  });
+
+  it("a 401/403 /snapshot rejects the seed with a typed AuthError, not Error('/snapshot 403')", async () => {
+    const { sockets, factory } = recordingFactory();
+    const fetchImpl = (async () =>
+      ({ ok: false, status: 403, text: async () => "" }) as unknown as Response) as unknown as typeof fetch;
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "bearer", getToken: async () => "oauth" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl,
+        wsFactory: factory,
+        log: () => {},
+      }),
+    );
+
+    const err = await replica.start().then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(AuthError);
+    expect((err as AuthError).code).toBe(403);
+    expect(sockets).toHaveLength(0); // never opened a socket on an unseeded store
+  });
+});
+
+// ── CTC-2111 round 2 — the supported reauth resume on the managed replica (Codex finding 3). ─────────
+describe("CatalystReplica bearer resume (CTC-2111 — Codex r1 fix)", () => {
+  it("resume() re-opens the transport after a 4401 close (start() alone rejects when already started)", async () => {
+    const { sockets, factory } = recordingFactory();
+    const seed = bufferedSnapshotFetch(
+      [{ entity: "issues", row: { id: "i1", identifier: "CTC-1", title: "Seed", updated_at: 1 } }],
+      5,
+    );
+    const statuses: string[] = [];
+    const authErrors: AuthError[] = [];
+    let token = "oauth-1";
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "bearer", getToken: async () => token },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: seed.fetchImpl,
+        wsFactory: factory,
+        onStatus: (s) => statuses.push(s),
+        onAuthError: (e) => authErrors.push(e),
+        log: () => {},
+      }),
+    );
+
+    await startToLive(replica, sockets);
+    expect(replica.status).toBe("live");
+
+    // The mirror closes the socket 4401 — the access token was revoked / went inactive.
+    sockets[0]!.onclose?.({ code: 4401, reason: "reauthenticate" });
+    await vi.waitFor(() => expect(authErrors).toHaveLength(1));
+    expect(authErrors[0]!.code).toBe(4401);
+    expect(replica.status).toBe("auth-required");
+
+    // start() again is refused (already started) — resume() is the supported recovery.
+    await expect(replica.start()).rejects.toThrow(/already called/);
+
+    token = "oauth-2"; // consumer refreshed the credential
+    replica.resume();
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+    sockets[1]!.fireOpen();
+    await vi.waitFor(() => expect(replica.status).toBe("live"));
+  });
+});
+
+// ── CTC-2111 round 3 — a cold-boot getToken() rejection must park auth-required and be resumable
+//    (Codex round-2 finding 1): the common interaction-required / refresh-failed-at-boot path. ────────
+describe("CatalystReplica bearer cold-boot getToken recovery (CTC-2111 — Codex r2 fix)", () => {
+  it("a getToken() rejection while building /snapshot headers parks auth-required and recovers via resume()", async () => {
+    const { sockets, factory } = recordingFactory();
+    const seed = bufferedSnapshotFetch(
+      [{ entity: "issues", row: { id: "i1", identifier: "CTC-1", title: "Seed", updated_at: 1 } }],
+      5,
+    );
+    const statuses: string[] = [];
+    const authErrors: AuthError[] = [];
+    let tokenOk = false;
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: {
+          kind: "bearer",
+          getToken: async () => {
+            if (!tokenOk) throw new Error("refresh failed at boot");
+            return "oauth";
+          },
+        },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: seed.fetchImpl,
+        wsFactory: factory,
+        onStatus: (s) => statuses.push(s),
+        onAuthError: (e) => authErrors.push(e),
+        log: () => {},
+      }),
+    );
+
+    // The cold boot fails building the snapshot headers — but as a recoverable park, not a dead end.
+    await expect(replica.start()).rejects.toBeTruthy();
+    expect(replica.status).toBe("auth-required");
+    expect(authErrors).toHaveLength(1);
+
+    // Recover: the credential is refreshed and resume() re-runs the cold seed with a fresh token.
+    tokenOk = true;
+    replica.resume();
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThan(0));
+    sockets[sockets.length - 1]!.fireOpen();
+    await vi.waitFor(() => expect(replica.status).toBe("live"));
+    expect(replica.issues().map((v) => v.id)).toEqual(["i1"]);
+  });
+});
+
+// ── CTC-2111 — Codex round-2 followup: a bearer getToken() that never settles during /snapshot must be
+//    bounded by the idle deadline, not hang until the (optional) total reseed backstop. ──────────────
+describe("CatalystReplica bearer snapshot getToken deadline (CTC-2111 — Codex r2 followup)", () => {
+  it("RwK — a never-settling getToken() during /snapshot is aborted by the idle deadline, not hung", async () => {
+    const { sockets, factory } = recordingFactory();
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "bearer", getToken: () => new Promise<string>(() => {}) }, // never settles
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: (async () =>
+          ({ ok: true, status: 200, text: async () => "" }) as unknown as Response) as unknown as typeof fetch,
+        wsFactory: factory,
+        snapshotIdleTimeoutMs: 50,
+        reseedTimeoutMs: 0, // the TOTAL backstop is disabled — only the idle bound can end this
+        log: () => {},
+      }),
+    );
+
+    // Without the fix the seed hangs awaiting getToken() (the idle abort has nothing to cancel) and
+    // this never settles; with it, the idle deadline aborts the seed and start() rejects promptly.
+    await expect(replica.start()).rejects.toBeTruthy();
+    expect(sockets).toHaveLength(0);
+  }, 3000);
 });

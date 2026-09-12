@@ -49,6 +49,7 @@ import {
 } from "@catalyst-cloud/read-model";
 
 import {
+  AuthError,
   LiveSyncClient,
   stripTrailingSlashes,
   type AuthStrategy,
@@ -223,7 +224,8 @@ export interface CatalystReplicaOptions {
    */
   accountSource?: AccountSource;
   /** How to authorize: {kind:'token',token} (host bearer rides /connect as ?token= and /snapshot as
-   *  Authorization) | {kind:'cookie'} (same-origin session cookie). */
+   *  Authorization) | {kind:'cookie'} (same-origin session cookie) | {kind:'bearer',getToken} (a
+   *  person's rotating OAuth access token, resolved fresh per /connect and per /snapshot, CTC-2111). */
   auth: AuthStrategy;
   /** File path or ':memory:'. */
   dbPath: string;
@@ -237,6 +239,12 @@ export interface CatalystReplicaOptions {
   onChange?: () => void;
   /** Connection lifecycle, for UI/logging. */
   onStatus?: (status: LiveSyncStatus) => void;
+  /** CTC-2111 — a typed authorization failure, `{kind:'bearer'}` ONLY: a 4401 socket close
+   *  (revocation/inactivity) or a bearer 401/403 /snapshot (initial or resync). Paired with the
+   *  `"auth-required"` status, which is where the reconnect loop STOPS; re-authorize the person and
+   *  call `resume()` (start() is refused once the replica is already started). A token/cookie 401/403
+   *  keeps reconnect-with-backoff and never fires this. */
+  onAuthError?: (err: AuthError) => void;
   /** Base reconnect backoff in ms. Default 1000. */
   backoffMs?: number;
   /** Reconnect backoff ceiling in ms. Default 30_000. */
@@ -695,6 +703,7 @@ export class CatalystReplica {
       connectParams: () => this.workflowRevParams(),
       onChange: (frame) => this.applyFrame(frame),
       onStatus: (status) => this.handleStatus(status),
+      onAuthError: (err) => this.handleAuthError(err),
       backoffMs: this.opts.backoffMs,
       maxBackoffMs: this.opts.maxBackoffMs,
       pingIntervalMs: this.opts.pingIntervalMs,
@@ -759,6 +768,20 @@ export class CatalystReplica {
         },
       );
     });
+  }
+
+  /**
+   * CTC-2111 — resume a replica parked in `"auth-required"` after `onAuthError` (a 4401 socket close,
+   * or a 401/403 /snapshot). `start()` cannot do this — it throws once the replica is already started —
+   * so this is the supported recovery: refresh whatever credential the bearer `getToken()` draws on,
+   * then call `resume()`. It re-opens the transport with a freshly-resolved token; progress surfaces
+   * through `onStatus` (connecting → live), the same way `start()` reports it. A no-op on a reader or
+   * after `close()`.
+   */
+  resume(): void {
+    if (this.readonlyMode || this.closed) return;
+    if (!this.client) throw new Error("CatalystReplica: resume() before start()");
+    this.client.resume();
   }
 
   /** Stop the socket, release the writer lock, close the DB. Idempotent. Rejects a still-pending
@@ -935,6 +958,16 @@ export class CatalystReplica {
       this.opts.onStatus?.(status);
     } catch (err) {
       this.log("warn", "onStatus handler threw", err);
+    }
+  }
+
+  /** CTC-2111 — forward a typed authorization failure from the transport (bearer 4401 close) or the
+   *  seed (401/403 /snapshot) to the consumer's onAuthError. Guarded like onStatus. */
+  private handleAuthError(err: AuthError): void {
+    try {
+      this.opts.onAuthError?.(err);
+    } catch (e) {
+      this.log("warn", "onAuthError handler threw", e);
     }
   }
 
@@ -1208,12 +1241,46 @@ export class CatalystReplica {
             ? abort.signal.reason
             : new Error("CatalystReplica: seed aborted");
 
+        /** CTC-2111 — race a promise against the seed's abort signal, so an operation that does not
+         *  itself observe the signal (a bearer getToken() that never settles) is still bounded by the
+         *  idle deadline / close() abort. Without this the /snapshot idle bound had no effect while
+         *  awaiting feedHeaders(): fetchImpl is never reached, so the abort had nothing to cancel. */
+        const abortable = <T>(p: Promise<T>): Promise<T> =>
+          new Promise<T>((resolve, reject) => {
+            if (abort.signal.aborted) return reject(abortError());
+            const onAbort = (): void => reject(abortError());
+            abort.signal.addEventListener("abort", onAbort, { once: true });
+            p.then(
+              (v) => {
+                abort.signal.removeEventListener("abort", onAbort);
+                resolve(v);
+              },
+              (e) => {
+                abort.signal.removeEventListener("abort", onAbort);
+                reject(e);
+              },
+            );
+          });
+
         try {
           const url = `${this.baseUrl}/snapshot?account=${encodeURIComponent(this.opts.account)}`;
-          armIdle(); // bounds the headers phase
-          const res = await this.fetchImpl(url, { headers: this.feedHeaders(), signal: abort.signal });
+          armIdle(); // bounds the headers phase, INCLUDING a bearer getToken() resolution (CTC-2111)
+          const headers = await abortable(this.feedHeaders());
+          armIdle(); // token in hand — progress
+          const res = await this.fetchImpl(url, { headers, signal: abort.signal });
           armIdle(); // headers arrived — progress
-          if (!res.ok) throw new Error(`/snapshot ${res.status}`);
+          if (!res.ok) {
+            // CTC-2111 — for a BEARER auth, an authorization failure is a TYPED AuthError the consumer
+            // can act on (refresh the token, resume()). BEARER-ONLY: a token/cookie credential has no
+            // refresh path, so its 401/403 stays a plain Error and keeps the legacy reconnect-with-
+            // backoff posture — parking an org-tier host-sync daemon on a WorkOS blip would strand it,
+            // and the mirror's 401 does not separate "invalid" from "unavailable" (CTC-792-grammar).
+            // Every other status is a plain Error too — the transport retries those through backoff.
+            if ((res.status === 401 || res.status === 403) && this.opts.auth.kind === "bearer") {
+              throw new AuthError(res.status, `/snapshot ${res.status}`);
+            }
+            throw new Error(`/snapshot ${res.status}`);
+          }
 
           // CTC-137: the /snapshot response is the SINGLE HTTP Response the SDK reads, so it is the one
           // place to learn the mirror's head_seq (+ server clock). Stashed for the lag_seq gauge, which
@@ -1335,9 +1402,26 @@ export class CatalystReplica {
     }
   }
 
-  private feedHeaders(): Record<string, string> {
+  /** The /snapshot request headers. Async because a bearer auth resolves a FRESH token per fetch
+   *  (CTC-2111) — a rotating access token must never be captured once, exactly as the /connect URL
+   *  re-resolves it per (re)connect. token/cookie are unchanged. */
+  private async feedHeaders(): Promise<Record<string, string>> {
     const h: Record<string, string> = { accept: "application/x-ndjson" };
     if (this.opts.auth.kind === "token") h["authorization"] = `Bearer ${this.opts.auth.token}`;
+    else if (this.opts.auth.kind === "bearer") {
+      // CTC-2111 — a getToken() REJECTION while building the headers (interaction-required, a failed
+      // refresh at boot) is an authorization failure, not a transport fault: raise it as a typed
+      // AuthError so it flows through the same auth-required park as a 401/403 response. Without this a
+      // COLD-boot reject bypassed the park entirely — the client never set authRequired, so start()
+      // refused a retry and resume() was a no-op, leaving startup unrecoverable without reconstruction.
+      let token: string;
+      try {
+        token = await this.opts.auth.getToken();
+      } catch (err) {
+        throw new AuthError(401, `bearer getToken() rejected: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      h["authorization"] = `Bearer ${token}`;
+    }
     return h;
   }
 }

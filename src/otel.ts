@@ -105,6 +105,9 @@ export const REPLICA_STATUS_CODE: Record<LiveSyncStatus, number> = {
   resyncing: 3,
   error: 4,
   stopped: 5,
+  // CTC-2111 — the bearer re-auth stop: a distinct gauge value so a dashboard can tell "the token
+  // must be re-authorized" apart from a transient "error", and alert on it separately.
+  "auth-required": 6,
 };
 
 /** The default instrumentation-scope name for both the tracer and the meter. */

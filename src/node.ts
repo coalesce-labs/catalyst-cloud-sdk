@@ -44,6 +44,8 @@ export {
 // Re-export the transport surface so a consumer can stay on one import.
 export {
   LiveSyncClient,
+  AuthError,
+  CLOSE_REAUTHENTICATE,
   type AuthStrategy,
   type LiveSyncStatus,
   type LogLevel,
