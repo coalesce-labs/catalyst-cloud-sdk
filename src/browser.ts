@@ -38,7 +38,10 @@ export {
   type DeltaQueueOptions,
 } from "./replica/browser/delta-queue.js";
 
-export { streamSnapshotBatches, SEED_BATCH_ROWS } from "./replica/browser/snapshot-stream.js";
+export {
+  streamSnapshotBatches,
+  SEED_BATCH_ROWS,
+} from "./replica/browser/snapshot-stream.js";
 
 export type {
   WireChange,
@@ -49,9 +52,13 @@ export type {
   ApplyChangesResult,
 } from "./replica/browser/protocol.js";
 
-// Re-export the transport surface so a consumer can stay on one import.
+// Re-export the transport surface so a consumer can stay on one import — including the bearer-auth
+// symbols (CTC-2111), so a browser consumer can `instanceof AuthError` in onAuthError from the same
+// subpath it built the client from. Mirrors /node and the root.
 export {
   LiveSyncClient,
+  AuthError,
+  CLOSE_REAUTHENTICATE,
   type AuthStrategy,
   type LiveSyncStatus,
   type LogLevel,

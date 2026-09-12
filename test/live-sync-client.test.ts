@@ -3198,3 +3198,59 @@ describe("bearer sync-resume during resync (CTC-2111 — Codex r4)", () => {
     client.stop();
   });
 });
+
+// ── CTC-2111 — the root fix for the sync-resume class: an owner registers its handle SYNCHRONOUSLY, so
+//    a reseed that throws SYNCHRONOUSLY + a sync resume() from onAuthError can never race the window
+//    before the handle is assigned (Codex post-merge :868). ─────────────────────────────────────────
+describe("bearer sync-throw reseed + sync resume (CTC-2111 — register-ownership-first)", () => {
+  it("a SYNCHRONOUSLY-throwing cold reseed + sync resume() recovers to live once, without clobbering the boot latches", async () => {
+    const store = makeStore(null); // cursorless → cold seed
+    const { sockets, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
+    let seedCalls = 0;
+    let failNext = true;
+    let resumeCalls = 0;
+    let client!: LiveSyncClient;
+    client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      // NOT async — throws SYNCHRONOUSLY on the call, before returning a promise. This is the window
+      // that raced bootTask assignment: the async boot IIFE is still evaluating when onAuthError fires.
+      reseed: (() => {
+        seedCalls += 1;
+        if (failNext) {
+          failNext = false;
+          throw new AuthError(403, "/snapshot 403");
+        }
+        store.setCursor(30);
+        return Promise.resolve(30);
+      }) as unknown as (signal?: AbortSignal) => Promise<number>,
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      auth: { kind: "bearer", getToken: async () => "tok" },
+      onStatus: (s) => statuses.push(s),
+      onAuthError: () => {
+        resumeCalls += 1;
+        client.resume(); // SYNCHRONOUS resume, racing bootTask assignment
+      },
+      backoffMs: 5,
+      maxBackoffMs: 5,
+      log: () => {},
+    });
+
+    void client.start().catch(() => {}); // the initial cold seed rejects; recovery is the resumed run
+
+    // Recovery re-seeds and opens a socket — the boot's own settle drained the single intent.
+    await vi.waitFor(() => expect(seedCalls).toBe(2));
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThan(0));
+    sockets[sockets.length - 1]!.fireOpen();
+    await vi.waitFor(() => expect(statuses[statuses.length - 1]).toBe("live"));
+    expect(resumeCalls).toBe(1); // one sync resume, no permanent park needing a second
+
+    // The boot latches were not clobbered by the failed outer boot: requestResync still works.
+    await client.requestResync();
+    expect(seedCalls).toBe(3);
+    client.stop();
+  });
+});

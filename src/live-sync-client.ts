@@ -77,7 +77,14 @@
 // `{type:"head", seq:<feed head>}` nudge; the client treats a head beyond its baseline exactly like a
 // beyond-gap change frame (re-request the hole `deliveredSeq+1..head`) but never applies it.
 
-import type { ChangeFrame, HeadFrame, PongFrame, ResyncFrame, ServerFrame, SyncFrame } from "./types.js";
+import type {
+  ChangeFrame,
+  HeadFrame,
+  PongFrame,
+  ResyncFrame,
+  ServerFrame,
+  SyncFrame,
+} from "./types.js";
 import { PING_FRAME } from "./types.js";
 import {
   NOOP_TELEMETRY,
@@ -366,7 +373,8 @@ const DEFAULT_CANCEL_CLEANUP_GRACE_MS = 250;
 
 /** Resolve the runtime global WebSocket, or fail with an actionable message. */
 function defaultWsFactory(url: string): WebSocketLike {
-  const Ctor = (globalThis as { WebSocket?: new (u: string) => WebSocketLike }).WebSocket;
+  const Ctor = (globalThis as { WebSocket?: new (u: string) => WebSocketLike })
+    .WebSocket;
   if (!Ctor) {
     throw new Error(
       "global WebSocket unavailable; pass wsFactory (browser, Bun, or Node >=22 expose one)",
@@ -432,7 +440,8 @@ export function buildConnectUrl(opts: {
   if (opts.auth.kind === "token") params.set("token", opts.auth.token);
   // CTC-2111 — a bearer's resolved token rides `?token=` identically to the `token` strategy. Only
   // when a value was actually resolved: a diagnostic `connectUrl()` cannot resolve one synchronously.
-  else if (opts.auth.kind === "bearer" && opts.bearerToken != null) params.set("token", opts.bearerToken);
+  else if (opts.auth.kind === "bearer" && opts.bearerToken != null)
+    params.set("token", opts.bearerToken);
   // Only when a tenant was actually named. `?account=` is NOT the same as no account: the server's
   // consumers are truthiness checks, so empty takes the omitted path anyway — but it would freeze a
   // contract in which "" is a legal mirror name, and it puts `catalyst.tenant=""` on every span.
@@ -585,7 +594,8 @@ export class LiveSyncClient {
   private deliveredSeq = -1;
   /** The gap currently being re-requested, or null when the stream is contiguous. `seqFrom..seqTo` is
    *  the detected hole (fixed at detection); `retries` counts the sync re-requests spent on it. */
-  private gap: { seqFrom: number; seqTo: number; retries: number } | null = null;
+  private gap: { seqFrom: number; seqTo: number; retries: number } | null =
+    null;
   private gapTimer: ReturnType<typeof setTimeout> | null = null;
   /** Epoch ms of the last inbound CHANGE frame (live or replayed, delivered or gap-dropped). Unlike
    *  {@link lastFrameAt} this ignores pongs, so it only moves when the feed actually pushes data. */
@@ -645,7 +655,10 @@ export class LiveSyncClient {
     // account is a misconfiguration, not a default. It is checked in the constructor rather than in
     // buildConnectUrl because `connectUrl()` is called from `openSocket()` OUTSIDE its try/catch — a
     // throw down there escapes the reconnect machinery entirely instead of surfacing to the caller.
-    if ((opts.auth.kind === "token" || opts.auth.kind === "bearer") && !opts.accountId) {
+    if (
+      (opts.auth.kind === "token" || opts.auth.kind === "bearer") &&
+      !opts.accountId
+    ) {
       throw new Error(
         "LiveSyncClient: accountId is required with token or bearer auth (only cookie auth can fall back to the session's own tenant)",
       );
@@ -675,7 +688,10 @@ export class LiveSyncClient {
     this.log =
       opts.log ??
       ((lvl, msg, extra) =>
-        console[lvl === "error" ? "error" : "log"](`[catalyst-sdk:live] ${msg}`, extra ?? ""));
+        console[lvl === "error" ? "error" : "log"](
+          `[catalyst-sdk:live] ${msg}`,
+          extra ?? "",
+        ));
     this.telemetryConfig = opts.telemetry;
     this.backoff = this.backoffMs;
   }
@@ -707,79 +723,98 @@ export class LiveSyncClient {
     const done = new Promise<void>((resolve) => {
       this.resolveDone = resolve;
     });
-    const boot = (async () => {
-      // The WHOLE boot is an in-flight resync, not just the cold seed (CTC-114 review rounds 4 + 6).
-      //
-      // `requestResync()` — public as of 0.8.0 — is callable the moment start() returns its promise,
-      // which is before ANY of this settles. Without the latch, `handleResync()`'s re-entrancy guard
-      // read false and started a SECOND concurrent reseed: two seeds interleaving writes through a
-      // non-reentrant consumer callback, then each completion calling openSocket() — and since
-      // openSocket() overwrites `this.ws`, the first socket was orphaned, still delivering duplicate
-      // frames and unreachable by stop().
-      //
-      // Round 4 latched only the cold seed. That was not enough: `createTelemetry()` below is awaited
-      // BEFORE the seed, so with telemetry enabled the boot suspends in a window where `started` is
-      // already true and the latch is not yet set. The latch therefore has to cover the entire body.
-      //
-      // Until this release the invariant held for free — a resync could only be driven by a server
-      // frame, and a frame needs a socket, which does not exist until openSocket() below.
-      //
-      // The latch makes the request WAIT; whether it is then absorbed or honoured is decided in
-      // requestResync() from `bootColdSeeded`, once this task has settled.
-      //
-      // Round 6 absorbed it on BOTH arms, arguing that a warm boot's `{type:"sync", after:<cursor>}`
-      // is itself the catch-up. That was wrong (round 7), and wrong against this method's whole
-      // reason for existing: a consumer calls requestResync() when it has discovered ON ITS OWN SIDE
-      // that deltas can no longer catch its store up — the browser replica's dropped overflow buffer
-      // is the motivating case. Replaying from the cursor cannot rebuild rows the consumer already
-      // lost, so silently swallowing the request left it permanently inconsistent. Only a COLD boot
-      // may absorb it, because that boot really is a full re-seed from /snapshot.
-      this.resyncing = true;
-      try {
-        // Resolve the OTel seam ONCE up front (before the first reseed, so the seed span exists on the
-        // cold-start path too). Keep the OFF path FULLY SYNCHRONOUS — no `await`, so a caller that opens
-        // the socket and inspects it in the same tick still sees it (the boot body runs synchronously up
-        // to its first await); only pay the async resolution (guarded dynamic import, or a
-        // CatalystReplica passing its already-resolved instance) when telemetry is on.
-        this.telemetry =
-          this.telemetryConfig === undefined || this.telemetryConfig === false
-            ? NOOP_TELEMETRY
-            : await createTelemetry(this.telemetryConfig, {
-                tracerName: DEFAULT_SCOPE_NAME,
-                meterName: DEFAULT_SCOPE_NAME,
-              });
-        this.gapCounter = this.telemetry.counter(REPLICA_METRIC.gaps, {
-          description: "Change-feed seq-gap lifecycle events (detected/healed/escalated).",
-          unit: "{gap}",
-        });
-        const saved = this.getCursor();
-        if (saved == null) {
-          this.setStatus("resyncing");
-          // Bounded like the resync-path reseed (CTC-281): a hanging COLD seed surfaces as a start()
-          // rejection (the boot arm rejects) instead of a silent forever-"resyncing" start().
-          try {
-            await this.boundedReseed();
-          } catch (err) {
-            // CTC-2111 — the initial /snapshot was rejected 401/403: for a BEARER client, surface it as
-            // "auth-required" + onAuthError so the consumer can refresh and resume() (not an endless
-            // retry). BEARER-ONLY (see runResync): a token/cookie initial-seed failure stays today's
-            // start() rejection, never auth-required. Either way, still reject the boot — an unseeded
-            // store cannot go live, and no socket is opened.
-            if (err instanceof AuthError && this.auth.kind === "bearer") this.raiseAuthError(err);
-            throw err;
-          }
-          // Only NOW may a request that waited on this boot be absorbed — this really was a full
-          // re-seed from /snapshot. A warm boot sets nothing, so the waiter is honoured instead.
-          this.bootColdSeeded = true;
-        }
-      } finally {
-        // Must clear on the FAILURE arm too, or a failed boot latches the client into a state where
-        // every later resync — and scheduleReconnect — is suppressed forever.
-        this.resyncing = false;
-      }
-      this.openSocket();
-    })();
+    // Register ownership SYNCHRONOUSLY, before the body runs (CTC-2111 :868): the async body runs
+    // synchronously up to its first await, and a bearer cold reseed that throws SYNCHRONOUSLY there
+    // fires onAuthError → resume() while `this.bootTask` would otherwise still be unassigned — so
+    // drainRecovery would see no in-flight owner and drain into a RECURSIVE boot, which the failing
+    // outer boot then clobbers. Assigning the handle first (a promise the body settles) guarantees
+    // hasInFlightRun() always sees this boot, so drainRecovery defers to its settle instead.
+    let finishBoot!: () => void;
+    let failBoot!: (err: unknown) => void;
+    const boot = new Promise<void>((resolve, reject) => {
+      finishBoot = resolve;
+      failBoot = reject;
+    });
     this.bootTask = boot;
+    void (async () => {
+      try {
+        // The WHOLE boot is an in-flight resync, not just the cold seed (CTC-114 review rounds 4 + 6).
+        //
+        // `requestResync()` — public as of 0.8.0 — is callable the moment start() returns its promise,
+        // which is before ANY of this settles. Without the latch, `handleResync()`'s re-entrancy guard
+        // read false and started a SECOND concurrent reseed: two seeds interleaving writes through a
+        // non-reentrant consumer callback, then each completion calling openSocket() — and since
+        // openSocket() overwrites `this.ws`, the first socket was orphaned, still delivering duplicate
+        // frames and unreachable by stop().
+        //
+        // Round 4 latched only the cold seed. That was not enough: `createTelemetry()` below is awaited
+        // BEFORE the seed, so with telemetry enabled the boot suspends in a window where `started` is
+        // already true and the latch is not yet set. The latch therefore has to cover the entire body.
+        //
+        // Until this release the invariant held for free — a resync could only be driven by a server
+        // frame, and a frame needs a socket, which does not exist until openSocket() below.
+        //
+        // The latch makes the request WAIT; whether it is then absorbed or honoured is decided in
+        // requestResync() from `bootColdSeeded`, once this task has settled.
+        //
+        // Round 6 absorbed it on BOTH arms, arguing that a warm boot's `{type:"sync", after:<cursor>}`
+        // is itself the catch-up. That was wrong (round 7), and wrong against this method's whole
+        // reason for existing: a consumer calls requestResync() when it has discovered ON ITS OWN SIDE
+        // that deltas can no longer catch its store up — the browser replica's dropped overflow buffer
+        // is the motivating case. Replaying from the cursor cannot rebuild rows the consumer already
+        // lost, so silently swallowing the request left it permanently inconsistent. Only a COLD boot
+        // may absorb it, because that boot really is a full re-seed from /snapshot.
+        this.resyncing = true;
+        try {
+          // Resolve the OTel seam ONCE up front (before the first reseed, so the seed span exists on the
+          // cold-start path too). Keep the OFF path FULLY SYNCHRONOUS — no `await`, so a caller that opens
+          // the socket and inspects it in the same tick still sees it (the boot body runs synchronously up
+          // to its first await); only pay the async resolution (guarded dynamic import, or a
+          // CatalystReplica passing its already-resolved instance) when telemetry is on.
+          this.telemetry =
+            this.telemetryConfig === undefined || this.telemetryConfig === false
+              ? NOOP_TELEMETRY
+              : await createTelemetry(this.telemetryConfig, {
+                  tracerName: DEFAULT_SCOPE_NAME,
+                  meterName: DEFAULT_SCOPE_NAME,
+                });
+          this.gapCounter = this.telemetry.counter(REPLICA_METRIC.gaps, {
+            description:
+              "Change-feed seq-gap lifecycle events (detected/healed/escalated).",
+            unit: "{gap}",
+          });
+          const saved = this.getCursor();
+          if (saved == null) {
+            this.setStatus("resyncing");
+            // Bounded like the resync-path reseed (CTC-281): a hanging COLD seed surfaces as a start()
+            // rejection (the boot arm rejects) instead of a silent forever-"resyncing" start().
+            try {
+              await this.boundedReseed();
+            } catch (err) {
+              // CTC-2111 — the initial /snapshot was rejected 401/403: for a BEARER client, surface it as
+              // "auth-required" + onAuthError so the consumer can refresh and resume() (not an endless
+              // retry). BEARER-ONLY (see runResync): a token/cookie initial-seed failure stays today's
+              // start() rejection, never auth-required. Either way, still reject the boot — an unseeded
+              // store cannot go live, and no socket is opened.
+              if (err instanceof AuthError && this.auth.kind === "bearer")
+                this.raiseAuthError(err);
+              throw err;
+            }
+            // Only NOW may a request that waited on this boot be absorbed — this really was a full
+            // re-seed from /snapshot. A warm boot sets nothing, so the waiter is honoured instead.
+            this.bootColdSeeded = true;
+          }
+        } finally {
+          // Must clear on the FAILURE arm too, or a failed boot latches the client into a state where
+          // every later resync — and scheduleReconnect — is suppressed forever.
+          this.resyncing = false;
+        }
+        this.openSocket();
+        finishBoot();
+      } catch (err) {
+        failBoot(err);
+      }
+    })();
     // Clear the handle once boot settles, so a resync arriving LONG after startup is never mistaken
     // for one that raced it — otherwise `bootColdSeeded` would absorb legitimate later requests
     // forever. The catch keeps a boot rejection from surfacing as an unhandled one on this arm; the
@@ -1054,7 +1089,10 @@ export class LiveSyncClient {
    *   • `getToken()` timed out (never settled) → a bounded backoff reconnect (transient, retryable);
    *   • `getToken()` rejected → park in `"auth-required"` (re-auth needed) until `resume()`.
    */
-  private async resolveBearerAndConnect(getToken: () => Promise<string>, attempt: number): Promise<void> {
+  private async resolveBearerAndConnect(
+    getToken: () => Promise<string>,
+    attempt: number,
+  ): Promise<void> {
     let token: string;
     try {
       token = await this.awaitTokenBounded(getToken());
@@ -1062,12 +1100,20 @@ export class LiveSyncClient {
       // Superseded: its late value must never open a socket the current run does not expect.
       if (this.supersededConnect(attempt)) return;
       if (err instanceof BearerTokenTimeoutError) {
-        this.log("warn", "bearer getToken() did not settle within the connect deadline; backing off", err);
+        this.log(
+          "warn",
+          "bearer getToken() did not settle within the connect deadline; backing off",
+          err,
+        );
         this.setStatus("reconnecting");
         this.scheduleReconnect();
         return;
       }
-      this.log("warn", "bearer getToken() rejected; auth-required until resume()", err);
+      this.log(
+        "warn",
+        "bearer getToken() rejected; auth-required until resume()",
+        err,
+      );
       this.parkAuthRequired();
       return;
     }
@@ -1117,7 +1163,10 @@ export class LiveSyncClient {
         // Late-timer guard (same discipline as onPongDeadline): a throttled tab can fire this after
         // onopen already ran, or after this socket was already replaced/torn down.
         if (this.stopped || this.ws !== ws || this.socketOpened) return;
-        this.log("warn", `ws open timed out after ${this.openTimeoutMs}ms; forcing reconnect`);
+        this.log(
+          "warn",
+          `ws open timed out after ${this.openTimeoutMs}ms; forcing reconnect`,
+        );
         this.endConnectSpan(new Error("open timeout"));
         this.forceReconnect();
       }, this.openTimeoutMs);
@@ -1153,9 +1202,15 @@ export class LiveSyncClient {
       // so the reconnect loop STOPS — the bug this fixes was reconnecting forever against a dead
       // token. A {kind:"token"} client is UNCHANGED: it ignores the code and reconnects as it always
       // has (regression pin). The next deliberate start() resolves a fresh token via getToken().
-      if (this.auth.kind === "bearer" && closeCode(ev) === CLOSE_REAUTHENTICATE && !this.stopped) {
+      if (
+        this.auth.kind === "bearer" &&
+        closeCode(ev) === CLOSE_REAUTHENTICATE &&
+        !this.stopped
+      ) {
         this.endConnectSpan(new Error("socket closed 4401 (reauthenticate)"));
-        this.raiseAuthError(new AuthError(CLOSE_REAUTHENTICATE, closeReason(ev)));
+        this.raiseAuthError(
+          new AuthError(CLOSE_REAUTHENTICATE, closeReason(ev)),
+        );
         return; // deliberately NO scheduleReconnect — see above
       }
       if (!this.stopped && !this.resyncing) this.setStatus("reconnecting");
@@ -1181,7 +1236,10 @@ export class LiveSyncClient {
         this.errorFallbackTimer = setTimeout(() => {
           this.errorFallbackTimer = null;
           if (this.stopped || this.ws !== ws) return; // onclose (or a teardown) already handled it
-          this.log("warn", "ws error was never followed by close; forcing reconnect (CTC-281)");
+          this.log(
+            "warn",
+            "ws error was never followed by close; forcing reconnect (CTC-281)",
+          );
           this.forceReconnect();
         }, ERROR_CLOSE_GRACE_MS);
       }
@@ -1272,7 +1330,10 @@ export class LiveSyncClient {
         // The degraded slow re-probe just paid off (the server pongs after all — recovered mid-window
         // or upgraded): re-arm full-speed detection immediately (CTC-281).
         this.watchdogDegraded = false;
-        this.log("info", "pong observed on a degraded watchdog; full-speed liveness detection re-armed (CTC-281)");
+        this.log(
+          "info",
+          "pong observed on a degraded watchdog; full-speed liveness detection re-armed (CTC-281)",
+        );
         this.armPing();
       }
       return;
@@ -1309,7 +1370,11 @@ export class LiveSyncClient {
     try {
       this.onChange(frame);
     } catch (err) {
-      this.log("error", `onChange failed for ${frame.entity} seq=${frame.seq}`, err);
+      this.log(
+        "error",
+        `onChange failed for ${frame.entity} seq=${frame.seq}`,
+        err,
+      );
     }
     if (frame.seq > this.deliveredSeq) {
       this.deliveredSeq = frame.seq;
@@ -1343,7 +1408,11 @@ export class LiveSyncClient {
    */
   private onGapFrame(frame: ChangeFrame): void {
     if (this.gap) return; // a re-request is already in flight; the replay redelivers this frame too
-    this.gap = { seqFrom: this.deliveredSeq + 1, seqTo: frame.seq - 1, retries: 0 };
+    this.gap = {
+      seqFrom: this.deliveredSeq + 1,
+      seqTo: frame.seq - 1,
+      retries: 0,
+    };
     this.recordGap("detected", this.gap);
     this.sendGapRequest();
   }
@@ -1422,7 +1491,10 @@ export class LiveSyncClient {
    *  line as VALUES, never labels. Levels: `detected` and `healed` log at INFO — a gap is the
    *  steady-state path (every reconcile pass punches one that heals via re-request), so ALERTING MUST
    *  KEY ON `escalated` ONLY (logged at ERROR); a gap that heals is routine and boring. */
-  private recordGap(event: ReplicaGapEvent, gap: { seqFrom: number; seqTo: number; retries: number }): void {
+  private recordGap(
+    event: ReplicaGapEvent,
+    gap: { seqFrom: number; seqTo: number; retries: number },
+  ): void {
     this.gapCounter.add(1, {
       [CATALYST_ATTR.tenant]: this.tenantAttr,
       [CATALYST_ATTR.gapEvent]: event,
@@ -1479,7 +1551,20 @@ export class LiveSyncClient {
   private boundedReseed(): Promise<number> {
     // Cancellation is scoped to THIS attempt. Aborting it must not disturb a successor.
     const cancel = new AbortController();
-    const seed = this.reseed(cancel.signal);
+    // CTC-2111 — NORMALIZE a synchronous throw from `reseed` into a rejected promise. A consumer reseed
+    // that throws SYNCHRONOUSLY (rather than rejecting) would otherwise unwind the caller before its
+    // `await` suspends — so the owning boot/resync would still be registering its handle when a sync
+    // resume() from onAuthError ran, and drainRecovery would drain into a recursive op. As a promise,
+    // the failure is always a microtask, after the handle is registered. (Register-first is the primary
+    // guard; this is the belt-and-suspenders that makes the reseed await ALWAYS suspend.)
+    let seed: Promise<number>;
+    try {
+      seed = Promise.resolve(this.reseed(cancel.signal));
+    } catch (err) {
+      seed = Promise.reject(
+        err instanceof Error ? err : new Error(String(err)),
+      );
+    }
     void seed.catch(() => {}); // an abandoned attempt's late rejection must never go unhandled
     // ALWAYS wrapped, even with the deadline disabled (CTC-114 review round 8). This used to
     // early-return the raw seed promise when `reseedTimeoutMs <= 0` — the documented way to turn the
@@ -1566,7 +1651,10 @@ export class LiveSyncClient {
         giveUp(new Error("client stopped while re-seeding"));
       seed.then(
         (cursor) => finish(() => resolve(cursor)),
-        (err: unknown) => finish(() => reject(err instanceof Error ? err : new Error(String(err)))),
+        (err: unknown) =>
+          finish(() =>
+            reject(err instanceof Error ? err : new Error(String(err))),
+          ),
       );
     });
   }
@@ -1662,8 +1750,18 @@ export class LiveSyncClient {
     // settle BEFORE the awaited work — a foot-gun this file has been bitten by often enough to be
     // worth foreclosing, and it keeps this frame in the stack trace when the resync rejects.
     if (this.activeResync) return await this.activeResync;
-    const run = this.runResync();
+    // Register ownership SYNCHRONOUSLY, before runResync's body runs (CTC-2111 :868): a synchronous
+    // resume() from onAuthError (fired by a reseed that rejects) must find `activeResync` already set,
+    // or drainRecovery sees no in-flight owner and drains into a recursive resync. The run promise is
+    // created here and settled by runResync, so the handle exists before any of runResync executes.
+    let finishRun!: () => void;
+    let failRun!: (err: unknown) => void;
+    const run = new Promise<void>((resolve, reject) => {
+      finishRun = resolve;
+      failRun = reject;
+    });
     this.activeResync = run;
+    void this.runResync().then(finishRun, failRun);
     try {
       await run;
     } finally {
@@ -1717,8 +1815,10 @@ export class LiveSyncClient {
       // has no refresh path and nothing calls resume() on a host-sync daemon, so parking it on a WorkOS
       // blip would strand it — and the mirror's 401 does not separate "invalid" from "unavailable"
       // (CTC-792-grammar). Legacy clients keep reconnect-with-backoff. Every other failure retries too.
-      if (err instanceof AuthError && this.auth.kind === "bearer") authErr = err;
-      else this.log("error", "resync reseed failed; will retry on reconnect", err);
+      if (err instanceof AuthError && this.auth.kind === "bearer")
+        authErr = err;
+      else
+        this.log("error", "resync reseed failed; will retry on reconnect", err);
     } finally {
       this.resyncing = false;
     }
@@ -1792,11 +1892,18 @@ export class LiveSyncClient {
     try {
       this.ws.send(PING_FRAME);
     } catch (err) {
-      this.log("warn", "liveness ping send failed (dead socket); forcing reconnect", err);
+      this.log(
+        "warn",
+        "liveness ping send failed (dead socket); forcing reconnect",
+        err,
+      );
       this.onProbeUnanswered();
       return;
     }
-    this.pongDeadline = setTimeout(() => this.onPongDeadline(), this.pongTimeoutMs);
+    this.pongDeadline = setTimeout(
+      () => this.onPongDeadline(),
+      this.pongTimeoutMs,
+    );
   }
 
   /** The pong deadline elapsed. Late-timer guard first: in a throttled background tab this callback can
@@ -1825,7 +1932,10 @@ export class LiveSyncClient {
    *  force-reconnects through the existing backoff. */
   private onProbeUnanswered(): void {
     if (this.pongObserved) {
-      this.log("warn", "liveness timeout: no frame within the pong deadline; reconnecting");
+      this.log(
+        "warn",
+        "liveness timeout: no frame within the pong deadline; reconnecting",
+      );
     } else if (this.pongEverObserved) {
       // A distinct signal from the plain liveness timeout: a PROVEN-pong server delivered zero frames
       // on a whole connection — the fleet-incident shape (server accepts upgrades, feed is dead).
