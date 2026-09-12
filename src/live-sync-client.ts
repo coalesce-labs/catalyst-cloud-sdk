@@ -547,9 +547,18 @@ export class LiveSyncClient {
    *  to `live` with the very inconsistency the resync existed to fix). Distinct from the cursorless
    *  initial-seed case, which `getCursor()` already detects. */
   private resyncNeededAfterAuth = false;
-  /** CTC-2111 — a monotonically-increasing connect-attempt id. A bearer connect resolves getToken()
-   *  asynchronously; this stamps each attempt so a late/stale resolution (superseded by a newer
-   *  attempt, a stop(), or a start()) is dropped rather than opening an orphan socket. */
+  /**
+   * CTC-2111 — THE single connect-generation guard. A bearer connect resolves getToken() asynchronously,
+   * so a late/stale resolution must be dropped rather than open an orphan socket. One counter, ONE check
+   * site (`supersededConnect`, in `resolveBearerAndConnect` — the only getToken-gated connect), bumped at
+   * the TWO choke points EVERY lifecycle transition funnels through:
+   *   • `openSocket()`  — every connect: initial, reconnect, and resume-reopen (so start → boot →
+   *     openSocket, and a resume re-open, each stamp a new attempt);
+   *   • `closeSocket()` — every deliberate teardown/reseed: stop, requestResync/runResync, forceReconnect,
+   *     and resume-reseed (so entering a resync invalidates any pending connect — RwF).
+   * `stop()` also bumps directly, ahead of its closeSocket(), to close the stop()-then-start() window
+   * before the new run's openSocket() re-stamps.
+   */
   private connectAttempt = 0;
   private backoff: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1023,7 +1032,7 @@ export class LiveSyncClient {
       token = await this.awaitTokenBounded(getToken());
     } catch (err) {
       // Superseded: its late value must never open a socket the current run does not expect.
-      if (this.stopped || attempt !== this.connectAttempt) return;
+      if (this.supersededConnect(attempt)) return;
       if (err instanceof BearerTokenTimeoutError) {
         this.log("warn", "bearer getToken() did not settle within the connect deadline; backing off", err);
         this.setStatus("reconnecting");
@@ -1035,8 +1044,15 @@ export class LiveSyncClient {
       return;
     }
     // Superseded during the await (a newer attempt, or a stop()/start()) — drop the stale resolution.
-    if (this.stopped || attempt !== this.connectAttempt) return;
+    if (this.supersededConnect(attempt)) return;
     this.connect(token);
+  }
+
+  /** CTC-2111 — the ONE connect-generation check: true if `attempt` is no longer the current connect
+   *  (a stop, a start, a resync, a reconnect, a resume-reopen all bump `connectAttempt`), so a bearer
+   *  getToken() resolving after any of those must be dropped rather than open an orphan socket. */
+  private supersededConnect(attempt: number): boolean {
+    return this.stopped || attempt !== this.connectAttempt;
   }
 
   /** Open a socket with the connect URL, given an already-resolved bearer token (undefined for
