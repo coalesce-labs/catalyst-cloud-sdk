@@ -1241,10 +1241,33 @@ export class CatalystReplica {
             ? abort.signal.reason
             : new Error("CatalystReplica: seed aborted");
 
+        /** CTC-2111 — race a promise against the seed's abort signal, so an operation that does not
+         *  itself observe the signal (a bearer getToken() that never settles) is still bounded by the
+         *  idle deadline / close() abort. Without this the /snapshot idle bound had no effect while
+         *  awaiting feedHeaders(): fetchImpl is never reached, so the abort had nothing to cancel. */
+        const abortable = <T>(p: Promise<T>): Promise<T> =>
+          new Promise<T>((resolve, reject) => {
+            if (abort.signal.aborted) return reject(abortError());
+            const onAbort = (): void => reject(abortError());
+            abort.signal.addEventListener("abort", onAbort, { once: true });
+            p.then(
+              (v) => {
+                abort.signal.removeEventListener("abort", onAbort);
+                resolve(v);
+              },
+              (e) => {
+                abort.signal.removeEventListener("abort", onAbort);
+                reject(e);
+              },
+            );
+          });
+
         try {
           const url = `${this.baseUrl}/snapshot?account=${encodeURIComponent(this.opts.account)}`;
-          armIdle(); // bounds the headers phase
-          const res = await this.fetchImpl(url, { headers: await this.feedHeaders(), signal: abort.signal });
+          armIdle(); // bounds the headers phase, INCLUDING a bearer getToken() resolution (CTC-2111)
+          const headers = await abortable(this.feedHeaders());
+          armIdle(); // token in hand — progress
+          const res = await this.fetchImpl(url, { headers, signal: abort.signal });
           armIdle(); // headers arrived — progress
           if (!res.ok) {
             // CTC-2111 — for a BEARER auth, an authorization failure is a TYPED AuthError the consumer

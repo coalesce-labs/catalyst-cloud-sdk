@@ -542,6 +542,11 @@ export class LiveSyncClient {
   /** CTC-2111 — parked in `"auth-required"` after a 4401 / a getToken rejection / a 401-403 seed. Only
    *  `resume()` (or a fresh `start()`) leaves this state; a normal reconnect never sets it. */
   private authRequired = false;
+  /** CTC-2111 — an auth failure (401/403) interrupted a RESYNC before its /snapshot could rebuild the
+   *  store. The cursor is then stale, so `resume()` must RE-SEED (not just re-open, which would return
+   *  to `live` with the very inconsistency the resync existed to fix). Distinct from the cursorless
+   *  initial-seed case, which `getCursor()` already detects. */
+  private resyncNeededAfterAuth = false;
   /** CTC-2111 — a monotonically-increasing connect-attempt id. A bearer connect resolves getToken()
    *  asynchronously; this stamps each attempt so a late/stale resolution (superseded by a newer
    *  attempt, a stop(), or a start()) is dropped rather than opening an orphan socket. */
@@ -667,6 +672,7 @@ export class LiveSyncClient {
     this.stopped = false;
     this.started = true;
     this.authRequired = false; // a fresh run is never still parked from a previous one (CTC-2111)
+    this.resyncNeededAfterAuth = false;
     // RESET per boot. `start()` is restartable after `stop()`, and a stale `true` from a previous
     // cold boot would make the NEXT boot — warm, and therefore re-seeding nothing — absorb a resync
     // it should have honoured. Found while re-reading this path rather than reported; the same class
@@ -832,6 +838,14 @@ export class LiveSyncClient {
     }
     if (!this.authRequired) return; // a live/reconnecting run has nothing to resume
     this.authRequired = false;
+    if (this.resyncNeededAfterAuth) {
+      // A live resync was interrupted by an auth failure before it could rebuild the store (RwI): the
+      // cursor is stale, so re-open alone would return to `live` with the original inconsistency. Force
+      // the interrupted reseed again (handleResync re-seeds regardless of cursor, then re-opens).
+      this.resyncNeededAfterAuth = false;
+      void this.handleResync();
+      return;
+    }
     if (this.getCursor() == null) {
       // The cold seed never completed (the initial /snapshot was what failed): a fresh run re-seeds.
       // But a SYNCHRONOUS resume() from onAuthError fires while the failing boot is still mid-reject —
@@ -1142,6 +1156,10 @@ export class LiveSyncClient {
   private closeSocket(): void {
     // A deliberate teardown of an in-flight attempt (stop/resync): end the connect span neutrally.
     this.endConnectSpan();
+    // CTC-2111 — a deliberate teardown SUPERSEDES any pending bearer connect: bump the attempt id so a
+    // getToken() resolving after this (e.g. mid-resync) is dropped rather than opening a socket against
+    // the store being rebuilt — which the following openSocket() would then orphan by overwriting this.ws.
+    this.connectAttempt++;
     // The single choke point for liveness-timer teardown — covers stop/resync/forceReconnect. (The
     // server-close path clears them in onclose; both routes null this.ws, so no timer outlives a socket.)
     this.clearLivenessTimers();
@@ -1659,6 +1677,9 @@ export class LiveSyncClient {
     }
     if (this.stopped) return;
     if (authErr) {
+      // CTC-2111 — this resync's /snapshot failed auth BEFORE it could rebuild the store, so the cursor
+      // is now stale: resume() must re-seed, not just re-open (RwI). Latch that, then park.
+      this.resyncNeededAfterAuth = true;
       this.raiseAuthError(authErr); // NO reconnect — the token must be re-authorized (resume())
       return;
     }

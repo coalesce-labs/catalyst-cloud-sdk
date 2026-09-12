@@ -1522,3 +1522,31 @@ describe("CatalystReplica bearer cold-boot getToken recovery (CTC-2111 — Codex
     expect(replica.issues().map((v) => v.id)).toEqual(["i1"]);
   });
 });
+
+// ── CTC-2111 — Codex round-2 followup: a bearer getToken() that never settles during /snapshot must be
+//    bounded by the idle deadline, not hang until the (optional) total reseed backstop. ──────────────
+describe("CatalystReplica bearer snapshot getToken deadline (CTC-2111 — Codex r2 followup)", () => {
+  it("RwK — a never-settling getToken() during /snapshot is aborted by the idle deadline, not hung", async () => {
+    const { sockets, factory } = recordingFactory();
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "bearer", getToken: () => new Promise<string>(() => {}) }, // never settles
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: (async () =>
+          ({ ok: true, status: 200, text: async () => "" }) as unknown as Response) as unknown as typeof fetch,
+        wsFactory: factory,
+        snapshotIdleTimeoutMs: 50,
+        reseedTimeoutMs: 0, // the TOTAL backstop is disabled — only the idle bound can end this
+        log: () => {},
+      }),
+    );
+
+    // Without the fix the seed hangs awaiting getToken() (the idle abort has nothing to cancel) and
+    // this never settles; with it, the idle deadline aborts the seed and start() rejects promptly.
+    await expect(replica.start()).rejects.toBeTruthy();
+    expect(sockets).toHaveLength(0);
+  }, 3000);
+});

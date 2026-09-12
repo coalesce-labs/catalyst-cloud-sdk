@@ -3047,3 +3047,98 @@ describe("bearer auth round 3 (CTC-2111 — Codex r2 fixes)", () => {
     client.stop();
   });
 });
+
+// ── CTC-2111 — Codex round-2 followups: a resync must supersede a pending bearer connect, and a
+//    resync interrupted by auth must RE-SEED on resume (not reopen into stale data). ─────────────────
+describe("bearer resync interplay (CTC-2111 — Codex r2 followups)", () => {
+  it("RwF — entering a resync supersedes a pending bearer connect (a stale getToken opens nothing)", async () => {
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const tokenResolvers: ((v: string) => void)[] = [];
+    let releaseReseed!: () => void;
+    const reseedGate = new Promise<void>((r) => {
+      releaseReseed = r;
+    });
+    let reseeds = 0;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "bearer", getToken: () => new Promise<string>((r) => tokenResolvers.push(r)) },
+      reseed: async () => {
+        reseeds += 1;
+        await reseedGate;
+        store.setCursor(20);
+        return 20;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      openTimeoutMs: 0, // no token deadline — drive resolution by hand
+      backoffMs: 5,
+      maxBackoffMs: 5,
+      log: () => {},
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(tokenResolvers).toHaveLength(1)); // connect attempt 1: getToken pending
+
+    const rs = client.requestResync(); // resync begins while getToken#1 is still pending
+    await vi.waitFor(() => expect(reseeds).toBe(1)); // socket closed, reseed underway
+
+    tokenResolvers[0]!("stale"); // resolves DURING the reseed — must be dropped (superseded)
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sockets).toHaveLength(0); // the stale resolution opened NOTHING
+
+    releaseReseed();
+    await rs;
+    await vi.waitFor(() => expect(tokenResolvers).toHaveLength(2)); // the resync's own connect
+    tokenResolvers[1]!("fresh");
+    await vi.waitFor(() => expect(sockets).toHaveLength(1)); // exactly ONE socket
+    client.stop();
+  });
+
+  it("RwI — a resync interrupted by a 401 RE-SEEDS on resume, not a bare reconnect into stale data", async () => {
+    const store = makeStore(7); // warm → live
+    const { sockets, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
+    let seedCalls = 0;
+    let failNext = false;
+    let client!: LiveSyncClient;
+    client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "bearer", getToken: async () => "tok" },
+      reseed: async () => {
+        seedCalls += 1;
+        if (failNext) {
+          failNext = false;
+          throw new AuthError(403, "/snapshot 403"); // 401s BEFORE the cursor is rebuilt
+        }
+        store.setCursor(30);
+        return 30;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      onStatus: (s) => statuses.push(s),
+      backoffMs: 5,
+      maxBackoffMs: 5,
+      log: () => {},
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+
+    failNext = true;
+    sockets[0]!.deliver({ type: "resync" }); // a live resync whose /snapshot 401s mid-flight
+    await vi.waitFor(() => expect(statuses).toContain("auth-required")); // the park completed
+    expect(seedCalls).toBe(1);
+
+    // Cursor is stale (still 7). resume() must RE-SEED, not just re-open into the un-repaired store.
+    client.resume();
+    await vi.waitFor(() => expect(seedCalls).toBe(2)); // the interrupted seed is retried
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThanOrEqual(2));
+    client.stop();
+  });
+});
