@@ -543,10 +543,19 @@ export class LiveSyncClient {
    *  `resume()` (or a fresh `start()`) leaves this state; a normal reconnect never sets it. */
   private authRequired = false;
   /** CTC-2111 — an auth failure (401/403) interrupted a RESYNC before its /snapshot could rebuild the
-   *  store. The cursor is then stale, so `resume()` must RE-SEED (not just re-open, which would return
+   *  store. The cursor is then stale, so recovery must RE-SEED (not just re-open, which would return
    *  to `live` with the very inconsistency the resync existed to fix). Distinct from the cursorless
    *  initial-seed case, which `getCursor()` already detects. */
   private resyncNeededAfterAuth = false;
+  /**
+   * CTC-2111 — a `resume()` intent awaiting drain. `resume()` from a parked run only RECORDS this (it
+   * does not re-drive or clear `authRequired` synchronously), because a synchronous `resume()` from
+   * `onAuthError` fires while the failing op (a boot or a resync) is still in flight. The single
+   * `drainRecovery()` point fires it once that owning op SETTLES — so a resume during a boot, during a
+   * resync, or between them is always captured and re-driven from the CURRENT store state, with no
+   * per-path deferral to get wrong and no path that clears the latch without starting recovery.
+   */
+  private pendingRecovery = false;
   /**
    * CTC-2111 — THE single connect-generation guard. A bearer connect resolves getToken() asynchronously,
    * so a late/stale resolution must be dropped rather than open an orphan socket. One counter, ONE check
@@ -682,6 +691,7 @@ export class LiveSyncClient {
     this.started = true;
     this.authRequired = false; // a fresh run is never still parked from a previous one (CTC-2111)
     this.resyncNeededAfterAuth = false;
+    this.pendingRecovery = false;
     // RESET per boot. `start()` is restartable after `stop()`, and a stale `true` from a previous
     // cold boot would make the NEXT boot — warm, and therefore re-seeding nothing — absorb a resync
     // it should have honoured. Found while re-reading this path rather than reported; the same class
@@ -782,6 +792,9 @@ export class LiveSyncClient {
       })
       .then(() => {
         if (this.bootTask === boot) this.bootTask = null;
+        // CTC-2111 — the single recovery drain: a resume() that arrived while this boot was in flight
+        // is re-driven now that it (and its latch cleanup above) has settled.
+        this.drainRecovery();
       });
     // Settles when stop() resolves the deferred, OR rejects if the boot (cold seed) fails — a boot
     // SUCCESS deliberately keeps waiting on `done` (the "runs forever" contract). Promise.race
@@ -792,6 +805,7 @@ export class LiveSyncClient {
   /** Stop the client: close the socket, cancel any pending reconnect, resolve start(). Idempotent. */
   stop(): void {
     this.stopped = true;
+    this.pendingRecovery = false; // CTC-2111 — a stopped client has no run to recover
     // CTC-2111 — invalidate any in-flight bearer connect attempt IMMEDIATELY, so a getToken() resolving
     // after a stop()+start() (its telemetry await can outlast this) is dropped rather than connecting
     // under the new run. The new run bumps this again in openSocket(), but bumping here closes the
@@ -846,45 +860,48 @@ export class LiveSyncClient {
       return;
     }
     if (!this.authRequired) return; // a live/reconnecting run has nothing to resume
-    this.authRequired = false;
-    if (this.resyncNeededAfterAuth) {
-      // A live resync was interrupted by an auth failure before it could rebuild the store (RwI): the
-      // cursor is stale, so re-open alone would return to `live` with the original inconsistency. Force
-      // the interrupted reseed again (handleResync re-seeds regardless of cursor, then re-opens). DEFER
-      // past the failing resync: a SYNCHRONOUS resume() from onAuthError fires before runResync returns,
-      // so `activeResync` still references it — calling handleResync() now would merely AWAIT that dead
-      // run and start nothing, leaving the client parked forever (Codex r4).
-      this.resyncNeededAfterAuth = false;
-      this.resumeAfter(this.activeResync, () => void this.handleResync().catch(() => {}));
-      return;
-    }
-    if (this.getCursor() == null) {
-      // The cold seed never completed (the initial /snapshot was what failed): a fresh run re-seeds.
-      // DEFER past the failing boot for the same reason: a SYNCHRONOUS resume() from onAuthError fires
-      // while it is mid-reject — its `finally` (resyncing=false) and `.catch` (bootFailed=true) have NOT
-      // run yet — and starting the replacement now would let that teardown clobber the resumed run's
-      // SHARED latches (a later requestResync() then wrongly ignored as "startup failed").
-      this.resumeAfter(this.bootTask, () => void this.start().catch(() => {}));
-      return;
-    }
-    // Seeded already: re-open the socket REUSING the original run's deferred (never a second start()).
-    this.openSocket();
+    // Record the intent ONLY — do not clear `authRequired` and do not re-drive synchronously. A
+    // synchronous resume() from onAuthError fires while the failing op (a boot or a resync) is still in
+    // flight; `drainRecovery()` re-drives it from the CURRENT store state once that op settles. If
+    // nothing is in flight (a later, standalone resume() — e.g. the 4401 mid-run case), drain now.
+    this.pendingRecovery = true;
+    if (!this.hasInFlightRun()) this.drainRecovery();
+  }
+
+  /** CTC-2111 — is a boot or a resync currently the owner of the client's recovery state? While one is,
+   *  a `resume()` intent waits for it to settle (that owner's settle calls `drainRecovery`). */
+  private hasInFlightRun(): boolean {
+    return this.bootTask != null || this.activeResync != null;
   }
 
   /**
-   * CTC-2111 — run `restart` once any in-flight run (`pending`) settles, else now. THE single deferral
-   * used by both `resume()` re-run branches, because a synchronous `resume()` from `onAuthError` fires
-   * BEFORE the failing run (boot or resync) has returned — so its cleanup continuations (registered
-   * first) run ahead of `restart`, which therefore has the last word on the shared latches and never
-   * merely awaits the dead run. `stopped` is re-checked at fire time.
+   * CTC-2111 — THE single recovery drain. Called from `resume()` (when idle) and from the settle of
+   * every in-flight owner (the boot chain, `handleResync`'s finally). It re-drives a recorded
+   * `resume()` intent exactly once, from the CURRENT store state, and clears `authRequired` only when
+   * recovery actually starts — so no path clears the latch without starting recovery, and a resume()
+   * during a boot, during a resync, or between them is always captured and correctly re-driven.
    */
-  private resumeAfter(pending: Promise<unknown> | null, restart: () => void): void {
-    if (pending) {
-      void pending.catch(() => {}).then(() => {
-        if (!this.stopped) restart();
-      });
+  private drainRecovery(): void {
+    if (!this.pendingRecovery || this.stopped) return;
+    // Another owner may still hold the state (a boot settled but a resync is now in flight, or vice
+    // versa): let the still-running one drain when IT settles, so recovery never races a live op.
+    if (this.hasInFlightRun()) return;
+    this.pendingRecovery = false;
+    this.authRequired = false;
+    if (this.resyncNeededAfterAuth) {
+      // A resync was interrupted by auth before it rebuilt the store: the cursor is stale, so re-open
+      // alone would return to `live` with the original inconsistency. Re-seed (handleResync re-seeds
+      // regardless of cursor, then re-opens).
+      this.resyncNeededAfterAuth = false;
+      void this.handleResync().catch(() => {});
+    } else if (this.getCursor() == null) {
+      // The cold seed never completed (the initial /snapshot failed): a fresh run re-seeds. Its old
+      // promise already rejected, so a new deferred strands nothing.
+      void this.start().catch(() => {});
     } else {
-      restart();
+      // Seeded already (the 4401 mid-run case): re-open, REUSING the original run's deferred (never a
+      // second start(), which would overwrite resolveDone and strand the first promise).
+      this.openSocket();
     }
   }
 
@@ -1651,6 +1668,9 @@ export class LiveSyncClient {
       await run;
     } finally {
       if (this.activeResync === run) this.activeResync = null;
+      // CTC-2111 — the single recovery drain: a resume() that arrived while this resync was in flight
+      // (a synchronous resume() from onAuthError, before runResync returned) is re-driven now.
+      this.drainRecovery();
     }
   }
 

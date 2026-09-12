@@ -3149,8 +3149,10 @@ describe("bearer sync-resume during resync (CTC-2111 — Codex r4)", () => {
   it("a resume() called synchronously from onAuthError during a resync re-seeds (not parked forever)", async () => {
     const store = makeStore(7); // warm → live
     const { sockets, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
     let seedCalls = 0;
     let failNext = false;
+    let resumeCalls = 0;
     let client!: LiveSyncClient;
     client = new LiveSyncClient({
       baseUrl: BASE,
@@ -3168,7 +3170,11 @@ describe("bearer sync-resume during resync (CTC-2111 — Codex r4)", () => {
       getCursor: store.getCursor,
       onChange: store.onChange,
       wsFactory: factory,
-      onAuthError: () => client.resume(), // SYNCHRONOUS resume, while activeResync still set
+      onStatus: (s) => statuses.push(s),
+      onAuthError: () => {
+        resumeCalls += 1;
+        client.resume(); // SYNCHRONOUS resume, while activeResync still references the failing run
+      },
       backoffMs: 5,
       maxBackoffMs: 5,
       log: () => {},
@@ -3181,9 +3187,14 @@ describe("bearer sync-resume during resync (CTC-2111 — Codex r4)", () => {
     failNext = true;
     sockets[0]!.deliver({ type: "resync" }); // resync /snapshot 401s → onAuthError → sync resume()
 
-    // The interrupted seed must be RETRIED once the failing resync settles, not left parked forever.
+    // The interrupted seed must be RETRIED once the failing resync settles, not left parked forever —
+    // and with NO second resume() (the single recorded intent is drained automatically).
     await vi.waitFor(() => expect(seedCalls).toBe(2));
     await vi.waitFor(() => expect(sockets.length).toBeGreaterThanOrEqual(2));
+    sockets[sockets.length - 1]!.fireOpen();
+    // It reaches 'live', it does not sit parked in 'auth-required', and only the one sync resume ran.
+    await vi.waitFor(() => expect(statuses[statuses.length - 1]).toBe("live"));
+    expect(resumeCalls).toBe(1);
     client.stop();
   });
 });
