@@ -49,6 +49,7 @@ import {
 } from "@catalyst-cloud/read-model";
 
 import {
+  AuthError,
   LiveSyncClient,
   stripTrailingSlashes,
   type AuthStrategy,
@@ -223,7 +224,8 @@ export interface CatalystReplicaOptions {
    */
   accountSource?: AccountSource;
   /** How to authorize: {kind:'token',token} (host bearer rides /connect as ?token= and /snapshot as
-   *  Authorization) | {kind:'cookie'} (same-origin session cookie). */
+   *  Authorization) | {kind:'cookie'} (same-origin session cookie) | {kind:'bearer',getToken} (a
+   *  person's rotating OAuth access token, resolved fresh per /connect and per /snapshot, CTC-2111). */
   auth: AuthStrategy;
   /** File path or ':memory:'. */
   dbPath: string;
@@ -237,6 +239,10 @@ export interface CatalystReplicaOptions {
   onChange?: () => void;
   /** Connection lifecycle, for UI/logging. */
   onStatus?: (status: LiveSyncStatus) => void;
+  /** CTC-2111 — a typed authorization failure from a `{kind:'bearer'}` replica: a 4401 socket close
+   *  (revocation/inactivity) or a 401/403 initial /snapshot. Paired with the `"auth-required"` status,
+   *  which is where the reconnect loop STOPS; re-authorize the person and call `start()` again. */
+  onAuthError?: (err: AuthError) => void;
   /** Base reconnect backoff in ms. Default 1000. */
   backoffMs?: number;
   /** Reconnect backoff ceiling in ms. Default 30_000. */
@@ -695,6 +701,7 @@ export class CatalystReplica {
       connectParams: () => this.workflowRevParams(),
       onChange: (frame) => this.applyFrame(frame),
       onStatus: (status) => this.handleStatus(status),
+      onAuthError: (err) => this.handleAuthError(err),
       backoffMs: this.opts.backoffMs,
       maxBackoffMs: this.opts.maxBackoffMs,
       pingIntervalMs: this.opts.pingIntervalMs,
@@ -935,6 +942,16 @@ export class CatalystReplica {
       this.opts.onStatus?.(status);
     } catch (err) {
       this.log("warn", "onStatus handler threw", err);
+    }
+  }
+
+  /** CTC-2111 — forward a typed authorization failure from the transport (bearer 4401 close) or the
+   *  seed (401/403 /snapshot) to the consumer's onAuthError. Guarded like onStatus. */
+  private handleAuthError(err: AuthError): void {
+    try {
+      this.opts.onAuthError?.(err);
+    } catch (e) {
+      this.log("warn", "onAuthError handler threw", e);
     }
   }
 
@@ -1211,9 +1228,17 @@ export class CatalystReplica {
         try {
           const url = `${this.baseUrl}/snapshot?account=${encodeURIComponent(this.opts.account)}`;
           armIdle(); // bounds the headers phase
-          const res = await this.fetchImpl(url, { headers: this.feedHeaders(), signal: abort.signal });
+          const res = await this.fetchImpl(url, { headers: await this.feedHeaders(), signal: abort.signal });
           armIdle(); // headers arrived — progress
-          if (!res.ok) throw new Error(`/snapshot ${res.status}`);
+          if (!res.ok) {
+            // CTC-2111 — an authorization failure is a TYPED AuthError a consumer can act on
+            // (re-authenticate), not the opaque Error("/snapshot 401") it used to be (retry). Every
+            // other status stays a plain Error — the transport retries those through backoff.
+            if (res.status === 401 || res.status === 403) {
+              throw new AuthError(res.status, `/snapshot ${res.status}`);
+            }
+            throw new Error(`/snapshot ${res.status}`);
+          }
 
           // CTC-137: the /snapshot response is the SINGLE HTTP Response the SDK reads, so it is the one
           // place to learn the mirror's head_seq (+ server clock). Stashed for the lag_seq gauge, which
@@ -1335,9 +1360,13 @@ export class CatalystReplica {
     }
   }
 
-  private feedHeaders(): Record<string, string> {
+  /** The /snapshot request headers. Async because a bearer auth resolves a FRESH token per fetch
+   *  (CTC-2111) — a rotating access token must never be captured once, exactly as the /connect URL
+   *  re-resolves it per (re)connect. token/cookie are unchanged. */
+  private async feedHeaders(): Promise<Record<string, string>> {
     const h: Record<string, string> = { accept: "application/x-ndjson" };
     if (this.opts.auth.kind === "token") h["authorization"] = `Bearer ${this.opts.auth.token}`;
+    else if (this.opts.auth.kind === "bearer") h["authorization"] = `Bearer ${await this.opts.auth.getToken()}`;
     return h;
   }
 }

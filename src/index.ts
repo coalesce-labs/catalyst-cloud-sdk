@@ -8,6 +8,8 @@
 
 export {
   LiveSyncClient,
+  AuthError,
+  CLOSE_REAUTHENTICATE,
   buildConnectUrl,
   parseFrame,
   toWsOrigin,

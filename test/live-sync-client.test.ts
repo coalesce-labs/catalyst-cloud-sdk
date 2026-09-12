@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   LiveSyncClient,
+  AuthError,
   buildConnectUrl,
   parseFrame,
   toWsOrigin,
@@ -55,8 +56,8 @@ class FakeWebSocket implements WebSocketLike {
   deliverRaw(data: unknown): void {
     this.onmessage?.({ data });
   }
-  fireServerClose(): void {
-    this.onclose?.({});
+  fireServerClose(code?: number, reason?: string): void {
+    this.onclose?.(code === undefined ? {} : { code, reason });
   }
   /** The last frame this socket sent, parsed. */
   lastSent(): unknown {
@@ -279,7 +280,19 @@ describe("accountId is required only for token auth (CTC-114 review, KtB)", () =
           ...base,
           auth: { kind: "token", token: "svc-tok" },
         }),
-    ).toThrow(/accountId is required with token auth/);
+    ).toThrow(/accountId is required with token or bearer auth/);
+  });
+
+  it("throws at CONSTRUCTION for bearer auth without an account (CTC-2111 — same host constraint)", () => {
+    // A bearer client is a host too (the OAuth CLI): no session cookie to fall back to, so an omitted
+    // account is the same misconfiguration as it is for token auth.
+    expect(
+      () =>
+        new LiveSyncClient({
+          ...base,
+          auth: { kind: "bearer", getToken: async () => "tok" },
+        }),
+    ).toThrow(/accountId is required with token or bearer auth/);
   });
 
   it("constructs fine for cookie auth without an account", () => {
@@ -2619,5 +2632,139 @@ describe("re-entrant teardown from a status callback (CTC-114 review round 13)",
     await new Promise((r) => setTimeout(r, 10));
     // THE OUTCOME: no orphaned socket exists for the completed teardown to have missed.
     expect(sockets).toHaveLength(0);
+  });
+});
+
+// ── CTC-2111 — the OAuth bearer strategy: a rotating short-lived access token, and a 4401 that means
+//    re-authenticate (not an endless reconnect). ────────────────────────────────────────────────────
+describe("bearer auth strategy (CTC-2111)", () => {
+  it("awaits getToken() FRESH before every connect AND every reconnect, riding ?token=", async () => {
+    // The whole point of the callback: a 15-minute access token rotates underneath a running client,
+    // so the value must be re-resolved on each (re)connect rather than captured once at construction.
+    const store = makeStore(7); // warm cursor → straight to the socket, no cold seed
+    const { sockets, urls, factory } = recordingFactory();
+    const tokens = ["tok-A", "tok-B", "tok-C"];
+    let calls = 0;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "bearer", getToken: async () => tokens[calls++] ?? "tok-last" },
+      reseed: store.reseedTo(12),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      backoffMs: 5,
+      maxBackoffMs: 5,
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    expect(calls).toBe(1);
+    expect(new URL(urls[0]!).searchParams.get("token")).toBe("tok-A");
+
+    sockets[0]!.fireOpen();
+    sockets[0]!.fireServerClose(); // an ORDINARY close → backoff reconnect
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+    expect(calls).toBe(2); // getToken() called AGAIN — a fresh, rotated token
+    expect(new URL(urls[1]!).searchParams.get("token")).toBe("tok-B");
+    client.stop();
+  });
+
+  it("a 4401 close → status 'auth-required', a typed AuthError to onAuthError, and NO reconnect", async () => {
+    // The bug this fixes: a bearer socket the mirror closed 4401 (access token aged out, or revoked)
+    // used to be indistinguishable from a network drop and reconnected forever. It must stop instead.
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
+    const authErrors: AuthError[] = [];
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "bearer", getToken: async () => "tok" },
+      reseed: store.reseedTo(12),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      onStatus: (s) => statuses.push(s),
+      onAuthError: (e) => authErrors.push(e),
+      backoffMs: 5,
+      maxBackoffMs: 5,
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+    sockets[0]!.fireServerClose(4401, "reauthenticate");
+
+    expect(statuses[statuses.length - 1]).toBe("auth-required");
+    expect(authErrors).toHaveLength(1);
+    expect(authErrors[0]).toBeInstanceOf(AuthError);
+    expect(authErrors[0]!.code).toBe(4401);
+    expect(authErrors[0]!.reason).toBe("reauthenticate");
+
+    // Give the backoff window every chance to (wrongly) fire a reconnect.
+    await new Promise((r) => setTimeout(r, 40));
+    expect(sockets).toHaveLength(1); // the reconnect loop STOPPED — no second socket
+    client.stop();
+  });
+
+  it("regression pin: a {kind:'token'} client reconnects on a 4401 close exactly as today", async () => {
+    // No behaviour change without the new strategy. The API-key path is byte-identical: the token
+    // rides ?token= synchronously, and a 4401 is just another close it reconnects through.
+    const store = makeStore(7);
+    const { sockets, urls, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "token", token: "svc-tok" },
+      reseed: store.reseedTo(12),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      onStatus: (s) => statuses.push(s),
+      backoffMs: 5,
+      maxBackoffMs: 5,
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    expect(new URL(urls[0]!).searchParams.get("token")).toBe("svc-tok");
+    sockets[0]!.fireOpen();
+    sockets[0]!.fireServerClose(4401, "reauthenticate");
+
+    await vi.waitFor(() => expect(sockets).toHaveLength(2)); // reconnected, exactly as today
+    expect(statuses).not.toContain("auth-required");
+    client.stop();
+  });
+
+  it("a reseed that rejects with AuthError (a 401/403 initial /snapshot) → 'auth-required' + onAuthError, no socket", async () => {
+    // The initial-connect authorization failure: the cold seed's /snapshot fetch is rejected 401/403,
+    // and CatalystReplica raises a typed AuthError. It surfaces as auth-required, not an endless retry.
+    const store = makeStore(null); // cursorless → start() takes the cold-seed path
+    const { sockets, factory } = recordingFactory();
+    const statuses: LiveSyncStatus[] = [];
+    const authErrors: AuthError[] = [];
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "bearer", getToken: async () => "tok" },
+      reseed: async () => {
+        throw new AuthError(403, "/snapshot 403");
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      onStatus: (s) => statuses.push(s),
+      onAuthError: (e) => authErrors.push(e),
+      log: () => {},
+    });
+
+    await expect(client.start()).rejects.toBeInstanceOf(AuthError);
+    expect(statuses).toContain("auth-required");
+    expect(authErrors).toHaveLength(1);
+    expect(authErrors[0]!.code).toBe(403);
+    expect(sockets).toHaveLength(0); // an unseeded store never went live
+    client.stop();
   });
 });

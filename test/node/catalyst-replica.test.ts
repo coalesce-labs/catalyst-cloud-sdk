@@ -7,6 +7,7 @@ import {
 import { applyDelta, setCursor, type ReplicaWriteDb } from "@catalyst-cloud/replicate";
 import {
   CatalystReplica,
+  AuthError,
   nodeSqliteEngine,
   type ReplicaEngine,
   type EngineFactory,
@@ -1366,5 +1367,64 @@ describe("CatalystReplica bounded teardown + seed abort (CTC-281)", () => {
     const view = replica.issues();
     expect(view).toHaveLength(1);
     expect(view[0]!.title).toBe("replayed");
+  });
+});
+
+// ── CTC-2111 — the OAuth bearer strategy on the managed replica: a rotating access token rides the
+//    /snapshot fetch fresh, and a 401/403 becomes a typed AuthError (never Error("/snapshot 401")). ──
+describe("CatalystReplica bearer auth (CTC-2111)", () => {
+  it("rides a FRESH bearer token as Authorization on the /snapshot fetch (getToken awaited per fetch)", async () => {
+    const { sockets, factory } = recordingFactory();
+    const seed = bufferedSnapshotFetch(
+      [{ entity: "issues", row: { id: "i1", identifier: "CTC-1", title: "Seed", updated_at: 1 } }],
+      5,
+    );
+    let calls = 0;
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "bearer", getToken: async () => `oauth-${++calls}` },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: seed.fetchImpl,
+        wsFactory: factory,
+      }),
+    );
+
+    await startToLive(replica, sockets);
+
+    expect(seed.calls.count).toBe(1);
+    // The /snapshot fetch awaited getToken() and rode its FRESH result as the Authorization header —
+    // the seed is the first token consumer, so it carries oauth-1. (The /connect URL then resolves its
+    // own fresh token, so `calls` ends > 1 — a rotating token is never captured once.)
+    expect(seed.headersSeen[0]?.["authorization"]).toBe("Bearer oauth-1");
+    expect(calls).toBeGreaterThanOrEqual(1);
+  });
+
+  it("a 401/403 /snapshot rejects the seed with a typed AuthError, not Error('/snapshot 403')", async () => {
+    const { sockets, factory } = recordingFactory();
+    const fetchImpl = (async () =>
+      ({ ok: false, status: 403, text: async () => "" }) as unknown as Response) as unknown as typeof fetch;
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "bearer", getToken: async () => "oauth" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl,
+        wsFactory: factory,
+        log: () => {},
+      }),
+    );
+
+    const err = await replica.start().then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(AuthError);
+    expect((err as AuthError).code).toBe(403);
+    expect(sockets).toHaveLength(0); // never opened a socket on an unseeded store
   });
 });

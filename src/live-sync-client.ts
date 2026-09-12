@@ -120,8 +120,39 @@ export type WebSocketFactory = (url: string) => WebSocketLike;
  *    trusted backend — never the browser.
  *  • `cookie` — append NOTHING to the URL. The browser's same-origin session cookie rides the
  *    WebSocket upgrade automatically. This makes it impossible to leak a token from the browser path.
+ *  • `bearer` — a person's OAuth access token, resolved by `getToken()` and awaited FRESH on every
+ *    (re)connect and every /snapshot fetch (CTC-2111). The token is short-lived (a WorkOS user access
+ *    token, ~15 min) and rotates underneath a running client, so unlike `token` it is NEVER captured
+ *    once. Its resolved value rides `?token=` exactly as the `token` strategy's value does. Pair it
+ *    with `onAuthError` + the `"auth-required"` status: a mirror close code 4401 means re-authenticate
+ *    (revocation / inactivity), and the client STOPS reconnecting rather than hammering a dead token.
  */
-export type AuthStrategy = { kind: "token"; token: string } | { kind: "cookie" };
+export type AuthStrategy =
+  | { kind: "token"; token: string }
+  | { kind: "cookie" }
+  | { kind: "bearer"; getToken: () => Promise<string> };
+
+/**
+ * A typed authorization failure surfaced through `onAuthError` (CTC-2111). `code` distinguishes the
+ * two wire origins: `4401` is the mirror's WebSocket close code for an accept-time token that aged out
+ * ("reauthenticate"); `401`/`403` are the HTTP status of a rejected `/snapshot` fetch. It replaces the
+ * opaque `Error("/snapshot 401")` a consumer could not act on — an AuthError says re-authenticate,
+ * a plain Error says retry.
+ */
+export class AuthError extends Error {
+  readonly code: 4401 | 401 | 403;
+  readonly reason?: string;
+  constructor(code: 4401 | 401 | 403, reason?: string) {
+    super(reason ? `auth error ${code}: ${reason}` : `auth error ${code}`);
+    this.name = "AuthError";
+    this.code = code;
+    this.reason = reason;
+  }
+}
+
+/** The mirror's WebSocket close code for an accept-time authorization that aged out (CTC-2111): the
+ *  socket must be re-opened with a fresh token, not blindly reconnected. */
+export const CLOSE_REAUTHENTICATE = 4401;
 
 /** Connection lifecycle, surfaced via `onStatus` so a consumer can drive UI. */
 export type LiveSyncStatus =
@@ -130,7 +161,10 @@ export type LiveSyncStatus =
   | "reconnecting"
   | "resyncing"
   | "error"
-  | "stopped";
+  | "stopped"
+  // CTC-2111: a bearer socket the mirror closed 4401, or a 401/403 /snapshot on the initial connect —
+  // the token must be re-authorized before the client reconnects. The reconnect loop is STOPPED here.
+  | "auth-required";
 
 /** Structured log levels. */
 export type LogLevel = "info" | "warn" | "error";
@@ -222,6 +256,13 @@ export interface LiveSyncClientOptions {
   onFrame?: (frame: ServerFrame) => void;
   /** Optional: connection lifecycle, for UI ("live"/"reconnecting"/…). */
   onStatus?: (status: LiveSyncStatus) => void;
+  /**
+   * Optional (CTC-2111): a typed authorization failure. Fires when a bearer socket is closed 4401
+   * (`AuthError{code:4401, reason}`) or the initial /snapshot is rejected 401/403 — paired with the
+   * `"auth-required"` status, which is when the reconnect loop STOPS. A consumer re-authorizes the
+   * person (its `getToken` will resolve a fresh token) and then calls `start()` again to resume.
+   */
+  onAuthError?: (err: AuthError) => void;
   /** Base reconnect backoff in ms; doubles each failed attempt up to maxBackoffMs. Default 1000. */
   backoffMs?: number;
   /** Reconnect backoff ceiling in ms. Default 30_000. */
@@ -331,6 +372,20 @@ export function toWsOrigin(baseUrl: string): string {
  * is ever appended (the type system + this single construction point make a browser token leak
  * impossible). Token is ordered FIRST so a truncated log line still reveals the account.
  */
+/** The WebSocket close event's numeric `code`, if the impl provides one (CTC-2111). The onclose event
+ *  is typed `unknown` (the structural WebSocketLike carries no CloseEvent shape); a real close event
+ *  and the FakeWebSocket both expose `.code`. Returns undefined for a code-less `{}` close. */
+function closeCode(ev: unknown): number | undefined {
+  const code = (ev as { code?: unknown } | null | undefined)?.code;
+  return typeof code === "number" ? code : undefined;
+}
+
+/** The WebSocket close event's `reason`, normalized: a non-empty string, else undefined (CTC-2111). */
+function closeReason(ev: unknown): string | undefined {
+  const reason = (ev as { reason?: unknown } | null | undefined)?.reason;
+  return typeof reason === "string" && reason !== "" ? reason : undefined;
+}
+
 /** Strip trailing "/" without a backtracking regex (ReDoS-safe vs `/\/+$/`, CodeQL js/polynomial-redos). */
 export function stripTrailingSlashes(s: string): string {
   let end = s.length;
@@ -344,6 +399,14 @@ export function buildConnectUrl(opts: {
   accountId?: string;
   auth: AuthStrategy;
   /**
+   * CTC-2111 — the resolved bearer token for a `{kind:"bearer"}` auth. The URL is built
+   * synchronously, so the caller awaits `getToken()` first and injects the value here; it then rides
+   * `?token=` exactly as the `token` strategy's own value does. Ignored for `token`/`cookie` (their
+   * behaviour is byte-identical to before this parameter existed). Omitted for a bearer diagnostic
+   * `connectUrl()` call, which cannot resolve a token synchronously.
+   */
+  bearerToken?: string;
+  /**
    * CTC-628 — extra params the consumer wants on THIS connect, resolved at CALL time. A plain object
    * would be read once at construction and then be a lie on every reconnect: the values these carry
    * (the replica's `max(workflow_rev)`) change while the client is running, and a reconnect is
@@ -354,6 +417,9 @@ export function buildConnectUrl(opts: {
   const origin = toWsOrigin(stripTrailingSlashes(opts.baseUrl));
   const params = new URLSearchParams();
   if (opts.auth.kind === "token") params.set("token", opts.auth.token);
+  // CTC-2111 — a bearer's resolved token rides `?token=` identically to the `token` strategy. Only
+  // when a value was actually resolved: a diagnostic `connectUrl()` cannot resolve one synchronously.
+  else if (opts.auth.kind === "bearer" && opts.bearerToken != null) params.set("token", opts.bearerToken);
   // Only when a tenant was actually named. `?account=` is NOT the same as no account: the server's
   // consumers are truthiness checks, so empty takes the omitted path anyway — but it would freeze a
   // contract in which "" is a legal mirror name, and it puts `catalyst.tenant=""` on every span.
@@ -413,6 +479,7 @@ export class LiveSyncClient {
   private readonly onChange: (frame: ChangeFrame) => void;
   private readonly onFrame?: (frame: ServerFrame) => void;
   private readonly onStatus?: (status: LiveSyncStatus) => void;
+  private readonly onAuthError?: (err: AuthError) => void;
   private readonly backoffMs: number;
   private readonly maxBackoffMs: number;
   private readonly pingIntervalMs: number;
@@ -531,9 +598,9 @@ export class LiveSyncClient {
     // account is a misconfiguration, not a default. It is checked in the constructor rather than in
     // buildConnectUrl because `connectUrl()` is called from `openSocket()` OUTSIDE its try/catch — a
     // throw down there escapes the reconnect machinery entirely instead of surfacing to the caller.
-    if (opts.auth.kind === "token" && !opts.accountId) {
+    if ((opts.auth.kind === "token" || opts.auth.kind === "bearer") && !opts.accountId) {
       throw new Error(
-        "LiveSyncClient: accountId is required with token auth (only cookie auth can fall back to the session's own tenant)",
+        "LiveSyncClient: accountId is required with token or bearer auth (only cookie auth can fall back to the session's own tenant)",
       );
     }
     this.baseUrl = stripTrailingSlashes(opts.baseUrl);
@@ -546,6 +613,7 @@ export class LiveSyncClient {
     this.onChange = opts.onChange;
     this.onFrame = opts.onFrame;
     this.onStatus = opts.onStatus;
+    this.onAuthError = opts.onAuthError;
     this.backoffMs = opts.backoffMs ?? 1000;
     this.maxBackoffMs = opts.maxBackoffMs ?? 30_000;
     this.pingIntervalMs = opts.pingIntervalMs ?? 90_000;
@@ -639,7 +707,15 @@ export class LiveSyncClient {
           this.setStatus("resyncing");
           // Bounded like the resync-path reseed (CTC-281): a hanging COLD seed surfaces as a start()
           // rejection (the boot arm rejects) instead of a silent forever-"resyncing" start().
-          await this.boundedReseed();
+          try {
+            await this.boundedReseed();
+          } catch (err) {
+            // CTC-2111 — the initial /snapshot was rejected 401/403: CatalystReplica raises a typed
+            // AuthError. Surface it as "auth-required" + onAuthError (not an endless retry), then
+            // still reject the boot — an unseeded store cannot go live, and no socket is opened.
+            if (err instanceof AuthError) this.raiseAuthError(err);
+            throw err;
+          }
           // Only NOW may a request that waited on this boot be absorbed — this really was a full
           // re-seed from /snapshot. A warm boot sets nothing, so the waiter is honoured instead.
           this.bootColdSeeded = true;
@@ -697,13 +773,22 @@ export class LiveSyncClient {
 
   /** The ws(s):// URL this client opens, for diagnostics/tests. Re-derived from the options — and,
    *  since CTC-628, re-RESOLVED: `connectParams` is invoked here, so every reconnect reports the
-   *  consumer's CURRENT state rather than the state it had when the client was constructed. */
+   *  consumer's CURRENT state rather than the state it had when the client was constructed.
+   *  For a bearer auth this omits `?token=` — the token is resolved asynchronously at connect time
+   *  (see `connectUrlWith`), which a synchronous diagnostic accessor cannot do. */
   connectUrl(): string {
+    return this.connectUrlWith(undefined);
+  }
+
+  /** The connect URL with a resolved bearer token injected (CTC-2111). Kept private and separate from
+   *  the public sync `connectUrl()` so the token/cookie path stays byte-identical and same-tick. */
+  private connectUrlWith(bearerToken: string | undefined): string {
     return buildConnectUrl({
       baseUrl: this.baseUrl,
       connectPath: this.connectPath,
       accountId: this.accountId,
       auth: this.auth,
+      bearerToken,
       extraParams: this.resolveConnectParams(),
     });
   }
@@ -750,6 +835,18 @@ export class LiveSyncClient {
     }
   }
 
+  /** CTC-2111 — go `"auth-required"` and hand the consumer a typed `AuthError`. The reconnect loop is
+   *  the CALLER's decision (it is NOT scheduled here): every caller of this stops it. The onAuthError
+   *  handler is guarded like onStatus — a throwing consumer callback never wedges the transport. */
+  private raiseAuthError(err: AuthError): void {
+    this.setStatus("auth-required");
+    try {
+      this.onAuthError?.(err);
+    } catch (e) {
+      this.log("warn", "onAuthError handler threw", e);
+    }
+  }
+
   private openSocket(): void {
     if (this.stopped) return;
     this.setStatus("connecting");
@@ -761,12 +858,46 @@ export class LiveSyncClient {
     // Every guarded entry point that calls out and then continues needs this; this is the one that
     // creates a resource afterwards.
     if (this.stopped) return;
+    // CTC-2111: a bearer strategy must resolve a FRESH token before it can build the connect URL, so
+    // its connect leg is async. token/cookie stay fully synchronous — no await between the "connecting"
+    // status and the socket construction — so the byte-identical URL and same-tick-socket both hold.
+    if (this.auth.kind === "bearer") {
+      void this.resolveBearerAndConnect(this.auth.getToken);
+      return;
+    }
+    this.connect(undefined);
+  }
+
+  /**
+   * CTC-2111 — resolve a fresh bearer token, then connect. A `getToken()` that REJECTS must not become
+   * a busy loop: the client stays in `"auth-required"` with no reconnect scheduled, until a later
+   * deliberate `start()` drives another connect. That is the honest outcome — a client that cannot
+   * prove who it is does not hammer the mirror.
+   */
+  private async resolveBearerAndConnect(getToken: () => Promise<string>): Promise<void> {
+    let token: string;
+    try {
+      token = await getToken();
+    } catch (err) {
+      this.log("warn", "bearer getToken() rejected; staying auth-required until re-authorized", err);
+      this.setStatus("auth-required");
+      return;
+    }
+    // A consumer may have torn down during the await — same discipline as the "connecting" re-check.
+    if (this.stopped) return;
+    this.connect(token);
+  }
+
+  /** Open a socket with the connect URL, given an already-resolved bearer token (undefined for
+   *  token/cookie). Everything from the connect span onward — byte-identical to the pre-CTC-2111
+   *  `openSocket` body, only the URL now carries a resolved bearer token when there is one. */
+  private connect(bearerToken: string | undefined): void {
     // One span per connect attempt: started here, ended OK in onopen, ERROR on construct-fail / a close
     // before open. Manual (not active) because the lifecycle spans onopen…onclose callbacks.
     this.connectSpan = this.telemetry.startSpan(REPLICA_SPAN.reconnect, {
       [CATALYST_ATTR.tenant]: this.tenantAttr,
     });
-    const wsUrl = this.connectUrl();
+    const wsUrl = this.connectUrlWith(bearerToken);
     let ws: WebSocketLike;
     try {
       ws = this.wsFactory(wsUrl);
@@ -818,9 +949,20 @@ export class LiveSyncClient {
       this.onInboundFrame();
       void this.handleFrame(ev.data);
     };
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       if (this.ws === ws) this.ws = null;
       this.clearLivenessTimers(); // this connection's ping/deadline die with its socket
+      // CTC-2111 — a BEARER socket closed 4401 is the mirror saying "reauthenticate": the access
+      // token was revoked or the session went inactive (a routine 15-minute expiry refreshes silently
+      // through getToken on the next connect, and never reaches here). This is NOT a transient drop,
+      // so the reconnect loop STOPS — the bug this fixes was reconnecting forever against a dead
+      // token. A {kind:"token"} client is UNCHANGED: it ignores the code and reconnects as it always
+      // has (regression pin). The next deliberate start() resolves a fresh token via getToken().
+      if (this.auth.kind === "bearer" && closeCode(ev) === CLOSE_REAUTHENTICATE && !this.stopped) {
+        this.endConnectSpan(new Error("socket closed 4401 (reauthenticate)"));
+        this.raiseAuthError(new AuthError(CLOSE_REAUTHENTICATE, closeReason(ev)));
+        return; // deliberately NO scheduleReconnect — see above
+      }
       if (!this.stopped && !this.resyncing) this.setStatus("reconnecting");
       // No-op if onopen already ended it (a normal disconnect of a healthy socket isn't a connect error).
       this.endConnectSpan(new Error("socket closed before open"));
