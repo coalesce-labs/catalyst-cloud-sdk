@@ -850,31 +850,42 @@ export class LiveSyncClient {
     if (this.resyncNeededAfterAuth) {
       // A live resync was interrupted by an auth failure before it could rebuild the store (RwI): the
       // cursor is stale, so re-open alone would return to `live` with the original inconsistency. Force
-      // the interrupted reseed again (handleResync re-seeds regardless of cursor, then re-opens).
+      // the interrupted reseed again (handleResync re-seeds regardless of cursor, then re-opens). DEFER
+      // past the failing resync: a SYNCHRONOUS resume() from onAuthError fires before runResync returns,
+      // so `activeResync` still references it — calling handleResync() now would merely AWAIT that dead
+      // run and start nothing, leaving the client parked forever (Codex r4).
       this.resyncNeededAfterAuth = false;
-      void this.handleResync();
+      this.resumeAfter(this.activeResync, () => void this.handleResync().catch(() => {}));
       return;
     }
     if (this.getCursor() == null) {
       // The cold seed never completed (the initial /snapshot was what failed): a fresh run re-seeds.
-      // But a SYNCHRONOUS resume() from onAuthError fires while the failing boot is still mid-reject —
-      // its `finally` (resyncing=false) and its `.catch` (bootFailed=true) have NOT run yet. Starting
-      // the replacement now would let that teardown clobber the resumed run's SHARED latches, and a
-      // later requestResync() would be wrongly ignored as "startup failed". So wait for the old boot to
-      // settle first: its cleanup continuations were registered before this one and run ahead of it, so
-      // the fresh start() below has the last word on bootFailed/resyncing. (Nothing pending → now.)
-      const pending = this.bootTask;
-      if (pending) {
-        void pending.catch(() => {}).then(() => {
-          if (!this.stopped) void this.start().catch(() => {});
-        });
-      } else {
-        void this.start().catch(() => {});
-      }
+      // DEFER past the failing boot for the same reason: a SYNCHRONOUS resume() from onAuthError fires
+      // while it is mid-reject — its `finally` (resyncing=false) and `.catch` (bootFailed=true) have NOT
+      // run yet — and starting the replacement now would let that teardown clobber the resumed run's
+      // SHARED latches (a later requestResync() then wrongly ignored as "startup failed").
+      this.resumeAfter(this.bootTask, () => void this.start().catch(() => {}));
       return;
     }
     // Seeded already: re-open the socket REUSING the original run's deferred (never a second start()).
     this.openSocket();
+  }
+
+  /**
+   * CTC-2111 — run `restart` once any in-flight run (`pending`) settles, else now. THE single deferral
+   * used by both `resume()` re-run branches, because a synchronous `resume()` from `onAuthError` fires
+   * BEFORE the failing run (boot or resync) has returned — so its cleanup continuations (registered
+   * first) run ahead of `restart`, which therefore has the last word on the shared latches and never
+   * merely awaits the dead run. `stopped` is re-checked at fire time.
+   */
+  private resumeAfter(pending: Promise<unknown> | null, restart: () => void): void {
+    if (pending) {
+      void pending.catch(() => {}).then(() => {
+        if (!this.stopped) restart();
+      });
+    } else {
+      restart();
+    }
   }
 
   /** The ws(s):// URL this client opens, for diagnostics/tests. Re-derived from the options — and,

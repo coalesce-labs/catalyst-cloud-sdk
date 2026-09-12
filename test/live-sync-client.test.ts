@@ -3142,3 +3142,48 @@ describe("bearer resync interplay (CTC-2111 — Codex r2 followups)", () => {
     client.stop();
   });
 });
+
+// ── CTC-2111 — the sync-resume deferral must also cover the RESYNC path (Codex round-4): a resume()
+//    from onAuthError fires while activeResync still references the failing run. ─────────────────────
+describe("bearer sync-resume during resync (CTC-2111 — Codex r4)", () => {
+  it("a resume() called synchronously from onAuthError during a resync re-seeds (not parked forever)", async () => {
+    const store = makeStore(7); // warm → live
+    const { sockets, factory } = recordingFactory();
+    let seedCalls = 0;
+    let failNext = false;
+    let client!: LiveSyncClient;
+    client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "bearer", getToken: async () => "tok" },
+      reseed: async () => {
+        seedCalls += 1;
+        if (failNext) {
+          failNext = false;
+          throw new AuthError(403, "/snapshot 403");
+        }
+        store.setCursor(30);
+        return 30;
+      },
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      onAuthError: () => client.resume(), // SYNCHRONOUS resume, while activeResync still set
+      backoffMs: 5,
+      maxBackoffMs: 5,
+      log: () => {},
+    });
+
+    void client.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.fireOpen();
+
+    failNext = true;
+    sockets[0]!.deliver({ type: "resync" }); // resync /snapshot 401s → onAuthError → sync resume()
+
+    // The interrupted seed must be RETRIED once the failing resync settles, not left parked forever.
+    await vi.waitFor(() => expect(seedCalls).toBe(2));
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThanOrEqual(2));
+    client.stop();
+  });
+});
