@@ -375,11 +375,16 @@ describe("CatalystReplica auto-reseed on a column-adding migration (CTC-127)", (
     // its mirror image — the reseed fires.
     const engine: ReplicaEngine = await nodeSqliteEngine(":memory:");
     const migrationDb: MigrationDb = { exec: (s) => engine.exec(s), query: (s) => engine.all(s) };
+    // Truncated AT 0008, not filtered around it: a replica that predates 0008 predates every later
+    // migration too, and the 0040 DATA migration reads `issues.state_id` — the column 0008 adds.
+    const shapeIdx = MIRROR_MIGRATIONS.journal.entries.findIndex(
+      (e) => e.tag === "0008_optimal_rattler",
+    );
     const partialBundle = {
       ...MIRROR_MIGRATIONS,
       journal: {
         ...MIRROR_MIGRATIONS.journal,
-        entries: MIRROR_MIGRATIONS.journal.entries.filter((e) => e.tag !== "0008_optimal_rattler"),
+        entries: MIRROR_MIGRATIONS.journal.entries.slice(0, shapeIdx),
       },
     };
     applyMigrations(migrationDb, partialBundle); // DB now at 0007 (no state_id/team_key/team_name)
