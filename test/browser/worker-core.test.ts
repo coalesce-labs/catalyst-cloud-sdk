@@ -485,14 +485,16 @@ describe("worker-core — tenant fence on open (CTC-114 review)", () => {
 });
 
 describe("row-shape migration forces one re-seed — CTC-127's browser twin (CTC-114 review, KtI)", () => {
-  /** The bundle minus its last column-adding migration: a replica that predates the mirror's ALTER. */
+  /** The bundle truncated BEFORE its column-adding migration: a replica that predates the mirror's
+   *  ALTER. Truncated, not filtered — a replica that predates 0008 predates every later migration too,
+   *  and a later DATA migration (0040 re-stamps `issues.state` by `issues.state_id`) cannot run on a
+   *  DB that skipped the ALTER which added the column it reads. */
+  const shapeIdx = MIRROR_MIGRATIONS.journal.entries.findIndex((e) => e.tag === LAST_SHAPE_TAG);
   const partialBundle = {
     ...MIRROR_MIGRATIONS,
     journal: {
       ...MIRROR_MIGRATIONS.journal,
-      entries: MIRROR_MIGRATIONS.journal.entries.filter(
-        (e) => e.tag !== LAST_SHAPE_TAG,
-      ),
+      entries: MIRROR_MIGRATIONS.journal.entries.slice(0, shapeIdx),
     },
   };
 
