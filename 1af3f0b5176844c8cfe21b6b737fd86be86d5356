@@ -1,0 +1,1 @@
+Address automatic review P1: route skip frames through the browser delta queue and worker transaction so OPFS cursor-only progress preserves ordering.
