@@ -57,7 +57,7 @@ import {
   type LogLevel,
   type WebSocketFactory,
 } from "../live-sync-client.js";
-import type { ChangeFrame } from "../types.js";
+import type { ChangeFrame, SkipFrame } from "../types.js";
 import {
   autoDetectEngine,
   autoDetectReadonlyEngine,
@@ -702,6 +702,7 @@ export class CatalystReplica {
       getCursor: () => getCursor(this.writeDb as ReplicaWriteDb<unknown>),
       connectParams: () => this.workflowRevParams(),
       onChange: (frame) => this.applyFrame(frame),
+      onSkip: (frame) => this.applySkip(frame),
       onStatus: (status) => this.handleStatus(status),
       onAuthError: (err) => this.handleAuthError(err),
       backoffMs: this.opts.backoffMs,
@@ -1137,6 +1138,16 @@ export class CatalystReplica {
     } catch (err) {
       this.recordApplyResult("failed", frame, err);
     }
+  }
+
+  /** Persist a cohort-filtered replay sequence without applying an entity row. */
+  private applySkip(frame: SkipFrame): void {
+    const engine = this.engine;
+    const writeDb = this.writeDb;
+    if (!engine || !writeDb || frame.seq <= this.highWater) return;
+    engine.transaction(() => setCursor(writeDb, frame.seq, engine.toBindable));
+    this.highWater = frame.seq;
+    this.lastAppliedAtMs = Date.now();
   }
 
   /**

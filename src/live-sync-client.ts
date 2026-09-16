@@ -83,6 +83,7 @@ import type {
   PongFrame,
   ResyncFrame,
   ServerFrame,
+  SkipFrame,
   SyncFrame,
 } from "./types.js";
 import { PING_FRAME } from "./types.js";
@@ -269,6 +270,8 @@ export interface LiveSyncClientOptions {
    * OPFS. Errors thrown here are caught and logged (one bad frame won't wedge the stream).
    */
   onChange: (frame: ChangeFrame) => void;
+  /** Persist a cursor-only replay placeholder without applying an entity row. */
+  onSkip?: (frame: SkipFrame) => void;
   /** Optional: every parsed server frame (change OR resync), before the type-specific handling. */
   onFrame?: (frame: ServerFrame) => void;
   /** Optional: connection lifecycle, for UI ("live"/"reconnecting"/…). */
@@ -499,6 +502,7 @@ export class LiveSyncClient {
   private readonly reseed: (signal?: AbortSignal) => Promise<number>;
   private readonly getCursor: () => number | null | undefined;
   private readonly onChange: (frame: ChangeFrame) => void;
+  private readonly onSkip?: (frame: SkipFrame) => void;
   private readonly onFrame?: (frame: ServerFrame) => void;
   private readonly onStatus?: (status: LiveSyncStatus) => void;
   private readonly onAuthError?: (err: AuthError) => void;
@@ -671,6 +675,7 @@ export class LiveSyncClient {
     this.reseed = opts.reseed;
     this.getCursor = opts.getCursor;
     this.onChange = opts.onChange;
+    this.onSkip = opts.onSkip;
     this.onFrame = opts.onFrame;
     this.onStatus = opts.onStatus;
     this.onAuthError = opts.onAuthError;
@@ -1356,7 +1361,9 @@ export class LiveSyncClient {
       await this.handleResync();
       return;
     }
-    // A change frame: live pushes and `{type:"sync"}` replays arrive through this one path by design.
+    // Change and cursor-only skip frames share the same contiguity contract. A skip is produced only
+    // by replay for a row intentionally hidden from this socket cohort; it persists the real seq but
+    // never reaches entity application.
     this._lastChangeFrameAt = Date.now();
     // Gap check (CTL-1402): only with a real baseline (deliveredSeq > 0 — a fresh/cursorless store has
     // nothing to be contiguous WITH). A frame beyond deliveredSeq+1 means the frames in between were
@@ -1365,16 +1372,25 @@ export class LiveSyncClient {
       this.onGapFrame(frame);
       return;
     }
-    // Contiguous — or a duplicate/out-of-order oldie (seq <= deliveredSeq), which is passed through
-    // unchanged: the consumer's stale-guard already dedups it and its cursor never moves backward.
-    try {
-      this.onChange(frame);
-    } catch (err) {
-      this.log(
-        "error",
-        `onChange failed for ${frame.entity} seq=${frame.seq}`,
-        err,
-      );
+    if (frame.type === "skip") {
+      if (!this.onSkip) {
+        this.log("error", `skip frame has no persistence callback seq=${frame.seq}`);
+        return;
+      }
+      try {
+        this.onSkip(frame);
+      } catch (err) {
+        this.log("error", `onSkip failed for seq=${frame.seq}`, err);
+        return;
+      }
+    } else {
+      // Contiguous — or a duplicate/out-of-order oldie (seq <= deliveredSeq), which is passed through
+      // unchanged: the consumer's stale-guard already dedups it and its cursor never moves backward.
+      try {
+        this.onChange(frame);
+      } catch (err) {
+        this.log("error", `onChange failed for ${frame.entity} seq=${frame.seq}`, err);
+      }
     }
     if (frame.seq > this.deliveredSeq) {
       this.deliveredSeq = frame.seq;
@@ -1406,7 +1422,7 @@ export class LiveSyncClient {
    * re-request is in flight, further beyond-the-gap frames (in-flight live pushes the replay will
    * cover) are dropped the same way WITHOUT sending another sync — one request per gap episode.
    */
-  private onGapFrame(frame: ChangeFrame): void {
+  private onGapFrame(frame: Pick<ChangeFrame | SkipFrame, "seq">): void {
     if (this.gap) return; // a re-request is already in flight; the replay redelivers this frame too
     this.gap = {
       seqFrom: this.deliveredSeq + 1,
@@ -2024,5 +2040,7 @@ export function parseFrame(data: unknown): ServerFrame | null {
   if (type === "change") return parsed as ChangeFrame;
   if (type === "pong") return parsed as PongFrame;
   if (type === "head") return parsed as HeadFrame;
+  if (type === "skip" && Number.isSafeInteger((parsed as { seq?: unknown }).seq))
+    return parsed as SkipFrame;
   return null;
 }

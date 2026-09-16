@@ -887,6 +887,9 @@ export class BrowserReplica {
       onChange: (frame) => {
         this.enqueueDelta(frame);
       },
+      onSkip: (frame) => {
+        this.enqueueSkip(frame.seq);
+      },
       onStatus: (status) => {
         if (this.disposed) return;
         // SDK lifecycle → the replica's UI signal. "live" → live; "stopped" is our own teardown
@@ -939,6 +942,12 @@ export class BrowserReplica {
       entityId: frame.entityId,
     });
     if (kept && frame.seq > this.acceptedSeq) this.acceptedSeq = frame.seq;
+  }
+
+  /** Queue cursor-only replay progress behind preceding entity deltas in the same worker batch. */
+  private enqueueSkip(seq: number): void {
+    if (this.disposed) return;
+    if (this.deltas.push({ seq })) this.acceptedSeq = Math.max(this.acceptedSeq, seq);
   }
 
   /** Read the issues list view from the local replica (buildIssuesView over OPFS). */

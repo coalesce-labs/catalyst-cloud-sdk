@@ -184,6 +184,14 @@ export interface HeadFrame {
   seq: number;
 }
 
+/** Cursor-only replay placeholder for a change row intentionally hidden from this socket cohort. */
+export interface SkipFrame {
+  type: "skip";
+  accountId: AccountId;
+  /** A real feed sequence that advances the cursor without applying an entity row. */
+  seq: number;
+}
+
 /**
  * The liveness ping/pong wire literals (CTC-135). The client sends `PING_FRAME` after an idle
  * interval; the mirror answers `PONG_FRAME` via `setWebSocketAutoResponse`, which matches the request
@@ -206,4 +214,4 @@ export interface PongFrame {
 
 /** Any frame the service can push to a consumer over `/connect`. `pong` and `head` are
  *  transport-internal (consumed by the client, never surfaced to `onFrame`/`onChange`). */
-export type ServerFrame = ChangeFrame | ResyncFrame | PongFrame | HeadFrame;
+export type ServerFrame = ChangeFrame | ResyncFrame | PongFrame | HeadFrame | SkipFrame;

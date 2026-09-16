@@ -912,6 +912,31 @@ describe("CatalystReplica gap detection + self-healing (CTL-1402)", () => {
     expect(appliedSeqs).toEqual([6, 7, 8, 9, 10]);
   });
 
+  it("persists replay skips as cursor-only progress and then applies the next contiguous row", async () => {
+    const { sockets, factory } = recordingFactory();
+    const seed = bufferedSnapshotFetch([], 5);
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl: seed.fetchImpl,
+        wsFactory: factory,
+      }),
+    );
+    await startToLive(replica, sockets);
+
+    sockets[0]!.deliver({ type: "skip", accountId: "tenant-0", seq: 6 });
+    expect(replica.cursor).toBe(6);
+    expect(replica.issues()).toEqual([]);
+
+    sockets[0]!.deliver(issueFrame(7));
+    expect(replica.cursor).toBe(7);
+    expect(replica.issues().map((issue) => issue.id)).toEqual(["i7"]);
+  });
+
   it("exposes lastChangeFrameAt (feed-delivery liveness), distinct from lastFrameAt (any-bytes liveness)", async () => {
     const { sockets, factory } = recordingFactory();
     const seed = bufferedSnapshotFetch([], 0);

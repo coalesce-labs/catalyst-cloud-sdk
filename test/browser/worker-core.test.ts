@@ -121,16 +121,17 @@ describe("worker-core over real sqlite-wasm (CTC-114)", () => {
           row: issueRow("a", { updated_at: 1 }),
           entityId: "a",
         },
-        { seq: 13, entity: "issues", op: "delete", row: {}, entityId: "a" },
+        { seq: 13 },
+        { seq: 14, entity: "issues", op: "delete", row: {}, entityId: "a" },
       ],
     })) as { applied: number; cursor: number };
 
-    expect(result.cursor).toBe(13);
+    expect(result.cursor).toBe(14);
     expect(result.applied).toBe(2); // b upserted + a deleted; the stale upsert applied nothing
 
     const rows = (await core.handle({ type: "queryIssues" })) as IssueView[];
     expect(rows.map((r) => r.id)).toEqual(["b"]);
-    expect(await core.handle({ type: "getCursor" })).toBe(13);
+    expect(await core.handle({ type: "getCursor" })).toBe(14);
   });
 
   // CTC-114 review round 4 (P1). The transport DELIBERATELY forwards duplicate / out-of-order frames

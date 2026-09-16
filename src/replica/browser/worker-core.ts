@@ -177,7 +177,12 @@ export function createWorkerCore(open: ReplicaOpener): WorkerCore {
             // order, so an oldie always trails the original it duplicates.
             if (rec.seq <= maxSeq) continue;
             // CTC-603: PRAGMA-derived knownColumns for this delta's own entity.
-            if (applyChange(r.write, rec, r.knownColumnsByEntity.get(rec.entity))) applied++;
+            if (
+              "entity" in rec &&
+              applyChange(r.write, rec, r.knownColumnsByEntity.get(rec.entity))
+            ) {
+              applied++;
+            }
             maxSeq = rec.seq;
           }
           // Advance to the max seq SEEN (not just applied) — a window of all-stale deltas still moves

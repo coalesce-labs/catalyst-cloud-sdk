@@ -75,7 +75,7 @@ export interface SeedAbortRequest {
 /** Apply a batch of live deltas (each a /changes row) and advance the cursor to the max seq seen. */
 export interface ApplyChangesRequest {
   type: "applyChanges";
-  changes: Array<WireChange & { seq: number }>;
+  changes: Array<(WireChange & { seq: number }) | { seq: number }>;
 }
 
 /** Read the issues list view locally (buildIssuesView over the OPFS replica). */

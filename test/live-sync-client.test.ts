@@ -1014,6 +1014,14 @@ describe("parseFrame", () => {
     expect(parseFrame(JSON.stringify({ type: "resync" }))?.type).toBe("resync");
   });
 
+  it("accepts a validated cursor-only {type:'skip'} frame", () => {
+    expect(parseFrame(JSON.stringify({ type: "skip", accountId: "t", seq: 42 }))).toMatchObject({
+      type: "skip",
+      seq: 42,
+    });
+    expect(parseFrame(JSON.stringify({ type: "skip", accountId: "t", seq: "42" }))).toBeNull();
+  });
+
   it("accepts an ArrayBuffer-encoded frame", () => {
     const buf = new TextEncoder().encode(JSON.stringify({ type: "resync" })).buffer;
     expect(parseFrame(buf)?.type).toBe("resync");
@@ -1681,6 +1689,7 @@ describe("LiveSyncClient gap detection + self-healing re-request (CTL-1402)", ()
       pingIntervalMs: 0, // liveness watchdog off — isolate the gap machinery
       gapTimeoutMs: opts.gapTimeoutMs,
       gapRetryLimit: opts.gapRetryLimit,
+      onSkip: (frame) => store.setCursor(frame.seq),
       wsFactory: factory,
       log: (level, msg, extra) => logs.push({ level, msg, extra }),
     });
@@ -1753,6 +1762,25 @@ describe("LiveSyncClient gap detection + self-healing re-request (CTL-1402)", ()
     expect(syncsSent(sockets[0]!)).toHaveLength(2); // no further re-request
     expect(gapLines(logs)).toContainEqual(
       expect.objectContaining({ level: "info", event: "healed", seq_from: 9, seq_to: 10 }),
+    );
+    client.stop();
+  });
+
+  it("cursor-only skip frames close a replay gap without applying a hidden entity row", () => {
+    const { client, store, sockets, logs } = makeGapClient({ initialCursor: 7 });
+    void client.start();
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver(change(8));
+    sockets[0]!.deliver(change(11));
+
+    sockets[0]!.deliver({ type: "skip", accountId: "tenant-0", seq: 9 });
+    sockets[0]!.deliver({ type: "skip", accountId: "tenant-0", seq: 10 });
+    sockets[0]!.deliver(change(11));
+
+    expect(store.applied.map((frame) => frame.seq)).toEqual([8, 11]);
+    expect(store.getCursor()).toBe(11);
+    expect(gapLines(logs)).toContainEqual(
+      expect.objectContaining({ event: "healed", seq_from: 9, seq_to: 10 }),
     );
     client.stop();
   });

@@ -28,7 +28,7 @@ import {
 } from "./validate.js";
 
 /** A live delta as it rides into the worker: the wire record plus its change_log seq. */
-export type SeqChange = WireChange & { seq: number };
+export type SeqChange = (WireChange & { seq: number }) | { seq: number };
 
 /**
  * Largest number of deltas handed to the worker in ONE applyChanges RPC.
