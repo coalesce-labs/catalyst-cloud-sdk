@@ -57,6 +57,41 @@ declare module "node:fs" {
   export function statSync(path: string): { size: number };
 }
 
+// Minimal node-only surface used by the event cache. Structural declarations keep the package free
+// of an @types/node dependency, like the sqlite and writer-lock declarations above.
+declare module "node:fs/promises" {
+  interface ByteBuffer extends Uint8Array {
+    lastIndexOf(value: number): number;
+    subarray(start: number, end?: number): ByteBuffer;
+    toString(encoding?: string): string;
+  }
+  interface FileHandle {
+    write(data: string): Promise<unknown>;
+    sync(): Promise<void>;
+    close(): Promise<void>;
+  }
+  export function appendFile(path: string, data: string): Promise<void>;
+  export function mkdir(path: string, options?: { recursive?: boolean; mode?: number }): Promise<unknown>;
+  export function open(path: string, flags: string, mode?: number): Promise<FileHandle>;
+  export function readFile(path: string): Promise<ByteBuffer>;
+  export function readFile(path: string, encoding: "utf8" | "utf-8"): Promise<string>;
+  export function readdir(path: string): Promise<string[]>;
+  export function rename(oldPath: string, newPath: string): Promise<void>;
+  export function rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>;
+  export function stat(path: string): Promise<{ size: number }>;
+  export function truncate(path: string, length?: number): Promise<void>;
+  export function watch(path: string, options?: { signal?: AbortSignal }): AsyncIterable<unknown>;
+  export function writeFile(path: string, data: string, options?: { mode?: number }): Promise<void>;
+}
+
+declare module "node:os" {
+  export function homedir(): string;
+}
+
+declare module "node:path" {
+  export function join(...parts: string[]): string;
+}
+
 declare module "node:sqlite" {
   /** A prepared-statement handle (returned by DatabaseSync.prepare). */
   export interface StatementSync {
