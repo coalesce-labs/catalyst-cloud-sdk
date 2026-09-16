@@ -34,6 +34,7 @@ export {
   type SyncFrame,
   type PongFrame,
   type HeadFrame,
+  type SkipFrame,
   type ServerFrame,
 } from "./types.js";
 
