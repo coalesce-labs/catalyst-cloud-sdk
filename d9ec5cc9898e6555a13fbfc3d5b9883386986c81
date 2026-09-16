@@ -1,0 +1,1 @@
+Harden normal concurrent cache operation before SDK adoption: ignore active partial tails, register watchers before scans, avoid reader-side mkdir, clean abort listeners, recover the tail once per writer ownership, and preserve failed status.
