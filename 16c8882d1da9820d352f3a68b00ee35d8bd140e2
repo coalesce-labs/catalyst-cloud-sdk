@@ -1,0 +1,6 @@
+Revision history for #72:
+
+rev 2 (content) 2026-09-16 13:43 UTC — Address automatic review P1: route skip frames through the browser delta queue and worker transaction so OPFS cursor-only progress preserves ordering.
+rev 1 (initial) 2026-09-16 13:43 UTC
+
+<!-- mergify-revision-data: {"schema_version":1,"pull_number":72,"entries":[{"number":1,"change_type":"initial","old_sha":null,"new_sha":"fcc001b583b4093126a424faebc1e96376302e6f","timestamp_iso":"2026-09-16T13:43:29Z","reason":"","replay_sha":null,"compare_url":null},{"number":2,"change_type":"content","old_sha":"fcc001b583b4093126a424faebc1e96376302e6f","new_sha":"1af3f0b5176844c8cfe21b6b737fd86be86d5356","timestamp_iso":"2026-09-16T13:43:29Z","reason":"Address automatic review P1: route skip frames through the browser delta queue and worker transaction so OPFS cursor-only progress preserves ordering.","replay_sha":null,"compare_url":"https://github.com/coalesce-labs/catalyst-cloud-sdk/compare/fcc001b583b4093126a424faebc1e96376302e6f...1af3f0b5176844c8cfe21b6b737fd86be86d5356"}]} -->
