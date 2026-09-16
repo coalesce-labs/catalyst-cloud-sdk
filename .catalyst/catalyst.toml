@@ -1,0 +1,5 @@
+#:schema https://staging.catalystcloud.dev/schemas/catalyst.schema.json
+# This repository belongs to the CTC Catalyst project, whose home repository is coalesce-labs/catalyst-cloud.
+
+[project]
+linear_team = "CTC"
