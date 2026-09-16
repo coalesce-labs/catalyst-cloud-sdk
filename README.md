@@ -244,6 +244,32 @@ switch (moved.outcome) {
 
 The contract cache is in memory per client by default; pass `contractCache: { get, set }` to keep it on disk (the bundle does). `fetch`, `now` and `timeoutMs` are injectable so a test never opens a socket.
 
+### Durable event cache for node and Bun
+
+`@catalyst-cloud/sdk/events` mirrors the tenant's exact durable Catalyst event backbone into an append-only local cache. It uses bounded HTTP replay with an idle backoff; local consumers tail files and never poll GitHub, Linear, or cloud tables. Start and stop it with the process that currently needs the tenant instead of installing another permanent daemon.
+
+```ts
+import { CatalystEventSync, tailCachedEvents } from "@catalyst-cloud/sdk/events";
+
+const sync = new CatalystEventSync({
+  baseUrl: "https://staging.catalystcloud.dev",
+  auth: { kind: "token", token: process.env.CATALYST_CLOUD_TOKEN! },
+  tenantId: "tenant-1",
+});
+const running = sync.start();
+for await (const event of tailCachedEvents({ tenantId: "tenant-1", signal })) {
+  console.log(event.type, event.sequence);
+}
+await sync.stop();
+await running;
+```
+
+The default path is `$XDG_STATE_HOME/catalyst/events/<tenant>/backbone/`, falling back to `~/.local/state/catalyst/events/<tenant>/backbone/`. Daily `YYYY-MM-DD[-NNN].jsonl` segments contain the cloud's `CatalystEvent` envelope unchanged. `cursor.json` is owned by the one sync writer; readers keep their own offsets elsewhere and do not write into this directory. The stable replay identity is `(tenantId, sequence, eventId)`.
+
+The writer fsyncs appended records before atomically advancing its cursor. On restart it truncates an incomplete final line and derives the resume cursor from the last complete record, making a crash between append and checkpoint safe. Server archive gaps and reads behind the local retention floor raise `EventHistoryGapError` with the head, suggested resume point, and reason; the SDK does not silently skip history. New caches bootstrap at the current backbone head. Closed daily segments are retained for seven days or until the cache reaches 256 MiB, whichever happens first. The active segment rotates before the same byte bound, so it cannot grow without limit; `retainDays` and `maxCacheBytes` configure these bounds.
+
+This API only reads the durable backbone. It does not publish events or treat raw provider events, the legacy coordination feed, or analytical samples as execution or billing authority. Use the existing authorized cloud operations to report outcomes and changes.
+
 ## API
 
 | Export | What it is |
@@ -256,6 +282,7 @@ The contract cache is in memory per client by default; pass `contractCache: { ge
 | `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `issues.list/get`, `pulls.list/get`, `projects.list`, `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept). |
 | `TenantContract` · `routeByName` · `teamByKey` · `teamForTicket` · `stageIdForSlot` · `labelIdFor` | The contract document's shape and the pure accessors over it, each returning a typed miss rather than throwing. |
 | `TenantClientFailure` · `PageCursor` · `pageCursor` · `memoryContractCache` | The shared failure arms, the opaque page token, and the default contract cache store. |
+| `CatalystEventSync` · `readCachedEvents` · `tailCachedEvents` · `EventHistoryGapError` | Node/Bun durable-backbone replay, local cache readers, and explicit history-gap handling from `@catalyst-cloud/sdk/events`. |
 
 `start()` resolves only when `stop()` is called. On a backend, `await` it to keep the process alive; in a browser, never await it — just call `stop()` on teardown.
 
