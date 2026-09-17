@@ -245,7 +245,17 @@ export type AgentRouteName =
   | "attachments"
   | "session"
   | "ask"
-  | "ask-accept";
+  | "ask-accept"
+  | "project-repositories"
+  | "project-repositories/remove";
+
+/** The runtime twin of {@link AgentRouteName}: the list a test can walk against the contract.
+ *  Kept in lockstep with the union by a compile-time equality in test/tenant-client-agent.test.ts. */
+export const AGENT_ROUTE_NAMES = [
+  "issue-state", "issue-label", "issue-comment", "issue-create", "reaction",
+  "attachment", "attachments", "session", "ask", "ask-accept",
+  "project-repositories", "project-repositories/remove",
+] as const satisfies readonly AgentRouteName[];
 
 /** The arms every agent call can end in BEFORE the route answers: the contract could not be served,
  *  or the tenant's contract does not list the route. */
@@ -253,6 +263,15 @@ export type AgentCallFailure =
   | ContractFailure
   | { outcome: "route-unknown"; route: AgentRouteName; routes: string[] }
   | TenantClientFailure;
+
+/** What `callAgentRoute` hands its verbs — a success, or a failure TAGGED WITH WHERE IT CAME FROM.
+ *  `"contract"` is everything that happened before the route was reached (the contract could not be
+ *  served, or does not list the route), `"transport"` is the request itself failing, and `"route"`
+ *  is the route's own answer. A verb that reinterprets a status — see `notFound` — may only do so
+ *  for `"route"`, or it would describe the caller's project using an answer about the contract. */
+type AgentCallResult =
+  | { ok: true; body: Record<string, unknown>; status: number }
+  | { ok: false; from: "contract" | "transport" | "route"; failure: AgentCallFailure };
 
 /** The proxy's shared write outcome (`ProxiedWriteResult`), on the wire with the HTTP status. The
  *  `rejected` arm is the shared {@link TenantClientFailure} one. */
@@ -420,6 +439,36 @@ export type AskAcceptResult =
   | { outcome: "recorded"; status: number; askIdentifier: string; decisionSummary: string; failedBlockedComments: string[]; resume: unknown[]; unblock?: unknown }
   | { outcome: "refused"; status: number; reason: AskAcceptRefusal }
   | { outcome: "record-failed"; status: number; reason: string; resume?: unknown[] }
+  | AgentCallFailure;
+
+/** Both project-repository routes take the same address: a repository plus ONE of project /
+ *  teamKey / teamId. This route is NOT accounted against the write budget
+ *  (`takesWriteBudgetUnit: false`); it is gated on an admin/owner personal key or an
+ *  organization key carrying `mirror:write`. */
+export interface ProjectRepositoryInput {
+  /** `owner/name`, sent VERBATIM. ⚠️ The cloud validates the trimmed halves but stores what it
+   *  was sent (CTC-2503 re-validation) — trim before calling if the value came from a human. */
+  repository: string;
+  project?: string;
+  teamKey?: string;
+  teamId?: string;
+}
+export interface RegisteredProjectRepository {
+  repoId: string;
+  owner: string;
+  name: string;
+  /** Present when the `repos` row carries one (e.g. `"paused"`). */
+  status?: string;
+}
+export type ProjectRepositoryRegisterResult =
+  | { outcome: "registered"; status: number; registered: RegisteredProjectRepository; created: boolean; linked: boolean }
+  /** The project is absent, archived, or another tenant's — one answer for all three. */
+  | { outcome: "not-found"; status: 404; reason: string }
+  | AgentCallFailure;
+export type ProjectRepositoryRemoveResult =
+  /** `removed: false` is idempotent success, not a failure — there was nothing to unlink. */
+  | { outcome: "removed"; status: number; removed: boolean }
+  | { outcome: "not-found"; status: 404; reason: string }
   | AgentCallFailure;
 
 // ── Header and param names — the mirror's own strings, each in exactly one place ────────────────
@@ -809,27 +858,43 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     name: AgentRouteName,
     input: Record<string, unknown>,
     accept: (body: Record<string, unknown>) => boolean,
-  ): Promise<{ ok: true; body: Record<string, unknown>; status: number } | { ok: false; failure: AgentCallFailure }> {
+  ): Promise<AgentCallResult> {
     const doc = await contract();
-    if (doc.outcome !== "ok") return { ok: false, failure: doc };
+    if (doc.outcome !== "ok") return { ok: false, from: "contract", failure: doc };
     const route = routeByName(doc.doc, name);
     if (route === null) {
-      return { ok: false, failure: { outcome: "route-unknown", route: name, routes: doc.doc.routes.map((r) => r.path) } };
+      return { ok: false, from: "contract", failure: { outcome: "route-unknown", route: name, routes: doc.doc.routes.map((r) => r.path) } };
     }
     const defined = Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined));
     const sent =
       route.method === "GET"
         ? await send("GET", url(route.path, stringify(defined)), {})
         : await send("POST", url(route.path), {}, defined);
-    if (!sent.ok) return { ok: false, failure: sent.failure };
+    if (!sent.ok) return { ok: false, from: "transport", failure: sent.failure };
     const { answer } = sent;
     if (isRecord(answer.json) && accept(answer.json)) return { ok: true, body: answer.json, status: answer.status };
-    return { ok: false, failure: classify(answer) };
+    return { ok: false, from: "route", failure: classify(answer) };
   }
 
   /** A route's success table: the `outcome` literals it answers with a 2xx OR a mapped error status. */
   function outcomes(...names: readonly string[]): (body: Record<string, unknown>) => boolean {
     return (body) => typeof body["outcome"] === "string" && names.includes(body["outcome"]);
+  }
+
+  /** These routes answer a missing/foreign project as a 404 `{error}` body; `classify` folds that
+   *  into the `http` catch-all, so lift it to its own arm. Every other status keeps `classify`'s
+   *  mapping — 403 → `forbidden`, 400 `{error}` → `rejected`, 409/503 → `http` — each carrying the
+   *  route's own error literal as `reason` (reasonOf reads `reason ?? error ?? message`).
+   *
+   *  ⛔ ONLY the ROUTE's own answer is lifted. `callAgentRoute` fails for three different reasons,
+   *  and a 404 from the contract fetch (a wrong `baseUrl`, a tenant whose contract endpoint is not
+   *  deployed) or a transport failure says nothing about the caller's project — reporting either as
+   *  `not-found` would state "this project is absent, archived, or another tenant's" about a call
+   *  that never reached the route. Those keep the arm every other agent verb returns for them. */
+  function notFound(r: Extract<AgentCallResult, { ok: false }>): { outcome: "not-found"; status: 404; reason: string } | null {
+    return r.from === "route" && r.failure.outcome === "http" && r.failure.status === 404
+      ? { outcome: "not-found", status: 404, reason: r.failure.reason }
+      : null;
   }
 
   function stringify(input: Record<string, unknown>): Record<string, string> {
@@ -895,6 +960,16 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
       const r = await callAgentRoute("ask-accept", { ...input }, outcomes("recorded", "refused", "record-failed"));
       return r.ok ? stamped<Extract<AskAcceptResult, { outcome: "recorded" | "refused" | "record-failed" }>>(r.body, r.status) : r.failure;
     },
+    async projectRepositoryRegister(input) {
+      const r = await callAgentRoute("project-repositories", { ...input }, (body) => isRecord(body["registered"]));
+      if (!r.ok) return notFound(r) ?? r.failure;
+      return { outcome: "registered", ...stamped<Omit<Extract<ProjectRepositoryRegisterResult, { outcome: "registered" }>, "outcome">>(r.body, r.status) };
+    },
+    async projectRepositoryRemove(input) {
+      const r = await callAgentRoute("project-repositories/remove", { ...input }, (body) => typeof body["removed"] === "boolean");
+      if (!r.ok) return notFound(r) ?? r.failure;
+      return { outcome: "removed", ...stamped<Omit<Extract<ProjectRepositoryRemoveResult, { outcome: "removed" }>, "outcome">>(r.body, r.status) };
+    },
   };
 
   return {
@@ -940,5 +1015,7 @@ export interface TenantClient {
     session(input: SessionInput): Promise<SessionResult>;
     ask(input: AskInput): Promise<AskResult>;
     askAccept(input: AskAcceptInput): Promise<AskAcceptResult>;
+    projectRepositoryRegister(input: ProjectRepositoryInput): Promise<ProjectRepositoryRegisterResult>;
+    projectRepositoryRemove(input: ProjectRepositoryInput): Promise<ProjectRepositoryRemoveResult>;
   };
 }

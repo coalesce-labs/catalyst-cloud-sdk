@@ -279,7 +279,7 @@ This API only reads the durable backbone. It does not publish events or treat ra
 | `AuthStrategy` | `{ kind: "token"; token }` (backend) or `{ kind: "cookie" }` (browser). |
 | `LiveSyncStatus` | `"connecting"` · `"live"` · `"reconnecting"` · `"resyncing"` · `"error"` · `"stopped"`. |
 | `ChangeFrame` · `EntityName` · `ChangeOp` | The change shape + the entity/op contract. |
-| `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `issues.list/get`, `pulls.list/get`, `projects.list`, `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept). |
+| `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `issues.list/get`, `pulls.list/get`, `projects.list`, `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept, projectRepositoryRegister, projectRepositoryRemove). |
 | `TenantContract` · `routeByName` · `teamByKey` · `teamForTicket` · `stageIdForSlot` · `labelIdFor` | The contract document's shape and the pure accessors over it, each returning a typed miss rather than throwing. |
 | `TenantClientFailure` · `PageCursor` · `pageCursor` · `memoryContractCache` | The shared failure arms, the opaque page token, and the default contract cache store. |
 | `CatalystEventSync` · `readCachedEvents` · `tailCachedEvents` · `EventHistoryGapError` | Node/Bun durable-backbone replay, local cache readers, and explicit history-gap handling from `@catalyst-cloud/sdk/events`. |

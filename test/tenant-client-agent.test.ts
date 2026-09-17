@@ -9,7 +9,15 @@
 import { describe, expect, it } from "vitest";
 import fixture from "./fixtures/tenant-contract.fixture.json";
 import { json, scriptedFetch, text, type Scripted } from "./helpers/scripted-fetch";
-import { createTenantClient, memoryContractCache, type TenantContract } from "../src/index";
+import {
+  AGENT_ROUTE_NAMES,
+  createTenantClient,
+  memoryContractCache,
+  readTenantContract,
+  routeByName,
+  type AgentRouteName,
+  type TenantContract,
+} from "../src/index";
 
 const BASE = "https://cloud.example";
 const KEY = "ctc_acct_writer";
@@ -233,5 +241,126 @@ describe("the per-route bodies", () => {
     expect(await c.agent.askAccept(input)).toMatchObject({ outcome: "recorded", status: 200, askIdentifier: "ENG-50" });
     expect(await c.agent.askAccept(input)).toEqual({ outcome: "refused", status: 409, reason: "not-assignee" });
     expect(await c.agent.askAccept(input)).toEqual({ outcome: "record-failed", status: 502, reason: "write failed" });
+  });
+
+  it("projectRepositoryRegister ⭐ POSTs to the contract's project-repositories path with exactly the given body, and passes {registered,created,linked} through with outcome stamped on", async () => {
+    const registered = { repoId: "tenant-0:coalesce-labs__dev-skills", owner: "coalesce-labs", name: "dev-skills" };
+    const { net, c } = client([() => json(200, { registered, created: true, linked: true })]);
+    const res = await c.agent.projectRepositoryRegister({ repository: "coalesce-labs/dev-skills", project: "proj-1" });
+    expect(res).toEqual({ outcome: "registered", status: 200, registered, created: true, linked: true });
+    expect(net.calls[1]!.method).toBe("POST");
+    expect(net.calls[1]!.url).toBe(`${BASE}${pathOf(fixture, "project-repositories")}`);
+    expect(net.calls[1]!.body).toEqual({ repository: "coalesce-labs/dev-skills", project: "proj-1" });
+  });
+
+  it("projectRepositoryRegister sends the address field it was given (project / teamKey / teamId) and no others", async () => {
+    const { net, c } = client([() => json(200, { registered: { repoId: "r", owner: "o", name: "n" }, created: false, linked: true })]);
+    await c.agent.projectRepositoryRegister({ repository: "o/n", teamKey: "ENG" });
+    expect(net.calls[1]!.body).toEqual({ repository: "o/n", teamKey: "ENG" });
+  });
+
+  it("projectRepositoryRemove ⭐ reaches the NESTED path, not the register route, and {removed:false} is a removed success, not a failure", async () => {
+    const { net, c } = client([() => json(200, { removed: false })]);
+    const res = await c.agent.projectRepositoryRemove({ repository: "coalesce-labs/dev-skills", teamId: "team-eng" });
+    expect(res).toEqual({ outcome: "removed", status: 200, removed: false });
+    expect(net.calls[1]!.url).toBe(`${BASE}${pathOf(fixture, "project-repositories/remove")}`);
+    expect(net.calls[1]!.url).not.toBe(`${BASE}${pathOf(fixture, "project-repositories")}`);
+  });
+
+  it("project-repositories error arms: 403 forbidden, 404 not-found, 400 rejected, and 409/503 preserved as http with the route's literal as reason", async () => {
+    const { c } = client([
+      () => json(403, { error: "forbidden", message: "managing repositories requires an admin or owner role" }),
+      () => json(404, { error: "project_not_found" }),
+      () => json(400, { error: "github_not_connected" }),
+      () => json(409, { error: "registry_not_migrated" }),
+      () => json(503, { error: "github_unverified" }),
+    ]);
+    // reasonOf reads `reason ?? error ?? message`; this shape has no `reason` field, so the route's
+    // own error LITERAL ("forbidden") wins over the human-readable `message` — the plan's documented
+    // behavior for classify()'s shared auth-plane handling, not something this route special-cases.
+    expect(await c.agent.projectRepositoryRegister({ repository: "o/n", project: "p" })).toEqual({
+      outcome: "forbidden",
+      status: 403,
+      reason: "forbidden",
+      required: null,
+      account: null,
+    });
+    expect(await c.agent.projectRepositoryRegister({ repository: "o/n", project: "p" })).toEqual({
+      outcome: "not-found",
+      status: 404,
+      reason: "project_not_found",
+    });
+    expect(await c.agent.projectRepositoryRegister({ repository: "o/n", project: "p" })).toEqual({
+      outcome: "rejected",
+      status: 400,
+      reason: "github_not_connected",
+    });
+    expect(await c.agent.projectRepositoryRegister({ repository: "o/n", project: "p" })).toEqual({
+      outcome: "http",
+      status: 409,
+      reason: "registry_not_migrated",
+    });
+    expect(await c.agent.projectRepositoryRemove({ repository: "o/n", project: "p" })).toEqual({
+      outcome: "http",
+      status: 503,
+      reason: "github_unverified",
+    });
+  });
+
+  it("project-repositories routes are route-unknown, with no POST, when the contract omits them", async () => {
+    const without: TenantContract = {
+      ...(JSON.parse(JSON.stringify(fixture)) as TenantContract),
+      routes: fixture.routes
+        .filter((r) => !r.path.includes("project-repositories"))
+        .map((r) => ({ ...r, method: r.method === "GET" ? ("GET" as const) : ("POST" as const) })),
+    };
+    const net = scriptedFetch([() => json(200, without, { etag: ETAG }), () => new Error("must not be called")]);
+    const c = createTenantClient({ key: KEY, baseUrl: BASE, fetch: net.fetch });
+    expect(await c.agent.projectRepositoryRegister({ repository: "o/n", project: "p" })).toEqual({
+      outcome: "route-unknown",
+      route: "project-repositories",
+      routes: without.routes.map((r) => r.path),
+    });
+    expect(net.calls).toHaveLength(1);
+  });
+
+  it("⛔ a 404 from the CONTRACT fetch is returned unchanged, NOT lifted to the route's project not-found arm", async () => {
+    // The route answers 404 `{error:"project_not_found"}` for a project that is absent, archived or
+    // another tenant's, and only THAT is `not-found`. A 404 on GET /api/v1/agent/contract — a wrong
+    // baseUrl, a tenant whose contract endpoint is not deployed — says nothing about the caller's
+    // project, so it stays the shared `http` arm every other agent verb returns for it.
+    const register = scriptedFetch([() => json(404, { error: "not_found" }), () => new Error("must not be called")]);
+    const rc = createTenantClient({ key: KEY, baseUrl: BASE, fetch: register.fetch, contractCache: memoryContractCache() });
+    expect(await rc.agent.projectRepositoryRegister({ repository: "o/n", project: "p" })).toEqual({
+      outcome: "http",
+      status: 404,
+      reason: "not_found",
+    });
+    expect(register.calls).toHaveLength(1);
+
+    const remove = scriptedFetch([() => json(404, { error: "not_found" }), () => new Error("must not be called")]);
+    const mc = createTenantClient({ key: KEY, baseUrl: BASE, fetch: remove.fetch, contractCache: memoryContractCache() });
+    expect(await mc.agent.projectRepositoryRemove({ repository: "o/n", project: "p" })).toEqual({
+      outcome: "http",
+      status: 404,
+      reason: "not_found",
+    });
+    expect(remove.calls).toHaveLength(1);
+  });
+});
+
+describe("⭐ the drift guard (CTC-2562): every route this SDK wraps must resolve against the committed fixture", () => {
+  /** Compile-time exact type equality — the device test/tenant-contract.test.ts already uses. */
+  type TypesAreEqual<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+  const namesInLockstep: TypesAreEqual<(typeof AGENT_ROUTE_NAMES)[number], AgentRouteName> = true;
+
+  it("the runtime AGENT_ROUTE_NAMES list is kept in lockstep with the AgentRouteName union at compile time", () => {
+    expect(namesInLockstep).toBe(true);
+  });
+
+  it("every route this client wraps exists in the committed contract fixture", () => {
+    const doc = readTenantContract(fixture);
+    if (doc === null) throw new Error("the committed fixture does not read as a TenantContract");
+    for (const name of AGENT_ROUTE_NAMES) expect([name, routeByName(doc, name) !== null]).toEqual([name, true]);
   });
 });

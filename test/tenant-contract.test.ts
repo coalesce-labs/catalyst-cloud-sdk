@@ -9,6 +9,12 @@
 // "Tier 2"). A copy lives under test/fixtures/; when the cloud's document changes shape, the copy is
 // refreshed and this file reddens on the delta.
 //
+// ⚠️ THIS COPY IS ROUTE-PARTIAL, NOT VERSION-CURRENT (CTC-2562): it carries the routes[] rows this
+// SDK actually wraps (plus the two `project-repositories` rows added at `since: "1.11.0"`), not every
+// route the cloud's real 1.11.0 document lists — `account-environment` and others are still absent.
+// Its `contractVersion` stays "1.0.0" on purpose: bumping it here would assert a completeness this
+// fixture does not have. A full refresh needs the cloud's own regenerated fixture.
+//
 // ⛔ A JSON import is WIDENED by tsc (`"POST"` becomes `string`), so `fixture satisfies TenantContract`
 // cannot be the check. The check is the runtime guard the client itself uses on every 200 —
 // `readTenantContract` — plus a compile-time lockstep between the type's key set and the guard's
