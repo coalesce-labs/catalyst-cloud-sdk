@@ -329,9 +329,19 @@ export function readTenantContract(value: unknown): TenantContract | null {
 
 // ── Pure accessors — the bundle's contract.ts helpers, returning results instead of throwing ──────
 
-/** The route whose LAST path segment is `name` (`issue-comment`); the path itself is never assumed. */
+/** The route whose LAST path segments are `name` — `"issue-comment"`, or a nested
+ *  `"project-repositories/remove"`. The path prefix is never assumed. */
 export function routeByName(doc: TenantContract, name: string): ContractRoute | null {
-  return doc.routes.find((r) => r.path.split("/").filter(Boolean).at(-1) === name) ?? null;
+  const wanted = name.split("/").filter(Boolean);
+  if (wanted.length === 0) return null;
+  return (
+    doc.routes.find((r) => {
+      const segs = r.path.split("/").filter(Boolean);
+      if (segs.length < wanted.length) return false;
+      const from = segs.length - wanted.length;
+      return wanted.every((w, i) => segs[from + i] === w);
+    }) ?? null
+  );
 }
 
 export type TeamLookup =

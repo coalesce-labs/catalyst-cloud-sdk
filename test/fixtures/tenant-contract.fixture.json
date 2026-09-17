@@ -104,6 +104,18 @@
       "path": "/api/v1/agent/contract",
       "takesWriteBudgetUnit": false,
       "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/project-repositories",
+      "takesWriteBudgetUnit": false,
+      "since": "1.11.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/project-repositories/remove",
+      "takesWriteBudgetUnit": false,
+      "since": "1.11.0"
     }
   ],
   "teams": [
