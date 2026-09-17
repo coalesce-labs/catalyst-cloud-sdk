@@ -1,0 +1,57 @@
+# Mergify merge queue for `catalyst-cloud-sdk` (CTC-2563).
+#
+# Entry is opt-OUT, matching `catalyst-cloud`: any pull request against `main` that is green,
+# non-draft, and has zero unresolved review threads self-enqueues. To keep one OUT, apply the
+# `hold` label — that is the only thing anyone does by hand.
+#
+# WHY THIS EXISTS: without a queue, the relay's merge phase fails `merge_excluded_no_merge_queue`,
+# burns its attempts, and waits for a human. Observed on CTC-2545 (three failed attempts, then a
+# hand-merge) on 2026-09-17.
+#
+# ⛔ A `neutral` "Mergify Merge Protections" check in a repository with NO config does not mean
+# "nothing to enforce" — it means no rule matched, evaluated against zero rules. That is what this
+# repository reported before this file existed, and it is why its absence was easy to miss.
+#
+# The gating check names below are this repository's OWN, read from its most recent pull request —
+# not copied from catalyst-cloud. Unlike catalyst-cloud, no job here is guarded on
+# `github.event.pull_request.draft == false`, so a draft→ready transition does NOT leave a second
+# SKIPPED run per gate name on one sha, and a bare `check-success=` is correct here. Verified in
+# this repository's `.github/workflows/ci.yml` rather than assumed.
+
+queue_rules:
+  - name: default
+    merge_method: squash
+    queue_conditions:
+      - base=main
+      - -draft
+      - label!=hold
+      - "#review-threads-unresolved=0"
+      - "check-success=install · build · typecheck · test"
+    merge_conditions:
+      - base=main
+      - label!=hold
+      - "#review-threads-unresolved=0"
+      - "check-success=install · build · typecheck · test"
+
+pull_request_rules:
+  # The trigger, not a second gate: its conditions mirror queue_conditions so a pull request that
+  # would be admitted is the one that gets enqueued.
+  - name: enqueue any green, thread-clean, non-held PR
+    conditions:
+      - base=main
+      - -draft
+      - label!=hold
+      - "#review-threads-unresolved=0"
+      - "check-success=install · build · typecheck · test"
+    actions:
+      queue: {}
+
+merge_protections:
+  # Applies to every non-draft pull request against main regardless of merge path, so a hand-merge
+  # cannot skip what the queue enforces.
+  - name: no unresolved review threads before merge
+    if:
+      - base=main
+      - -draft
+    success_conditions:
+      - "#review-threads-unresolved=0"
