@@ -88,6 +88,7 @@ export {
   type ProjectListParams,
   type ProjectListResult,
   type MeResult,
+  AGENT_ROUTE_NAMES,
   type AgentRouteName,
   type AgentCallFailure,
   type ProxiedWriteOutcome,
@@ -117,6 +118,10 @@ export {
   type AskAcceptInput,
   type AskAcceptRefusal,
   type AskAcceptResult,
+  type ProjectRepositoryInput,
+  type RegisteredProjectRepository,
+  type ProjectRepositoryRegisterResult,
+  type ProjectRepositoryRemoveResult,
 } from "./tenant-client.js";
 
 export {
