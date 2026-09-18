@@ -214,6 +214,13 @@ const client = createTenantClient({
   baseUrl: "https://staging.catalystcloud.dev",
 });
 
+// Or drive it with the CTC-2111 AuthStrategy — the same shape LiveSyncClient/CatalystReplica take —
+// so one credential provider serves every SDK surface. `bearer` is resolved FRESH on every request.
+const clientWithAuth = createTenantClient({
+  auth: { kind: "bearer", getToken: () => credentialProvider.accessToken() },
+  baseUrl: "https://staging.catalystcloud.dev",
+});
+
 // A keyset-paged read: follow `nextCursor` (typed, read off X-Mirror-Next-Cursor) until it is null.
 let after = undefined;
 do {
@@ -243,6 +250,21 @@ switch (moved.outcome) {
 ```
 
 The contract cache is in memory per client by default; pass `contractCache: { get, set }` to keep it on disk (the bundle does). `fetch`, `now` and `timeoutMs` are injectable so a test never opens a socket.
+
+**CTC-2132 — the remaining routes the bundle's own transport used to reach:**
+
+| Namespace | Methods |
+| --- | --- |
+| `client.issues.execution(identifier)` | `GET /api/v1/issues/:id/execution` — the ticket's own execution/telemetry report. |
+| `client.diagnostics.*` | `workEligibility`, `dispatchQueue`, `fleetActivity`, `agentRoster`, `leaseAttributions`, `codingAccounts` — a customer delegate agent's own "why is nothing moving" / "what is my fleet doing" answers. |
+| `client.cycles.list()` | `GET /api/v1/cycles`. |
+| `client.search({ q, limit })` | `GET /api/v1/search` — issues/pulls/projects/initiatives buckets. |
+| `client.workflowStages()` | `GET /api/v1/workflow-stages` (key-authenticated twin). |
+| `client.changes.stream({ since, signal })` / `client.changes.list(...)` | `GET /api/v1/changes` — the NDJSON change feed; `stream()`'s generator may throw mid-iteration on a transport fault, `list()` never throws. |
+| `client.snapshot.head()` | `GET /api/v1/snapshot?head=1` — the cheap head probe; never falls back to a full snapshot. |
+| `client.request({ method, path, query, headers, body })` | The generic authed-request escape hatch for a route nobody enumerated. **`path` must be an absolute path under the client's own origin** (e.g. `"/api/v1/…"`), never a URL — a value that escapes it is refused before anything is sent. |
+
+Every one of the above is documented from cloud-side prose this package cannot compile against (`catalyst-cloud` is not a dependency here), so each response type carries an index signature and the runtime check validates only the response's *container* shape (an array, or an object with the documented key) — never an individual field — so a cloud-side field addition is never refused as a shape error.
 
 ### Durable event cache for node and Bun
 
@@ -279,7 +301,7 @@ This API only reads the durable backbone. It does not publish events or treat ra
 | `AuthStrategy` | `{ kind: "token"; token }` (backend) or `{ kind: "cookie" }` (browser). |
 | `LiveSyncStatus` | `"connecting"` · `"live"` · `"reconnecting"` · `"resyncing"` · `"error"` · `"stopped"`. |
 | `ChangeFrame` · `EntityName` · `ChangeOp` | The change shape + the entity/op contract. |
-| `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `issues.list/get`, `pulls.list/get`, `projects.list`, `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept, projectRepositoryRegister, projectRepositoryRemove). |
+| `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `request()`, `issues.list/get/execution`, `pulls.list/get`, `projects.list`, `cycles.list`, `search`, `workflowStages`, `changes.stream/list`, `snapshot.head`, `diagnostics.*` (workEligibility, dispatchQueue, fleetActivity, agentRoster, leaseAttributions, codingAccounts), `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept, projectRepositoryRegister, projectRepositoryRemove). Accepts either `key: string` or the CTC-2111 `auth: AuthStrategy`. |
 | `TenantContract` · `routeByName` · `teamByKey` · `teamForTicket` · `stageIdForSlot` · `labelIdFor` | The contract document's shape and the pure accessors over it, each returning a typed miss rather than throwing. |
 | `TenantClientFailure` · `PageCursor` · `pageCursor` · `memoryContractCache` | The shared failure arms, the opaque page token, and the default contract cache store. |
 | `CatalystEventSync` · `readCachedEvents` · `tailCachedEvents` · `EventHistoryGapError` | Node/Bun durable-backbone replay, local cache readers, and explicit history-gap handling from `@catalyst-cloud/sdk/events`. |
