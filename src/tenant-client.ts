@@ -13,6 +13,18 @@
 //     issue-create, reaction, attachment, session, ask, ask-accept — plus the attachments read-back.
 //     ⭐ THE PATH IS NEVER A LITERAL: each is resolved from the contract's `routes[]` by its last
 //     segment, and a route the tenant's contract does not list is a typed `route-unknown` result.
+//   • CTC-2132 — the routes the bundle's own `src/http.ts` transport used to hand-roll: GET
+//     /issues/:id/execution, /work-eligibility, /dispatch-queue/current, /fleet-activity/current,
+//     /agent-roster/current, /lease/attributions, /coding-accounts (the `diagnostics.*` namespace +
+//     `issues.execution`), /cycles, /search, /workflow-stages, /changes (NDJSON — `changes.stream`/
+//     `changes.list`), /snapshot?head=1 (`snapshot.head`), plus a generic `request()` escape hatch for
+//     any route not otherwise enumerated. This package does not depend on `catalyst-cloud`, so every
+//     one of these response types is declared open (an index signature) and validated only by its
+//     CONTAINER shape at runtime — never a field — so a cloud-side field addition is never a `shape`
+//     refusal (see the "diagnosis / telemetry reads" and "query reads" sections below).
+//   • CTC-2111/CTC-2132 — `createTenantClient` accepts either `key: string` (unchanged) or the
+//     `AuthStrategy` from `./live-sync-client.js` (`token` | `cookie` | `bearer`), resolved fresh on
+//     EVERY request — never captured once, since a `bearer` token rotates (~15 min).
 //
 // ⛔ NOTHING THROWS FOR A SERVER ANSWER. Every call resolves to a discriminated union on `outcome`.
 // The mirror already speaks that grammar on the proxy (`{outcome, reason}` on every status); the auth
@@ -35,6 +47,8 @@ import type {
   PullDetailView,
   PullView,
 } from "@catalyst-cloud/read-model";
+import { AuthError, type AuthStrategy } from "./live-sync-client.js";
+import { iterateNdjson } from "./ndjson.js";
 import {
   CONTRACT_ROUTE,
   readTenantContract,
@@ -73,10 +87,7 @@ export function memoryContractCache(): ContractCacheStore {
   };
 }
 
-export interface TenantClientOptions {
-  /** The tenant key. Reads accept any key with `mirror:read`; every `/api/v1/agent/*` route needs an
-   *  organization-tier key (`ctc_acct_*`) — a workstation key is refused `403 not-machine-principal`. */
-  key: string;
+export interface TenantClientBaseOptions {
   /** The service origin (e.g. "https://staging.catalystcloud.dev"). A trailing slash is trimmed;
    *  every route path is absolute under it. */
   baseUrl: string;
@@ -89,6 +100,25 @@ export interface TenantClientOptions {
   /** Epoch ms; injectable so a test can cross the cache bounds without sleeping. */
   now?: () => number;
 }
+
+/**
+ * Exactly one credential. `key` is the CTC-2004 shape, kept working with identical wire behaviour;
+ * `auth` is the CTC-2111 {@link AuthStrategy} the bundle's single credential provider drives
+ * (CTC-2132) — `token`/`cookie`/`bearer`, resolved per request exactly as
+ * `CatalystReplica.feedHeaders()` resolves it (src/replica/catalyst-replica.ts). Internally `key` is
+ * normalized to `{kind:"token", token:key}` at construction, so `send()` never sees two shapes.
+ */
+export type TenantClientOptions = TenantClientBaseOptions &
+  (
+    | {
+        /** The tenant key. Reads accept any key with `mirror:read`; every `/api/v1/agent/*` route
+         *  needs an organization-tier key (`ctc_acct_*`) — a workstation key is refused `403
+         *  not-machine-principal`. */
+        key: string;
+        auth?: never;
+      }
+    | { auth: AuthStrategy; key?: never }
+  );
 
 // ── The shared failure arms ─────────────────────────────────────────────────────────────────────
 
@@ -230,6 +260,150 @@ export type MeResult =
     }
   | TenantClientFailure;
 
+/** `GET /api/v1/issues/:id/execution` — the ticket's own execution/telemetry report. ⛔ The fields
+ *  below are DOCUMENTED, not compiled: this repo does not depend on `catalyst-cloud`. The index
+ *  signature is deliberate (Decision 4, CTC-2132) — a field the cloud adds must reach the caller, not
+ *  be refused as a shape error. The tenant decides which principals may read this route (Decision 5);
+ *  the client reports whatever it answers. */
+export interface TicketExecutionReport {
+  readonly identifier?: string;
+  readonly [key: string]: unknown;
+}
+export type TicketExecutionResult =
+  | { outcome: "ok"; status: 200; report: TicketExecutionReport }
+  | { outcome: "not-found"; status: 404 }
+  | TenantClientFailure;
+
+// ── The diagnosis / telemetry reads — CTC-2132 (Ryan/M2: customer delegate agents diagnosing and
+//    unsticking their own work). Seven literal-path open reads, same pattern as `me()`/`issuesList`:
+//    no contract fetch, `classify()` every non-2xx. Every interface below carries an index signature
+//    and validates only its CONTAINER shape at runtime (Decision 4) — never an individual field —
+//    because this repo does not depend on `catalyst-cloud` and cannot verify the field list compiles
+//    against the cloud's own view. Decision 5: no doc comment here states which principal class may
+//    call a route; a 401/403 already folds through `classify()` with the server's own reason. ─────
+
+/** `GET /api/v1/work-eligibility?team=` — the dispatcher's own "why is nothing moving" answer.
+ *  ⛔ DOCUMENTED, not compiled — see the section note above. */
+export interface WorkEligibilityReport {
+  readonly team?: string;
+  readonly [key: string]: unknown;
+}
+export type WorkEligibilityResult = { outcome: "ok"; status: 200; report: WorkEligibilityReport } | TenantClientFailure;
+
+/** `GET /api/v1/dispatch-queue/current?team=` — an ENVELOPE (`entries[]`), not a bare array. */
+export interface DispatchQueueEnvelope {
+  readonly entries: readonly Record<string, unknown>[];
+  readonly [key: string]: unknown;
+}
+export type DispatchQueueResult = { outcome: "ok"; status: 200; queue: DispatchQueueEnvelope } | TenantClientFailure;
+
+/** `GET /api/v1/fleet-activity/current` — a bare array of activity rows. */
+export type FleetActivityResult =
+  | { outcome: "ok"; status: 200; rows: readonly Record<string, unknown>[] }
+  | TenantClientFailure;
+
+/** `GET /api/v1/agent-roster/current` — a bare array of roster rows. */
+export type AgentRosterResult =
+  | { outcome: "ok"; status: 200; rows: readonly Record<string, unknown>[] }
+  | TenantClientFailure;
+
+/** `GET /api/v1/lease/attributions?ticket=&phase=` — both params are required (the route 400s when
+ *  either is absent); the body shape is tolerant (object or array). */
+export type LeaseAttributionsResult = { outcome: "ok"; status: 200; body: unknown } | TenantClientFailure;
+
+/** `GET /api/v1/coding-accounts` — an OBJECT carrying an `accounts` array. */
+export interface CodingAccountsReport {
+  readonly accounts: readonly Record<string, unknown>[];
+  readonly [key: string]: unknown;
+}
+export type CodingAccountsResult = { outcome: "ok"; status: 200; report: CodingAccountsReport } | TenantClientFailure;
+
+// ── The query reads — CTC-2132 Phase 4: cycles, search, workflow-stages, changes (NDJSON), snapshot
+//    head. `@catalyst-cloud/read-model` publishes IssueView/PullView/ProjectView/InitiativeView and
+//    NOT CycleView or SearchView (verified against the installed package on 2026-09-18: no
+//    src/cycles.ts, no src/search.ts). Same precedent as `TenantContract`: the SDK carries its own
+//    structural copy, open by Decision 4 (an index signature, no per-field validation). If
+//    `@catalyst-cloud/read-model` ever publishes these views, replace with an `import type`. ───────
+
+/** `GET /api/v1/cycles` — the SDK's own structural copy; see the section note above. */
+export interface CycleRow {
+  readonly id?: string;
+  readonly [key: string]: unknown;
+}
+export type CyclesListResult = { outcome: "ok"; status: 200; rows: readonly CycleRow[] } | TenantClientFailure;
+
+/** `GET /api/v1/search?q=&limit=` — four result buckets, the SDK's own structural copy. */
+export interface SearchParams {
+  q: string;
+  limit?: number;
+}
+export interface SearchResults {
+  readonly issues?: readonly Record<string, unknown>[];
+  readonly pulls?: readonly Record<string, unknown>[];
+  readonly projects?: readonly Record<string, unknown>[];
+  readonly initiatives?: readonly Record<string, unknown>[];
+  readonly [key: string]: unknown;
+}
+export type SearchResult = { outcome: "ok"; status: 200; results: SearchResults } | TenantClientFailure;
+
+/** `GET /api/v1/workflow-stages` — the key-authenticated twin; its shape is never quoted anywhere in
+ *  the pool (Decision 7). Tolerant: accepts `{stages, source?}` OR a bare array, normalizing both. */
+export type WorkflowStagesResult =
+  | { outcome: "ok"; status: 200; stages: readonly Record<string, unknown>[]; source: string | null }
+  | TenantClientFailure;
+
+/** `GET /api/v1/changes?since=` — the NDJSON change feed. */
+export type ChangesStreamResult =
+  | {
+      outcome: "ok";
+      status: 200;
+      head: number | null;
+      rows: AsyncGenerator<Record<string, unknown>>;
+      /**
+       * Release the feed WITHOUT draining it — cancels the response body and stops the idle deadline.
+       * Idempotent, and safe to call after the rows have been read.
+       *
+       * ⛔ A caller that reads `head` and then DISCARDS `rows` must call this (CTC-2132 validate
+       * attempt 14, code-review Finding 3): nothing else runs the generator's cleanup, so the body
+       * would stay uncancelled and its connection referenced. Draining the rows to EOF, or `break`ing
+       * out of the `for await`, already releases both — `close()` is for the caller that never starts.
+       */
+      close: () => Promise<void>;
+    }
+  /** The tenant can no longer replay from `since` — reseed from `snapshot.head()` (or a full
+   *  snapshot) rather than replaying the gap. `head` is the tenant's current head. */
+  | { outcome: "resync"; status: 409; head: number | null; reason: string }
+  | TenantClientFailure;
+export type ChangesListResult =
+  | { outcome: "ok"; status: 200; head: number | null; rows: Record<string, unknown>[] }
+  | Extract<ChangesStreamResult, { outcome: "resync" }>
+  | TenantClientFailure;
+
+/** `GET /api/v1/snapshot?head=1` — the cheap head probe (Decision 7): the shape was inferred from
+ *  prose, not a quoted response body, so the parse is deliberately tolerant of three answer shapes. */
+export type SnapshotHeadResult =
+  | { outcome: "ok"; status: 200; head: number; source: "header" | "body" }
+  | { outcome: "shape"; status: number; reason: string }
+  | TenantClientFailure;
+
+// ── The generic escape hatch — CTC-2132 Phase 5 ─────────────────────────────────────────────────
+
+export interface RawRequest {
+  method?: "GET" | "POST";
+  /** ⛔ An ABSOLUTE PATH under the client's own origin ("/api/v1/…"), never a URL. A value that is
+   *  not one is refused BEFORE the request is built: `new URL(origin + path)` does not throw on
+   *  "@host/x" — it reads the origin as USERINFO and `host` becomes the attacker's, which would send
+   *  this client's bearer credential to that host (reproduced: `new URL("https://cloud.example" +
+   *  "@evil.example/steal")` → host `evil.example`, no throw). CTC-2132. */
+  path: string;
+  query?: Record<string, string | number | undefined>;
+  headers?: Record<string, string>;
+  body?: unknown;
+}
+export type RawRequestResult =
+  | { outcome: "ok"; status: number; json: unknown; headers: Headers }
+  | TenantClientFailure;
+
 // ── The agent proxy — every tenant write, plus the attachments read-back ────────────────────────
 
 /** The routes this client wraps, by the last segment of their contract path. `delegate` (operator
@@ -256,6 +430,24 @@ export const AGENT_ROUTE_NAMES = [
   "attachment", "attachments", "session", "ask", "ask-accept",
   "project-repositories", "project-repositories/remove",
 ] as const satisfies readonly AgentRouteName[];
+
+//   ⏳ DEFERRED TO CTC-2156 — the customer release routes. CTC-2132's M2 addendum asks for typed
+//      `agent.ticketRelease` / `agent.ticketReleaseClass` with the refusal shape. The routes DO NOT
+//      EXIST in the cloud yet (verified 2026-09-18: CTC-2156 has a research doc and a plan and no
+//      implement/validation document anywhere in the thoughts pool), and CTC-2156's own plan states
+//      the dependency runs one way — "CTC-2132: not a dependency". When they ship, both are plain
+//      `callAgentRoute` extensions and need NO new machinery: their bodies already carry a top-level
+//      `outcome`, so `outcomes(...)` works directly and no discriminator synthesis (the
+//      `agent.session` / `projectRepositoryRegister` pattern) is needed.
+//        POST …/ticket-release        {ticket, because, retryUnchanged?, dryRun?}
+//          → {ticket, outcome: "released"|"refused"|"nothing-held", released[], refused[],
+//             evidence, notHeld?, auditId}
+//        POST …/ticket-release-class  {team, class, because, retryUnchanged?, limit?, dryRun?}
+//          → {released[], refused[], truncated}   (capped at 25 tickets per call)
+//      Add both to `AgentRouteName` AND `AGENT_ROUTE_NAMES` (the compile-time lockstep in
+//      test/tenant-client-agent.test.ts will fail if only one is updated), add a fixture row to
+//      test/fixtures/tenant-contract.fixture.json WITHOUT bumping the fixture's own
+//      `contractVersion` (the fixture is route-partial by design, CTC-2562 decision 3).
 
 /** The arms every agent call can end in BEFORE the route answers: the contract could not be served,
  *  or the tenant's contract does not list the route. */
@@ -527,7 +719,9 @@ interface Answer {
   textHead: string;
 }
 
-type Sent = { ok: true; answer: Answer } | { ok: false; failure: Extract<TenantClientFailure, { outcome: "network" }> };
+type Sent =
+  | { ok: true; answer: Answer }
+  | { ok: false; failure: Extract<TenantClientFailure, { outcome: "network" | "unauthorized" }> };
 
 /** The reason string a refusal body carries, under whichever of the three grammars it speaks. */
 function reasonOf(answer: Answer): string {
@@ -598,6 +792,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
   const store = opts.contractCache ?? memoryContractCache();
   const now = opts.now ?? Date.now;
   const origin = normalizeBaseUrl(opts.baseUrl);
+  const auth: AuthStrategy = opts.auth ?? { kind: "token", token: opts.key as string };
 
   function url(path: string, query?: Record<string, string | number | undefined>): string {
     const u = new URL(`${origin}${path}`);
@@ -607,17 +802,34 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     return u.toString();
   }
 
+  /** Async because a `bearer` token rotates (~15 min) and must be resolved FRESH per request — the
+   *  same rule `CatalystReplica.feedHeaders()` follows (src/replica/catalyst-replica.ts:1416). */
+  async function authHeaders(): Promise<Record<string, string>> {
+    if (auth.kind === "token") return { authorization: `Bearer ${auth.token}` };
+    if (auth.kind === "cookie") return {};
+    let token: string;
+    try {
+      token = await auth.getToken();
+    } catch (err) {
+      throw new AuthError(401, `bearer getToken() rejected: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return { authorization: `Bearer ${token}` };
+  }
+
   async function send(
-    method: "GET" | "POST",
+    method: string,
     target: string,
     extraHeaders: Record<string, string>,
     body?: unknown,
   ): Promise<Sent> {
-    const headers: Record<string, string> = {
-      authorization: `Bearer ${opts.key}`,
-      accept: "application/json",
-      ...extraHeaders,
-    };
+    let resolved: Record<string, string>;
+    try {
+      resolved = await authHeaders();
+    } catch (err) {
+      const reason = err instanceof AuthError ? err.message : err instanceof Error ? err.message : String(err);
+      return { ok: false, failure: { outcome: "unauthorized", status: 401, reason, ref: null } };
+    }
+    const headers: Record<string, string> = { ...resolved, accept: "application/json", ...extraHeaders };
     if (body !== undefined) headers["content-type"] = "application/json";
     let res: Response;
     let text: string;
@@ -627,6 +839,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
         headers,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: AbortSignal.timeout(timeoutMs),
+        ...(auth.kind === "cookie" ? { credentials: "include" as const } : {}),
       });
       // ⛔ THE BODY READ IS INSIDE THE TRY (Codex #65 r1, P2). `fetch` resolves once the HEADERS
       // arrive; the stream can still fail, or the deadline fire, while `text()` consumes it — and
@@ -636,6 +849,120 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       return { ok: false, failure: { outcome: "network", reason: `could not reach ${target}: ${reason}` } };
+    }
+    let json: unknown;
+    if (text !== "") {
+      try {
+        json = JSON.parse(text);
+      } catch {
+        json = undefined;
+      }
+    }
+    return { ok: true, answer: { status: res.status, headers: res.headers, json, textHead: text.slice(0, 200) } };
+  }
+
+  /**
+   * An IDLE deadline for the streaming path, NOT the wall-clock one `AbortSignal.timeout()` gives.
+   * ⛔ `AbortSignal.timeout(timeoutMs)` keeps governing the response BODY once the headers have
+   * arrived, so it truncated any `/changes` replay that took longer than `timeoutMs` to drain and
+   * lost every row already read (CTC-2132 validate attempt 1, code-review Finding 2) — which defeats
+   * the whole point of `changes.stream`. The timer is rearmed on every chunk (`iterateNdjson`'s
+   * `onProgress` refund, the same one the replica's snapshot seed uses), so a feed that keeps
+   * delivering never expires while a feed that STALLS for `timeoutMs` still does. `release()` clears
+   * it when the stream ends, normally or not.
+   */
+  function idleDeadline(): { signal: AbortSignal; rearm: () => void; release: () => void } {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const release = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    };
+    const rearm = (): void => {
+      if (controller.signal.aborted) return;
+      release();
+      timer = setTimeout(() => {
+        timer = undefined;
+        controller.abort(new Error(`The operation timed out after ${timeoutMs}ms without progress.`));
+      }, timeoutMs);
+    };
+    rearm();
+    return { signal: controller.signal, rearm, release };
+  }
+
+  interface RawDeadline {
+    /** Refund the idle deadline — call per chunk read off the body. */
+    rearm: () => void;
+    /** Stop the deadline; MUST be called on every exit path once the body is done with. */
+    release: () => void;
+  }
+
+  /** A raw-response sibling of `send()`: resolves auth exactly as `send()` does but hands back the
+   *  `Response` UNREAD, so an NDJSON body can be streamed instead of buffered through `text()`. The
+   *  returned `deadline` is the caller's to drive — see {@link idleDeadline}.
+   *
+   *  ⛔ `signal` IS THE CALLER'S OWN, AND IT REACHES THE FETCH (CTC-2132 validate attempt 14,
+   *  code-review Finding 4). Threading it into `iterateNdjson` alone bounds only the BODY loop, so an
+   *  abort raised before the response HEADERS arrived left the request in flight and uncancelled —
+   *  invisible to a suite that only ever aborts mid-body. It is composed with the idle deadline's
+   *  signal here, so EITHER cancels the request at any point in its life. */
+  async function sendRaw(
+    method: string,
+    target: string,
+    extraHeaders: Record<string, string>,
+    body?: unknown,
+    signal?: AbortSignal,
+  ): Promise<
+    | { ok: true; res: Response; deadline: RawDeadline }
+    | { ok: false; failure: Extract<TenantClientFailure, { outcome: "network" | "unauthorized" }> }
+  > {
+    let resolved: Record<string, string>;
+    try {
+      resolved = await authHeaders();
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return { ok: false, failure: { outcome: "unauthorized", status: 401, reason, ref: null } };
+    }
+    const headers: Record<string, string> = { ...resolved, ...extraHeaders };
+    if (body !== undefined) headers["content-type"] = "application/json";
+    const deadline = idleDeadline();
+    const composed = signal === undefined ? deadline.signal : AbortSignal.any([deadline.signal, signal]);
+    try {
+      const res = await fetchImpl(target, {
+        method,
+        headers,
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        signal: composed,
+        ...(auth.kind === "cookie" ? { credentials: "include" as const } : {}),
+      });
+      deadline.rearm(); // the headers arrived: the deadline now bounds IDLE time on the body, not the whole read
+      return { ok: true, res, deadline };
+    } catch (err) {
+      deadline.release();
+      const reason = err instanceof Error ? err.message : String(err);
+      return { ok: false, failure: { outcome: "network", reason: `could not reach ${target}: ${reason}` } };
+    }
+  }
+
+  /**
+   * Read a `Response` `sendRaw` handed back into the same `Answer` shape `send()` produces — used for
+   * the refusal path of an NDJSON route, whose refusal body IS JSON.
+   *
+   * ⛔ THE BODY READ IS INSIDE THE TRY, for exactly the reason `send()`'s is (CTC-2132 validate
+   * attempt 14, code-review Finding 1). `fetch` resolved when the HEADERS arrived; this stream can
+   * still fault — or the idle deadline fire — while `text()` drains it, and that is a transport
+   * failure to FOLD, never an exception the public call may leak. It leaked: `changes.list()` and
+   * `snapshot.head()` are both documented as never-throwing, and a refusal whose socket reset
+   * mid-body rejected straight out of them. Returns `Sent` so every caller folds this read exactly
+   * as it already folds `send()`'s.
+   */
+  async function answerOf(res: Response, target: string): Promise<Sent> {
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return { ok: false, failure: { outcome: "network", reason: `could not read ${target}: ${reason}` } };
     }
     let json: unknown;
     if (text !== "") {
@@ -686,7 +1013,13 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
       return fromCache(cached);
     };
     const sent = await send("GET", url(CONTRACT_ROUTE), cached?.etag ? { "if-none-match": cached.etag } : {});
-    if (!sent.ok) return unavailable(sent.failure);
+    // CTC-2132 widened `Sent`'s failure arm from `network` to `network | unauthorized` so a bearer
+    // `getToken()` rejection can be returned as a typed arm — which made this line funnel a CREDENTIAL
+    // REFUSAL through the stale-cache tolerance above, so a client whose OAuth refresh had failed was
+    // told `{outcome:"ok",source:"cache"}` (validate attempt 1, code-review Finding 3). A refusal is
+    // not transient; it is returned as itself, exactly as the comment above `unavailable` states and
+    // as the 401/403 answered by the SERVER already is (they fall through to `classify` below).
+    if (!sent.ok) return sent.failure.outcome === "unauthorized" ? sent.failure : unavailable(sent.failure);
     const { answer } = sent;
     if (answer.status === 429 || answer.status >= 500) return unavailable(classify(answer));
 
@@ -846,6 +1179,286 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     return { outcome: "ok", account, slug, name, permissions, principal };
   }
 
+  async function issuesExecution(identifier: string): Promise<TicketExecutionResult> {
+    const sent = await send("GET", url(`/api/v1/issues/${encodeURIComponent(identifier)}/execution`), {});
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    if (answer.status === 404) return { outcome: "not-found", status: 404 };
+    if (answer.status !== 200) return classify(answer);
+    if (!isRecord(answer.json)) {
+      return { outcome: "shape", status: 200, reason: "GET /api/v1/issues/:id/execution did not answer an object" };
+    }
+    return { outcome: "ok", status: 200, report: answer.json as TicketExecutionReport };
+  }
+
+  // ── The diagnosis / telemetry reads ───────────────────────────────────────────────────────────
+
+  /** A literal-path open read whose body is one object. The shape check is the CONTAINER only
+   *  (Decision 4, CTC-2132) — `check` never inspects a field the cloud might rename. */
+  async function objectRead(
+    path: string,
+    query: Record<string, string | number | undefined>,
+    label: string,
+    check: (body: Record<string, unknown>) => boolean = () => true,
+  ): Promise<{ outcome: "ok"; status: 200; body: Record<string, unknown> } | TenantClientFailure> {
+    const sent = await send("GET", url(path, query), {});
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    if (answer.status !== 200) return classify(answer);
+    if (!isRecord(answer.json) || !check(answer.json)) {
+      return { outcome: "shape", status: 200, reason: `${label} did not answer the documented shape` };
+    }
+    return { outcome: "ok", status: 200, body: answer.json };
+  }
+
+  /** A literal-path open read whose body is a bare array. */
+  async function arrayRead(
+    path: string,
+    query: Record<string, string | number | undefined>,
+    label: string,
+  ): Promise<{ outcome: "ok"; status: 200; rows: Record<string, unknown>[] } | TenantClientFailure> {
+    const sent = await send("GET", url(path, query), {});
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    if (answer.status !== 200) return classify(answer);
+    const rows = Array.isArray(answer.json) ? rowsOf<Record<string, unknown>>(answer.json) : null;
+    if (rows === null) return { outcome: "shape", status: 200, reason: `${label} did not answer an array` };
+    return { outcome: "ok", status: 200, rows };
+  }
+
+  async function workEligibility(params: { team?: string } = {}): Promise<WorkEligibilityResult> {
+    const r = await objectRead("/api/v1/work-eligibility", { team: params.team }, "GET /api/v1/work-eligibility");
+    return r.outcome === "ok" ? { outcome: "ok", status: 200, report: r.body as WorkEligibilityReport } : r;
+  }
+
+  async function dispatchQueue(params: { team?: string } = {}): Promise<DispatchQueueResult> {
+    const r = await objectRead(
+      "/api/v1/dispatch-queue/current",
+      { team: params.team },
+      "GET /api/v1/dispatch-queue/current",
+      (body) => Array.isArray(body["entries"]),
+    );
+    return r.outcome === "ok" ? { outcome: "ok", status: 200, queue: r.body as DispatchQueueEnvelope } : r;
+  }
+
+  async function fleetActivity(params: { account?: string } = {}): Promise<FleetActivityResult> {
+    const r = await arrayRead("/api/v1/fleet-activity/current", { account: params.account }, "GET /api/v1/fleet-activity/current");
+    return r.outcome === "ok" ? { outcome: "ok", status: 200, rows: r.rows } : r;
+  }
+
+  async function agentRoster(): Promise<AgentRosterResult> {
+    const r = await arrayRead("/api/v1/agent-roster/current", {}, "GET /api/v1/agent-roster/current");
+    return r.outcome === "ok" ? { outcome: "ok", status: 200, rows: r.rows } : r;
+  }
+
+  async function leaseAttributions(params: { ticket: string; phase: string }): Promise<LeaseAttributionsResult> {
+    const sent = await send("GET", url("/api/v1/lease/attributions", { ticket: params.ticket, phase: params.phase }), {});
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    if (answer.status !== 200) return classify(answer);
+    if (answer.json === undefined) {
+      return { outcome: "shape", status: 200, reason: "GET /api/v1/lease/attributions did not answer JSON" };
+    }
+    return { outcome: "ok", status: 200, body: answer.json };
+  }
+
+  async function codingAccounts(): Promise<CodingAccountsResult> {
+    const r = await objectRead("/api/v1/coding-accounts", {}, "GET /api/v1/coding-accounts", (body) => Array.isArray(body["accounts"]));
+    return r.outcome === "ok" ? { outcome: "ok", status: 200, report: r.body as CodingAccountsReport } : r;
+  }
+
+  // ── The query reads ────────────────────────────────────────────────────────────────────────────
+
+  async function cyclesList(): Promise<CyclesListResult> {
+    const r = await arrayRead("/api/v1/cycles", {}, "GET /api/v1/cycles");
+    return r.outcome === "ok" ? { outcome: "ok", status: 200, rows: r.rows as CycleRow[] } : r;
+  }
+
+  async function search(params: SearchParams): Promise<SearchResult> {
+    const r = await objectRead("/api/v1/search", { q: params.q, limit: params.limit }, "GET /api/v1/search");
+    return r.outcome === "ok" ? { outcome: "ok", status: 200, results: r.body as SearchResults } : r;
+  }
+
+  /** Tolerant (Decision 7): accepts `{stages, source?}` OR a bare array, normalizing both — mirroring
+   *  the bundle's own `fetchWorkflowStates`, which already defends against three shapes. */
+  async function workflowStages(): Promise<WorkflowStagesResult> {
+    const sent = await send("GET", url("/api/v1/workflow-stages"), {});
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    if (answer.status !== 200) return classify(answer);
+    if (Array.isArray(answer.json)) {
+      const rows = rowsOf<Record<string, unknown>>(answer.json);
+      if (rows !== null) return { outcome: "ok", status: 200, stages: rows, source: null };
+    }
+    if (isRecord(answer.json) && Array.isArray(answer.json["stages"])) {
+      const rows = rowsOf<Record<string, unknown>>(answer.json["stages"]);
+      if (rows !== null) {
+        return { outcome: "ok", status: 200, stages: rows, source: stringField(answer.json, "source") };
+      }
+    }
+    return { outcome: "shape", status: 200, reason: "GET /api/v1/workflow-stages did not answer a recognised shape" };
+  }
+
+  /** ⛔ The returned generator MAY THROW mid-iteration — a transport fault after the promise already
+   *  resolved cannot be folded into an already-resolved union. Use {@link changesList} for the
+   *  nothing-throws, buffered alternative. */
+  async function changesStream(params: { since: number | "head"; signal?: AbortSignal }): Promise<ChangesStreamResult> {
+    const target = url("/api/v1/changes", { since: params.since });
+    const sent = await sendRaw("GET", target, { accept: "application/x-ndjson" }, undefined, params.signal);
+    if (!sent.ok) return sent.failure;
+    const { res, deadline } = sent;
+    if (res.status === 409) {
+      // ⛔ RELEASE THE DEADLINE *AFTER* THE REFUSAL BODY, NEVER BEFORE (CTC-2132 validate attempt 14,
+      // code-review Finding 2). The deadline's signal is the ONLY one bounding this read — it is the
+      // signal `sendRaw` handed the fetch — so releasing first left a tenant that sends 409 HEADERS
+      // and then stalls the body wedged with no timeout at all. `send()` does not behave this way:
+      // its own `AbortSignal.timeout` keeps governing its body read.
+      const head = integerHeader(res.headers, HEAD_SEQ_HEADER);
+      const read = await answerOf(res, target).finally(() => deadline.release());
+      if (!read.ok) return read.failure;
+      return { outcome: "resync", status: 409, head, reason: reasonOf(read.answer) };
+    }
+    if (res.status !== 200) {
+      const read = await answerOf(res, target).finally(() => deadline.release());
+      return read.ok ? classify(read.answer) : read.failure;
+    }
+    const head = integerHeader(res.headers, HEAD_SEQ_HEADER);
+    // ⛔ ARM THE IDLE DEADLINE LAZILY, AND HAND BACK A `close()` (CTC-2132 validate attempt 14,
+    // code-review Finding 3). `deadline.release()` lives in `rows()`'s `finally`, which NEVER RUNS for
+    // a caller that awaits this promise, reads `head` and then discards the generator — the shape
+    // `test/tenant-client-changes.test.ts`'s own `since:'head'` case has. That left an armed timer
+    // holding the event loop open for `timeoutMs` and then firing an abort on a controller nobody was
+    // listening to, with `res.body` never cancelled and the connection still referenced. So: nothing
+    // is armed while the stream is UNSTARTED (`rows()` arms on entry and `onProgress` refunds per
+    // chunk thereafter), and a caller that will not drain the feed releases the body through `close()`.
+    deadline.release();
+    let closed = false;
+    const close = async (): Promise<void> => {
+      if (closed) return;
+      closed = true;
+      deadline.release();
+      // Locked once `rows()` holds a reader — `iterateNdjson`'s own `finally` cancels that one.
+      await res.body?.cancel().catch(() => {});
+    };
+    async function* rows(): AsyncGenerator<Record<string, unknown>> {
+      deadline.rearm(); // the idle clock starts at the first READ, not when the headers arrived
+      try {
+        // `onProgress` refunds the idle deadline per chunk, so a long replay is never truncated at
+        // `timeoutMs` (attempt 1, code-review Finding 2); `finally` releases it on every exit — EOF,
+        // caller abort, a `break` out of the for-await, or a throw from the parse below.
+        for await (const line of iterateNdjson(res, {
+          ...(params.signal === undefined ? {} : { signal: params.signal }),
+          onProgress: deadline.rearm,
+        })) {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(line);
+          } catch {
+            throw new Error(`/api/v1/changes emitted a line that is not JSON: ${line.slice(0, 120)}`);
+          }
+          if (!isRecord(parsed)) throw new Error("/api/v1/changes emitted a line that is not an object");
+          yield parsed;
+        }
+      } finally {
+        deadline.release();
+      }
+    }
+    return { outcome: "ok", status: 200, head, rows: rows(), close };
+  }
+
+  async function changesListFn(params: { since: number | "head"; signal?: AbortSignal }): Promise<ChangesListResult> {
+    const sent = await changesStream(params);
+    if (sent.outcome !== "ok") return sent;
+    try {
+      const rows: Record<string, unknown>[] = [];
+      for await (const row of sent.rows) rows.push(row);
+      return { outcome: "ok", status: 200, head: sent.head, rows };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return { outcome: "network", reason: `/api/v1/changes stream faulted mid-body: ${reason}` };
+    } finally {
+      // `rows()`'s own `finally` already ran on every path above; `close()` is idempotent and makes
+      // the buffered caller provably leak-free without it having to know that (Finding 3).
+      await sent.close();
+    }
+  }
+
+  /** The cheap probe (Decision 7) — NEVER falls back to a full snapshot fetch. Reads the head from
+   *  `X-Mirror-Cursor` if present, else a JSON body's `head`/`seq`/`cursor`, else the first NDJSON
+   *  line parsed as JSON. */
+  async function snapshotHead(): Promise<SnapshotHeadResult> {
+    const target = url("/api/v1/snapshot", { head: 1 });
+    const sent = await sendRaw("GET", target, { accept: "application/x-ndjson, application/json" });
+    if (!sent.ok) return sent.failure;
+    const { res, deadline } = sent;
+    try {
+      // ⛔ STATUS FIRST, THEN THE HEADER. `X-Mirror-Cursor` rides REFUSALS too — `changesStream`
+      // above reads the head straight off a 409 — so reading it before the status gate reported a
+      // 403 as `{outcome:"ok",status:200,head:…}` and told a liveness probe the mirror was healthy
+      // while the client was de-authorized (CTC-2132 validate attempt 1, code-review Finding 1).
+      // Past this gate `res.status` IS 200, so the literal below is the status, not an assumption.
+      if (res.status !== 200) {
+        const read = await answerOf(res, target);
+        return read.ok ? classify(read.answer) : read.failure;
+      }
+      const headerHead = integerHeader(res.headers, HEAD_SEQ_HEADER);
+      if (headerHead !== null) {
+        await res.body?.cancel().catch(() => {});
+        return { outcome: "ok", status: 200, head: headerHead, source: "header" };
+      }
+      const contentType = res.headers.get("content-type") ?? "";
+      if (contentType.includes("application/json")) {
+        const read = await answerOf(res, target);
+        if (!read.ok) return read.failure;
+        const answer = read.answer;
+        const fromBody = isRecord(answer.json)
+          ? (numberField(answer.json, "head") ?? numberField(answer.json, "seq") ?? numberField(answer.json, "cursor"))
+          : null;
+        if (fromBody !== null) return { outcome: "ok", status: 200, head: fromBody, source: "body" };
+        return { outcome: "shape", status: 200, reason: "GET /api/v1/snapshot?head=1 did not answer a finite head" };
+      }
+      for await (const line of iterateNdjson(res, { onProgress: deadline.rearm })) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (isRecord(parsed)) {
+          const fromLine = numberField(parsed, "head") ?? numberField(parsed, "seq") ?? numberField(parsed, "cursor");
+          if (fromLine !== null) return { outcome: "ok", status: 200, head: fromLine, source: "body" };
+        }
+        break;
+      }
+      return { outcome: "shape", status: 200, reason: "GET /api/v1/snapshot?head=1 did not answer a finite head" };
+    } catch (err) {
+      // The SAME never-throws contract Finding 1 is about, on this function's OTHER body read: the
+      // NDJSON line scan above streams `res.body`, which can fault (or the deadline fire) exactly as
+      // `answerOf`'s `text()` can. `SnapshotHeadResult` has no throw arm — fold it as `send()` would.
+      const reason = err instanceof Error ? err.message : String(err);
+      return { outcome: "network", reason: `could not read ${target}: ${reason}` };
+    } finally {
+      deadline.release();
+    }
+  }
+
+  // ── The generic escape hatch ───────────────────────────────────────────────────────────────────
+
+  async function request(req: RawRequest): Promise<RawRequestResult> {
+    if (!req.path.startsWith("/") || req.path.startsWith("//")) {
+      return {
+        outcome: "rejected",
+        status: 0,
+        reason: `request(): path must be an absolute path under the tenant origin, got ${req.path}`,
+      };
+    }
+    const sent = await send(req.method ?? "GET", url(req.path, req.query), req.headers ?? {}, req.body);
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    if (answer.status < 200 || answer.status >= 300) return classify(answer);
+    return { outcome: "ok", status: answer.status, json: answer.json, headers: answer.headers };
+  }
+
   // ── The agent proxy ───────────────────────────────────────────────────────────────────────────
 
   /**
@@ -975,9 +1588,23 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
   return {
     contract,
     me,
-    issues: { list: issuesList, get: issuesGet },
+    request,
+    issues: { list: issuesList, get: issuesGet, execution: issuesExecution },
     pulls: { list: pullsList, get: pullsGet },
     projects: { list: projectsList },
+    cycles: { list: cyclesList },
+    search,
+    workflowStages,
+    changes: { stream: changesStream, list: changesListFn },
+    snapshot: { head: snapshotHead },
+    diagnostics: {
+      workEligibility,
+      dispatchQueue,
+      fleetActivity,
+      agentRoster,
+      leaseAttributions,
+      codingAccounts,
+    },
     agent,
   };
 }
@@ -988,11 +1615,16 @@ export interface TenantClient {
   contract(opts?: ContractOptions): Promise<ContractResult>;
   /** `GET /api/v1/me` — the account this key belongs to. */
   me(): Promise<MeResult>;
+  /** The generic authed-request escape hatch (CTC-2132) — for a route nobody enumerated. `path` MUST
+   *  be an absolute path under this client's own origin; see {@link RawRequest}. */
+  request(req: RawRequest): Promise<RawRequestResult>;
   issues: {
     /** `GET /api/v1/issues` — keyset-paged; follow `nextCursor` until it is `null`. */
     list(params?: IssueListParams): Promise<IssueListResult>;
     /** `GET /api/v1/issues/:identifier`. */
     get(identifier: string): Promise<IssueGetResult>;
+    /** `GET /api/v1/issues/:id/execution` — the ticket's own execution/telemetry report. */
+    execution(identifier: string): Promise<TicketExecutionResult>;
   };
   pulls: {
     list(params?: PullListParams): Promise<PullListResult>;
@@ -1001,6 +1633,35 @@ export interface TenantClient {
   };
   projects: {
     list(params?: ProjectListParams): Promise<ProjectListResult>;
+  };
+  cycles: {
+    /** `GET /api/v1/cycles` — the SDK's own structural row type; see {@link CycleRow}. */
+    list(): Promise<CyclesListResult>;
+  };
+  /** `GET /api/v1/search?q=&limit=`. */
+  search(params: SearchParams): Promise<SearchResult>;
+  /** `GET /api/v1/workflow-stages` — tolerant of a `{stages,source?}` envelope or a bare array. */
+  workflowStages(): Promise<WorkflowStagesResult>;
+  changes: {
+    /** `GET /api/v1/changes?since=` — NDJSON. ⛔ The returned generator MAY THROW mid-iteration; use
+     *  `list` for the nothing-throws, buffered alternative. */
+    stream(params: { since: number | "head"; signal?: AbortSignal }): Promise<ChangesStreamResult>;
+    /** The same feed, buffered — never throws; a mid-stream fault comes back as the `network` arm. */
+    list(params: { since: number | "head"; signal?: AbortSignal }): Promise<ChangesListResult>;
+  };
+  snapshot: {
+    /** `GET /api/v1/snapshot?head=1` — the cheap head probe; never falls back to a full snapshot. */
+    head(): Promise<SnapshotHeadResult>;
+  };
+  /** The diagnosis / telemetry reads (CTC-2132, M2 addendum) — a customer delegate agent's own
+   *  "why is nothing moving" / "what is my fleet doing" answers. */
+  diagnostics: {
+    workEligibility(params?: { team?: string }): Promise<WorkEligibilityResult>;
+    dispatchQueue(params?: { team?: string }): Promise<DispatchQueueResult>;
+    fleetActivity(params?: { account?: string }): Promise<FleetActivityResult>;
+    agentRoster(): Promise<AgentRosterResult>;
+    leaseAttributions(params: { ticket: string; phase: string }): Promise<LeaseAttributionsResult>;
+    codingAccounts(): Promise<CodingAccountsResult>;
   };
   /** The `/api/v1/agent/*` proxy — every tenant write as the app actor, path from `routes[]`. */
   agent: {
