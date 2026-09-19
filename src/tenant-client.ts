@@ -846,14 +846,54 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     return { ok: true, answer: { status: res.status, headers: res.headers, json, textHead: text.slice(0, 200) } };
   }
 
+  /**
+   * An IDLE deadline for the streaming path, NOT the wall-clock one `AbortSignal.timeout()` gives.
+   * ⛔ `AbortSignal.timeout(timeoutMs)` keeps governing the response BODY once the headers have
+   * arrived, so it truncated any `/changes` replay that took longer than `timeoutMs` to drain and
+   * lost every row already read (CTC-2132 validate attempt 1, code-review Finding 2) — which defeats
+   * the whole point of `changes.stream`. The timer is rearmed on every chunk (`iterateNdjson`'s
+   * `onProgress` refund, the same one the replica's snapshot seed uses), so a feed that keeps
+   * delivering never expires while a feed that STALLS for `timeoutMs` still does. `release()` clears
+   * it when the stream ends, normally or not.
+   */
+  function idleDeadline(): { signal: AbortSignal; rearm: () => void; release: () => void } {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const release = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    };
+    const rearm = (): void => {
+      if (controller.signal.aborted) return;
+      release();
+      timer = setTimeout(() => {
+        timer = undefined;
+        controller.abort(new Error(`The operation timed out after ${timeoutMs}ms without progress.`));
+      }, timeoutMs);
+    };
+    rearm();
+    return { signal: controller.signal, rearm, release };
+  }
+
+  interface RawDeadline {
+    /** Refund the idle deadline — call per chunk read off the body. */
+    rearm: () => void;
+    /** Stop the deadline; MUST be called on every exit path once the body is done with. */
+    release: () => void;
+  }
+
   /** A raw-response sibling of `send()`: resolves auth exactly as `send()` does but hands back the
-   *  `Response` UNREAD, so an NDJSON body can be streamed instead of buffered through `text()`. */
+   *  `Response` UNREAD, so an NDJSON body can be streamed instead of buffered through `text()`. The
+   *  returned `deadline` is the caller's to drive — see {@link idleDeadline}. */
   async function sendRaw(
     method: string,
     target: string,
     extraHeaders: Record<string, string>,
     body?: unknown,
-  ): Promise<{ ok: true; res: Response } | { ok: false; failure: Extract<TenantClientFailure, { outcome: "network" | "unauthorized" }> }> {
+  ): Promise<
+    | { ok: true; res: Response; deadline: RawDeadline }
+    | { ok: false; failure: Extract<TenantClientFailure, { outcome: "network" | "unauthorized" }> }
+  > {
     let resolved: Record<string, string>;
     try {
       resolved = await authHeaders();
@@ -863,16 +903,19 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     }
     const headers: Record<string, string> = { ...resolved, ...extraHeaders };
     if (body !== undefined) headers["content-type"] = "application/json";
+    const deadline = idleDeadline();
     try {
       const res = await fetchImpl(target, {
         method,
         headers,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: deadline.signal,
         ...(auth.kind === "cookie" ? { credentials: "include" as const } : {}),
       });
-      return { ok: true, res };
+      deadline.rearm(); // the headers arrived: the deadline now bounds IDLE time on the body, not the whole read
+      return { ok: true, res, deadline };
     } catch (err) {
+      deadline.release();
       const reason = err instanceof Error ? err.message : String(err);
       return { ok: false, failure: { outcome: "network", reason: `could not reach ${target}: ${reason}` } };
     }
@@ -931,7 +974,13 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
       return fromCache(cached);
     };
     const sent = await send("GET", url(CONTRACT_ROUTE), cached?.etag ? { "if-none-match": cached.etag } : {});
-    if (!sent.ok) return unavailable(sent.failure);
+    // CTC-2132 widened `Sent`'s failure arm from `network` to `network | unauthorized` so a bearer
+    // `getToken()` rejection can be returned as a typed arm — which made this line funnel a CREDENTIAL
+    // REFUSAL through the stale-cache tolerance above, so a client whose OAuth refresh had failed was
+    // told `{outcome:"ok",source:"cache"}` (validate attempt 1, code-review Finding 3). A refusal is
+    // not transient; it is returned as itself, exactly as the comment above `unavailable` states and
+    // as the 401/403 answered by the SERVER already is (they fall through to `classify` below).
+    if (!sent.ok) return sent.failure.outcome === "unauthorized" ? sent.failure : unavailable(sent.failure);
     const { answer } = sent;
     if (answer.status === 429 || answer.status >= 500) return unavailable(classify(answer));
 
@@ -1150,7 +1199,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
       "GET /api/v1/dispatch-queue/current",
       (body) => Array.isArray(body["entries"]),
     );
-    return r.outcome === "ok" ? { outcome: "ok", status: 200, queue: r.body as unknown as DispatchQueueEnvelope } : r;
+    return r.outcome === "ok" ? { outcome: "ok", status: 200, queue: r.body as DispatchQueueEnvelope } : r;
   }
 
   async function fleetActivity(params: { account?: string } = {}): Promise<FleetActivityResult> {
@@ -1176,7 +1225,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
 
   async function codingAccounts(): Promise<CodingAccountsResult> {
     const r = await objectRead("/api/v1/coding-accounts", {}, "GET /api/v1/coding-accounts", (body) => Array.isArray(body["accounts"]));
-    return r.outcome === "ok" ? { outcome: "ok", status: 200, report: r.body as unknown as CodingAccountsReport } : r;
+    return r.outcome === "ok" ? { outcome: "ok", status: 200, report: r.body as CodingAccountsReport } : r;
   }
 
   // ── The query reads ────────────────────────────────────────────────────────────────────────────
@@ -1217,23 +1266,37 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
   async function changesStream(params: { since: number | "head"; signal?: AbortSignal }): Promise<ChangesStreamResult> {
     const sent = await sendRaw("GET", url("/api/v1/changes", { since: params.since }), { accept: "application/x-ndjson" });
     if (!sent.ok) return sent.failure;
-    const { res } = sent;
+    const { res, deadline } = sent;
     if (res.status === 409) {
+      deadline.release();
       const answer = await answerOf(res);
       return { outcome: "resync", status: 409, head: integerHeader(res.headers, HEAD_SEQ_HEADER), reason: reasonOf(answer) };
     }
-    if (res.status !== 200) return classify(await answerOf(res));
+    if (res.status !== 200) {
+      deadline.release();
+      return classify(await answerOf(res));
+    }
     const head = integerHeader(res.headers, HEAD_SEQ_HEADER);
     async function* rows(): AsyncGenerator<Record<string, unknown>> {
-      for await (const line of iterateNdjson(res, params.signal === undefined ? undefined : { signal: params.signal })) {
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(line);
-        } catch {
-          throw new Error(`/api/v1/changes emitted a line that is not JSON: ${line.slice(0, 120)}`);
+      try {
+        // `onProgress` refunds the idle deadline per chunk, so a long replay is never truncated at
+        // `timeoutMs` (code-review Finding 2); `finally` releases it on every exit — EOF, caller
+        // abort, a `break` out of the for-await, or a throw from the parse below.
+        for await (const line of iterateNdjson(res, {
+          ...(params.signal === undefined ? {} : { signal: params.signal }),
+          onProgress: deadline.rearm,
+        })) {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(line);
+          } catch {
+            throw new Error(`/api/v1/changes emitted a line that is not JSON: ${line.slice(0, 120)}`);
+          }
+          if (!isRecord(parsed)) throw new Error("/api/v1/changes emitted a line that is not an object");
+          yield parsed;
         }
-        if (!isRecord(parsed)) throw new Error("/api/v1/changes emitted a line that is not an object");
-        yield parsed;
+      } finally {
+        deadline.release();
       }
     }
     return { outcome: "ok", status: 200, head, rows: rows() };
@@ -1258,36 +1321,45 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
   async function snapshotHead(): Promise<SnapshotHeadResult> {
     const sent = await sendRaw("GET", url("/api/v1/snapshot", { head: 1 }), { accept: "application/x-ndjson, application/json" });
     if (!sent.ok) return sent.failure;
-    const { res } = sent;
-    const headerHead = integerHeader(res.headers, HEAD_SEQ_HEADER);
-    if (headerHead !== null) {
-      await res.body?.cancel().catch(() => {});
-      return { outcome: "ok", status: 200, head: headerHead, source: "header" };
-    }
-    if (res.status !== 200) return classify(await answerOf(res));
-    const contentType = res.headers.get("content-type") ?? "";
-    if (contentType.includes("application/json")) {
-      const answer = await answerOf(res);
-      const fromBody = isRecord(answer.json)
-        ? (numberField(answer.json, "head") ?? numberField(answer.json, "seq") ?? numberField(answer.json, "cursor"))
-        : null;
-      if (fromBody !== null) return { outcome: "ok", status: 200, head: fromBody, source: "body" };
+    const { res, deadline } = sent;
+    try {
+      // ⛔ STATUS FIRST, THEN THE HEADER. `X-Mirror-Cursor` rides REFUSALS too — `changesStream`
+      // above reads the head straight off a 409 — so reading it before the status gate reported a
+      // 403 as `{outcome:"ok",status:200,head:…}` and told a liveness probe the mirror was healthy
+      // while the client was de-authorized (CTC-2132 validate attempt 1, code-review Finding 1).
+      // Past this gate `res.status` IS 200, so the literal below is the status, not an assumption.
+      if (res.status !== 200) return classify(await answerOf(res));
+      const headerHead = integerHeader(res.headers, HEAD_SEQ_HEADER);
+      if (headerHead !== null) {
+        await res.body?.cancel().catch(() => {});
+        return { outcome: "ok", status: 200, head: headerHead, source: "header" };
+      }
+      const contentType = res.headers.get("content-type") ?? "";
+      if (contentType.includes("application/json")) {
+        const answer = await answerOf(res);
+        const fromBody = isRecord(answer.json)
+          ? (numberField(answer.json, "head") ?? numberField(answer.json, "seq") ?? numberField(answer.json, "cursor"))
+          : null;
+        if (fromBody !== null) return { outcome: "ok", status: 200, head: fromBody, source: "body" };
+        return { outcome: "shape", status: 200, reason: "GET /api/v1/snapshot?head=1 did not answer a finite head" };
+      }
+      for await (const line of iterateNdjson(res, { onProgress: deadline.rearm })) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (isRecord(parsed)) {
+          const fromLine = numberField(parsed, "head") ?? numberField(parsed, "seq") ?? numberField(parsed, "cursor");
+          if (fromLine !== null) return { outcome: "ok", status: 200, head: fromLine, source: "body" };
+        }
+        break;
+      }
       return { outcome: "shape", status: 200, reason: "GET /api/v1/snapshot?head=1 did not answer a finite head" };
+    } finally {
+      deadline.release();
     }
-    for await (const line of iterateNdjson(res)) {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (isRecord(parsed)) {
-        const fromLine = numberField(parsed, "head") ?? numberField(parsed, "seq") ?? numberField(parsed, "cursor");
-        if (fromLine !== null) return { outcome: "ok", status: 200, head: fromLine, source: "body" };
-      }
-      break;
-    }
-    return { outcome: "shape", status: 200, reason: "GET /api/v1/snapshot?head=1 did not answer a finite head" };
   }
 
   // ── The generic escape hatch ───────────────────────────────────────────────────────────────────

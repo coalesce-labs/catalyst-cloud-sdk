@@ -103,3 +103,71 @@ describe("changes.list", () => {
     expect(r).toMatchObject({ outcome: "resync", head: 50 });
   });
 });
+
+// ⭐ Regression, CTC-2132 validate attempt 1 / code-review Finding 2. `sendRaw` attached
+// `AbortSignal.timeout(timeoutMs)` — a WALL-CLOCK deadline that keeps governing the response BODY
+// after the headers arrive — so any `/changes` replay slower than `timeoutMs` was truncated and lost
+// every row already read, defeating the whole point of `stream()`. The deadline is now an IDLE one,
+// rearmed per chunk via `iterateNdjson`'s `onProgress` (the same refund the replica's snapshot seed
+// uses). The two tests below pin BOTH halves: a feed that keeps delivering must never expire, and a
+// feed that STALLS must still expire — the fix must not have simply removed the deadline.
+//
+// The stand-in below honours `init.signal` on the BODY the way a real transport does; the recording
+// `scriptedFetch` helper ignores it, which is why this defect could land under a green suite.
+function dribbleFetch(rows: string[], gapMs: number, stallAtEnd = false): typeof fetch {
+  const impl = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const signal = init?.signal ?? null;
+    const encoder = new TextEncoder();
+    let i = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(ctrl) {
+        const aborted = (): Error => (signal?.reason instanceof Error ? signal.reason : new Error("aborted"));
+        if (i < rows.length) {
+          await new Promise((r) => setTimeout(r, gapMs));
+          if (signal?.aborted === true) return void ctrl.error(aborted());
+          ctrl.enqueue(encoder.encode(rows[i++]!));
+          return;
+        }
+        if (!stallAtEnd) return void ctrl.close();
+        await new Promise<void>((resolve) => {
+          if (signal === null || signal.aborted) return resolve();
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        ctrl.error(aborted());
+      },
+    });
+    return new Response(stream, { status: 200, headers: { "content-type": "application/x-ndjson", "X-Mirror-Cursor": "12" } });
+  };
+  return impl as typeof fetch;
+}
+
+describe("the /changes deadline is IDLE, not wall-clock", () => {
+  it("⭐ a replay that takes longer than timeoutMs overall — but never stalls — completes in full", async () => {
+    const rows = Array.from({ length: 12 }, (_, n) => `{"seq":${n + 1}}\n`);
+    const c = createTenantClient({
+      key: KEY,
+      baseUrl: BASE,
+      // 12 × 25 ms ≈ 300 ms of feed against a 120 ms deadline: it outlives the WALL CLOCK by 2.5×
+      // while every individual gap sits ~5× inside it.
+      timeoutMs: 120,
+      fetch: dribbleFetch(rows, 25),
+    });
+    const r = await c.changes.list({ since: 0 });
+    expect(r.outcome).toBe("ok");
+    if (r.outcome !== "ok") return;
+    expect(r.rows).toHaveLength(12);
+    expect(r.rows[11]).toEqual({ seq: 12 });
+  });
+
+  it("⭐ a feed that STALLS past timeoutMs still expires — the deadline was rearmed, not removed", async () => {
+    const c = createTenantClient({
+      key: KEY,
+      baseUrl: BASE,
+      timeoutMs: 80,
+      fetch: dribbleFetch(['{"seq":1}\n'], 5, true),
+    });
+    const r = await c.changes.list({ since: 0 });
+    expect(r.outcome).toBe("network");
+    if (r.outcome === "network") expect(r.reason).toContain("without progress");
+  });
+});

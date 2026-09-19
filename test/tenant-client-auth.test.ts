@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import fixture from "./fixtures/tenant-contract.fixture.json";
 import { json, scriptedFetch } from "./helpers/scripted-fetch";
-import { createTenantClient } from "../src/index";
+import { createTenantClient, memoryContractCache } from "../src/index";
 
 const BASE = "https://cloud.example";
 const ME = { account: "acct_1", slug: "acme", name: "Acme", permissions: null, principal: "service" };
@@ -70,6 +70,47 @@ describe("AuthStrategy on the tenant client", () => {
     expect(net.calls).toHaveLength(2);
     expect(net.calls[0]!.headers["authorization"]).toBe("Bearer tok1");
     expect(net.calls[1]!.headers["authorization"]).toBe("Bearer tok2");
+  });
+
+  // ⭐ Regression, CTC-2132 validate attempt 1 / code-review Finding 3. Widening `Sent`'s failure arm
+  // to `network | unauthorized` made `contract()`'s `unavailable(sent.failure)` swallow a CREDENTIAL
+  // REFUSAL into the stale-cache tolerance, so a client whose OAuth refresh had died was answered
+  // `{outcome:"ok",source:"cache"}` — and `contract()` is precisely the probe a credential provider
+  // uses to decide whether to prompt for re-login. The cache covers the server being away, never the
+  // credential having been revoked.
+  it("⭐ a getToken() rejection is `unauthorized` from contract(), NOT a cached-contract `ok`", async () => {
+    const net = scriptedFetch([() => json(200, fixture, { etag: '"abc"', "x-catalyst-contract-version": "1.0.0" })]);
+    const store = memoryContractCache();
+    let live = true;
+    const client = createTenantClient({
+      auth: {
+        kind: "bearer",
+        getToken: async () => {
+          if (!live) throw new Error("refresh token revoked");
+          return "tok1";
+        },
+      },
+      baseUrl: BASE,
+      fetch: net.fetch,
+      contractCache: store,
+    });
+    expect((await client.contract()).outcome).toBe("ok"); // seeds the cache over a live credential
+    live = false;
+    const r = await client.contract({ refresh: true });
+    expect(r.outcome).toBe("unauthorized");
+    if (r.outcome === "unauthorized") expect(r.reason).toContain("refresh token revoked");
+    expect(net.calls).toHaveLength(1); // the refusal never reached the wire
+  });
+
+  it("a transport failure still falls back to the cached contract (the tolerance the refusal must not borrow)", async () => {
+    const net = scriptedFetch([
+      () => json(200, fixture, { etag: '"abc"', "x-catalyst-contract-version": "1.0.0" }),
+      () => new Error("ECONNREFUSED"),
+    ]);
+    const store = memoryContractCache();
+    const client = createTenantClient({ key: "ctc_user_x", baseUrl: BASE, fetch: net.fetch, contractCache: store });
+    expect((await client.contract()).outcome).toBe("ok");
+    expect(await client.contract({ refresh: true })).toMatchObject({ outcome: "ok", source: "cache" });
   });
 });
 

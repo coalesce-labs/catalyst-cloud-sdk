@@ -84,4 +84,26 @@ describe("snapshot.head", () => {
     const { c } = client([() => text(200, "", { "content-type": "application/x-ndjson" })]);
     expect(await c.snapshot.head()).toMatchObject({ outcome: "shape", status: 200 });
   });
+
+  // ⭐ Regression, CTC-2132 validate attempt 1 / code-review Finding 1. The header was read BEFORE
+  // the status gate, so a refusal carrying `X-Mirror-Cursor` — and this API family does attach it to
+  // refusals, see `changes.stream`'s 409 arm — was reported as `{outcome:"ok",status:200}`. The cheap
+  // probe is exactly what a credential provider polls for liveness, so masking a 403 as a healthy
+  // mirror is the worst possible answer here.
+  it("⭐ a 403 carrying X-Mirror-Cursor is the refusal, NOT a healthy head", async () => {
+    const { c } = client([() => json(403, { error: "missing scope", required: "mirror:read" }, { "X-Mirror-Cursor": "900" })]);
+    const r = await c.snapshot.head();
+    expect(r.outcome).toBe("forbidden");
+    if (r.outcome === "forbidden") expect(r.required).toBe("mirror:read");
+  });
+
+  it("⭐ a 401 carrying X-Mirror-Cursor is the refusal, NOT a healthy head", async () => {
+    const { c } = client([() => json(401, { reason: "key revoked" }, { "X-Mirror-Cursor": "900" })]);
+    expect(await c.snapshot.head()).toMatchObject({ outcome: "unauthorized", status: 401 });
+  });
+
+  it("⭐ a 503 carrying X-Mirror-Cursor is the failure, NOT a healthy head", async () => {
+    const { c } = client([() => text(503, "upstream down", { "X-Mirror-Cursor": "900" })]);
+    expect(await c.snapshot.head()).toMatchObject({ outcome: "http", status: 503 });
+  });
 });
