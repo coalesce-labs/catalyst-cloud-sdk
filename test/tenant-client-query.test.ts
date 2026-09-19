@@ -106,4 +106,32 @@ describe("snapshot.head", () => {
     const { c } = client([() => text(503, "upstream down", { "X-Mirror-Cursor": "900" })]);
     expect(await c.snapshot.head()).toMatchObject({ outcome: "http", status: 503 });
   });
+
+  // ⭐ Regression, CTC-2132 validate attempt 14 / code-review Finding 1. `answerOf()` read the
+  // refusal body OUTSIDE any try, so a 500 whose socket reset mid-body rejected straight out of
+  // `snapshot.head()` — the cheap liveness probe, whose whole contract is that it answers with an
+  // arm rather than an exception. The body read is now folded exactly as `send()` folds its own.
+  it("⭐ a refusal body that faults mid-read is the `network` arm, NOT a throw", async () => {
+    const faulting = new ReadableStream<Uint8Array>({
+      start(ctrl) {
+        ctrl.error(new Error("socket reset"));
+      },
+    });
+    const { c } = client([() => new Response(faulting, { status: 500, headers: { "content-type": "application/json" } })]);
+    const r = await c.snapshot.head().catch((err: unknown) => ({ outcome: `THREW:${err instanceof Error ? err.message : String(err)}` }));
+    expect(r.outcome).toBe("network");
+  });
+
+  // ⭐ Same contract, the OTHER body read in the same function: a 200 whose NDJSON body faults while
+  // the head is being looked for must fold too, not throw out of the probe.
+  it("⭐ a 200 NDJSON body that faults mid-read is the `network` arm, NOT a throw", async () => {
+    const faulting = new ReadableStream<Uint8Array>({
+      start(ctrl) {
+        ctrl.error(new Error("socket reset"));
+      },
+    });
+    const { c } = client([() => new Response(faulting, { status: 200, headers: { "content-type": "application/x-ndjson" } })]);
+    const r = await c.snapshot.head().catch((err: unknown) => ({ outcome: `THREW:${err instanceof Error ? err.message : String(err)}` }));
+    expect(r.outcome).toBe("network");
+  });
 });

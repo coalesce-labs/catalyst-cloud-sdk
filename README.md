@@ -260,7 +260,7 @@ The contract cache is in memory per client by default; pass `contractCache: { ge
 | `client.cycles.list()` | `GET /api/v1/cycles`. |
 | `client.search({ q, limit })` | `GET /api/v1/search` — issues/pulls/projects/initiatives buckets. |
 | `client.workflowStages()` | `GET /api/v1/workflow-stages` (key-authenticated twin). |
-| `client.changes.stream({ since, signal })` / `client.changes.list(...)` | `GET /api/v1/changes` — the NDJSON change feed; `stream()`'s generator may throw mid-iteration on a transport fault, `list()` never throws. |
+| `client.changes.stream({ since, signal })` / `client.changes.list(...)` | `GET /api/v1/changes` — the NDJSON change feed; `stream()`'s generator may throw mid-iteration on a transport fault, `list()` never throws. `stream()`'s ok arm also carries `close()`: a caller that reads `head` and does not drain `rows` must call it to release the body. |
 | `client.snapshot.head()` | `GET /api/v1/snapshot?head=1` — the cheap head probe; never falls back to a full snapshot. |
 | `client.request({ method, path, query, headers, body })` | The generic authed-request escape hatch for a route nobody enumerated. **`path` must be an absolute path under the client's own origin** (e.g. `"/api/v1/…"`), never a URL — a value that escapes it is refused before anything is sent. |
 

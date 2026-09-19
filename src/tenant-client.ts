@@ -354,7 +354,22 @@ export type WorkflowStagesResult =
 
 /** `GET /api/v1/changes?since=` — the NDJSON change feed. */
 export type ChangesStreamResult =
-  | { outcome: "ok"; status: 200; head: number | null; rows: AsyncGenerator<Record<string, unknown>> }
+  | {
+      outcome: "ok";
+      status: 200;
+      head: number | null;
+      rows: AsyncGenerator<Record<string, unknown>>;
+      /**
+       * Release the feed WITHOUT draining it — cancels the response body and stops the idle deadline.
+       * Idempotent, and safe to call after the rows have been read.
+       *
+       * ⛔ A caller that reads `head` and then DISCARDS `rows` must call this (CTC-2132 validate
+       * attempt 14, code-review Finding 3): nothing else runs the generator's cleanup, so the body
+       * would stay uncancelled and its connection referenced. Draining the rows to EOF, or `break`ing
+       * out of the `for await`, already releases both — `close()` is for the caller that never starts.
+       */
+      close: () => Promise<void>;
+    }
   /** The tenant can no longer replay from `since` — reseed from `snapshot.head()` (or a full
    *  snapshot) rather than replaying the gap. `head` is the tenant's current head. */
   | { outcome: "resync"; status: 409; head: number | null; reason: string }
@@ -884,12 +899,19 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
 
   /** A raw-response sibling of `send()`: resolves auth exactly as `send()` does but hands back the
    *  `Response` UNREAD, so an NDJSON body can be streamed instead of buffered through `text()`. The
-   *  returned `deadline` is the caller's to drive — see {@link idleDeadline}. */
+   *  returned `deadline` is the caller's to drive — see {@link idleDeadline}.
+   *
+   *  ⛔ `signal` IS THE CALLER'S OWN, AND IT REACHES THE FETCH (CTC-2132 validate attempt 14,
+   *  code-review Finding 4). Threading it into `iterateNdjson` alone bounds only the BODY loop, so an
+   *  abort raised before the response HEADERS arrived left the request in flight and uncancelled —
+   *  invisible to a suite that only ever aborts mid-body. It is composed with the idle deadline's
+   *  signal here, so EITHER cancels the request at any point in its life. */
   async function sendRaw(
     method: string,
     target: string,
     extraHeaders: Record<string, string>,
     body?: unknown,
+    signal?: AbortSignal,
   ): Promise<
     | { ok: true; res: Response; deadline: RawDeadline }
     | { ok: false; failure: Extract<TenantClientFailure, { outcome: "network" | "unauthorized" }> }
@@ -904,12 +926,13 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     const headers: Record<string, string> = { ...resolved, ...extraHeaders };
     if (body !== undefined) headers["content-type"] = "application/json";
     const deadline = idleDeadline();
+    const composed = signal === undefined ? deadline.signal : AbortSignal.any([deadline.signal, signal]);
     try {
       const res = await fetchImpl(target, {
         method,
         headers,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        signal: deadline.signal,
+        signal: composed,
         ...(auth.kind === "cookie" ? { credentials: "include" as const } : {}),
       });
       deadline.rearm(); // the headers arrived: the deadline now bounds IDLE time on the body, not the whole read
@@ -921,10 +944,26 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     }
   }
 
-  /** Read a `Response` `sendRaw` handed back into the same `Answer` shape `send()` produces — used
-   *  for the refusal path of an NDJSON route, whose refusal body IS JSON. */
-  async function answerOf(res: Response): Promise<Answer> {
-    const text = await res.text();
+  /**
+   * Read a `Response` `sendRaw` handed back into the same `Answer` shape `send()` produces — used for
+   * the refusal path of an NDJSON route, whose refusal body IS JSON.
+   *
+   * ⛔ THE BODY READ IS INSIDE THE TRY, for exactly the reason `send()`'s is (CTC-2132 validate
+   * attempt 14, code-review Finding 1). `fetch` resolved when the HEADERS arrived; this stream can
+   * still fault — or the idle deadline fire — while `text()` drains it, and that is a transport
+   * failure to FOLD, never an exception the public call may leak. It leaked: `changes.list()` and
+   * `snapshot.head()` are both documented as never-throwing, and a refusal whose socket reset
+   * mid-body rejected straight out of them. Returns `Sent` so every caller folds this read exactly
+   * as it already folds `send()`'s.
+   */
+  async function answerOf(res: Response, target: string): Promise<Sent> {
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return { ok: false, failure: { outcome: "network", reason: `could not read ${target}: ${reason}` } };
+    }
     let json: unknown;
     if (text !== "") {
       try {
@@ -933,7 +972,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
         json = undefined;
       }
     }
-    return { status: res.status, headers: res.headers, json, textHead: text.slice(0, 200) };
+    return { ok: true, answer: { status: res.status, headers: res.headers, json, textHead: text.slice(0, 200) } };
   }
 
   // ── contract() ────────────────────────────────────────────────────────────────────────────────
@@ -1264,24 +1303,49 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
    *  resolved cannot be folded into an already-resolved union. Use {@link changesList} for the
    *  nothing-throws, buffered alternative. */
   async function changesStream(params: { since: number | "head"; signal?: AbortSignal }): Promise<ChangesStreamResult> {
-    const sent = await sendRaw("GET", url("/api/v1/changes", { since: params.since }), { accept: "application/x-ndjson" });
+    const target = url("/api/v1/changes", { since: params.since });
+    const sent = await sendRaw("GET", target, { accept: "application/x-ndjson" }, undefined, params.signal);
     if (!sent.ok) return sent.failure;
     const { res, deadline } = sent;
     if (res.status === 409) {
-      deadline.release();
-      const answer = await answerOf(res);
-      return { outcome: "resync", status: 409, head: integerHeader(res.headers, HEAD_SEQ_HEADER), reason: reasonOf(answer) };
+      // ⛔ RELEASE THE DEADLINE *AFTER* THE REFUSAL BODY, NEVER BEFORE (CTC-2132 validate attempt 14,
+      // code-review Finding 2). The deadline's signal is the ONLY one bounding this read — it is the
+      // signal `sendRaw` handed the fetch — so releasing first left a tenant that sends 409 HEADERS
+      // and then stalls the body wedged with no timeout at all. `send()` does not behave this way:
+      // its own `AbortSignal.timeout` keeps governing its body read.
+      const head = integerHeader(res.headers, HEAD_SEQ_HEADER);
+      const read = await answerOf(res, target).finally(() => deadline.release());
+      if (!read.ok) return read.failure;
+      return { outcome: "resync", status: 409, head, reason: reasonOf(read.answer) };
     }
     if (res.status !== 200) {
-      deadline.release();
-      return classify(await answerOf(res));
+      const read = await answerOf(res, target).finally(() => deadline.release());
+      return read.ok ? classify(read.answer) : read.failure;
     }
     const head = integerHeader(res.headers, HEAD_SEQ_HEADER);
+    // ⛔ ARM THE IDLE DEADLINE LAZILY, AND HAND BACK A `close()` (CTC-2132 validate attempt 14,
+    // code-review Finding 3). `deadline.release()` lives in `rows()`'s `finally`, which NEVER RUNS for
+    // a caller that awaits this promise, reads `head` and then discards the generator — the shape
+    // `test/tenant-client-changes.test.ts`'s own `since:'head'` case has. That left an armed timer
+    // holding the event loop open for `timeoutMs` and then firing an abort on a controller nobody was
+    // listening to, with `res.body` never cancelled and the connection still referenced. So: nothing
+    // is armed while the stream is UNSTARTED (`rows()` arms on entry and `onProgress` refunds per
+    // chunk thereafter), and a caller that will not drain the feed releases the body through `close()`.
+    deadline.release();
+    let closed = false;
+    const close = async (): Promise<void> => {
+      if (closed) return;
+      closed = true;
+      deadline.release();
+      // Locked once `rows()` holds a reader — `iterateNdjson`'s own `finally` cancels that one.
+      await res.body?.cancel().catch(() => {});
+    };
     async function* rows(): AsyncGenerator<Record<string, unknown>> {
+      deadline.rearm(); // the idle clock starts at the first READ, not when the headers arrived
       try {
         // `onProgress` refunds the idle deadline per chunk, so a long replay is never truncated at
-        // `timeoutMs` (code-review Finding 2); `finally` releases it on every exit — EOF, caller
-        // abort, a `break` out of the for-await, or a throw from the parse below.
+        // `timeoutMs` (attempt 1, code-review Finding 2); `finally` releases it on every exit — EOF,
+        // caller abort, a `break` out of the for-await, or a throw from the parse below.
         for await (const line of iterateNdjson(res, {
           ...(params.signal === undefined ? {} : { signal: params.signal }),
           onProgress: deadline.rearm,
@@ -1299,7 +1363,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
         deadline.release();
       }
     }
-    return { outcome: "ok", status: 200, head, rows: rows() };
+    return { outcome: "ok", status: 200, head, rows: rows(), close };
   }
 
   async function changesListFn(params: { since: number | "head"; signal?: AbortSignal }): Promise<ChangesListResult> {
@@ -1312,6 +1376,10 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       return { outcome: "network", reason: `/api/v1/changes stream faulted mid-body: ${reason}` };
+    } finally {
+      // `rows()`'s own `finally` already ran on every path above; `close()` is idempotent and makes
+      // the buffered caller provably leak-free without it having to know that (Finding 3).
+      await sent.close();
     }
   }
 
@@ -1319,7 +1387,8 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
    *  `X-Mirror-Cursor` if present, else a JSON body's `head`/`seq`/`cursor`, else the first NDJSON
    *  line parsed as JSON. */
   async function snapshotHead(): Promise<SnapshotHeadResult> {
-    const sent = await sendRaw("GET", url("/api/v1/snapshot", { head: 1 }), { accept: "application/x-ndjson, application/json" });
+    const target = url("/api/v1/snapshot", { head: 1 });
+    const sent = await sendRaw("GET", target, { accept: "application/x-ndjson, application/json" });
     if (!sent.ok) return sent.failure;
     const { res, deadline } = sent;
     try {
@@ -1328,7 +1397,10 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
       // 403 as `{outcome:"ok",status:200,head:…}` and told a liveness probe the mirror was healthy
       // while the client was de-authorized (CTC-2132 validate attempt 1, code-review Finding 1).
       // Past this gate `res.status` IS 200, so the literal below is the status, not an assumption.
-      if (res.status !== 200) return classify(await answerOf(res));
+      if (res.status !== 200) {
+        const read = await answerOf(res, target);
+        return read.ok ? classify(read.answer) : read.failure;
+      }
       const headerHead = integerHeader(res.headers, HEAD_SEQ_HEADER);
       if (headerHead !== null) {
         await res.body?.cancel().catch(() => {});
@@ -1336,7 +1408,9 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
       }
       const contentType = res.headers.get("content-type") ?? "";
       if (contentType.includes("application/json")) {
-        const answer = await answerOf(res);
+        const read = await answerOf(res, target);
+        if (!read.ok) return read.failure;
+        const answer = read.answer;
         const fromBody = isRecord(answer.json)
           ? (numberField(answer.json, "head") ?? numberField(answer.json, "seq") ?? numberField(answer.json, "cursor"))
           : null;
@@ -1357,6 +1431,12 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
         break;
       }
       return { outcome: "shape", status: 200, reason: "GET /api/v1/snapshot?head=1 did not answer a finite head" };
+    } catch (err) {
+      // The SAME never-throws contract Finding 1 is about, on this function's OTHER body read: the
+      // NDJSON line scan above streams `res.body`, which can fault (or the deadline fire) exactly as
+      // `answerOf`'s `text()` can. `SnapshotHeadResult` has no throw arm — fold it as `send()` would.
+      const reason = err instanceof Error ? err.message : String(err);
+      return { outcome: "network", reason: `could not read ${target}: ${reason}` };
     } finally {
       deadline.release();
     }

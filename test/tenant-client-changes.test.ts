@@ -47,8 +47,11 @@ describe("changes.stream", () => {
 
   it("since:'head' is sent verbatim, not coerced to a number", async () => {
     const { net, c } = client([() => text(200, "", { "content-type": "application/x-ndjson" })]);
-    await c.changes.stream({ since: "head" });
+    const r = await c.changes.stream({ since: "head" });
     expect(new URL(net.calls[0]!.url).searchParams.get("since")).toBe("head");
+    // This test asserts only the wire shape and never iterates — the exact abandonment shape
+    // Finding 3 is about. `close()` is how such a caller releases the body it did not read.
+    if (r.outcome === "ok") await r.close();
   });
 
   it("an abort signal stops the stream", async () => {
@@ -169,5 +172,177 @@ describe("the /changes deadline is IDLE, not wall-clock", () => {
     const r = await c.changes.list({ since: 0 });
     expect(r.outcome).toBe("network");
     if (r.outcome === "network") expect(r.reason).toContain("without progress");
+  });
+});
+
+// ⭐ Regression, CTC-2132 validate attempt 14 / code-review Findings 1–4. All four defects lived in
+// the `sendRaw()` + `answerOf()` + `idleDeadline()` hand-back, and they shared one root cause:
+// handing the caller a raw `Response` plus a manually-driven deadline moved three responsibilities
+// `send()` had discharged itself — body-read error handling, deadline LIFETIME, and signal
+// propagation — onto callers that discharged them only partly.
+//
+// ⛔ The recording `scriptedFetch` helper IGNORES `init.signal`, which is precisely why three of the
+// four landed under a green suite. Every stand-in below honours the signal the way a real transport
+// does: it is the signal-awareness, not the assertion, that makes these tests bite.
+
+/** A response whose body faults the moment it is read — a refusal whose socket resets mid-body. */
+function faultingBody(status: number, headers: Record<string, string> = {}): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(ctrl) {
+      ctrl.error(new Error("socket reset mid-refusal-body"));
+    },
+  });
+  return new Response(stream, { status, headers: { "content-type": "application/json", ...headers } });
+}
+
+/** Headers arrive with `status`; the body then STALLS until the signal aborts. */
+function stalledBody(status: number, headers: Record<string, string> = {}): typeof fetch {
+  const impl = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const signal = init?.signal ?? null;
+    const aborted = (): Error => (signal?.reason instanceof Error ? signal.reason : new Error("aborted"));
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(ctrl) {
+        await new Promise<void>((resolve) => {
+          if (signal === null || signal.aborted) return resolve();
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        ctrl.error(aborted());
+      },
+    });
+    return new Response(stream, { status, headers: { "content-type": "application/json", ...headers } });
+  };
+  return impl as typeof fetch;
+}
+
+/** An NDJSON 200 whose body honours the fetch signal — an abort ERRORS the stream, as a socket does. */
+function signalAwareNdjson(rows: string[], headers: Record<string, string> = {}): { fetch: typeof fetch; cancelled: () => boolean } {
+  let cancelled = false;
+  const impl = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const signal = init?.signal ?? null;
+    const encoder = new TextEncoder();
+    let i = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(ctrl) {
+        if (signal?.aborted === true) {
+          ctrl.error(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+          return;
+        }
+        if (i < rows.length) {
+          ctrl.enqueue(encoder.encode(rows[i++]!));
+          return;
+        }
+        ctrl.close();
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { "content-type": "application/x-ndjson", "X-Mirror-Cursor": "7", ...headers },
+    });
+  };
+  return { fetch: impl as typeof fetch, cancelled: () => cancelled };
+}
+
+/** A transport whose headers NEVER arrive: it settles only when the signal it was handed aborts. */
+function neverAnswering(): { fetch: typeof fetch; signals: (AbortSignal | null)[] } {
+  const signals: (AbortSignal | null)[] = [];
+  const impl = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const signal = init?.signal ?? null;
+    signals.push(signal);
+    return await new Promise<Response>((_resolve, reject) => {
+      const fail = (): void => reject(signal?.reason instanceof Error ? signal.reason : new Error("aborted"));
+      if (signal === null) return;
+      if (signal.aborted) return fail();
+      signal.addEventListener("abort", fail, { once: true });
+    });
+  };
+  return { fetch: impl as typeof fetch, signals };
+}
+
+/** Race a call against a wall clock: `"HUNG"` means it never settled, which is the defect's shape. */
+async function outcomeOrHang(call: Promise<{ outcome: string }>, ms = 1_200): Promise<string> {
+  return await Promise.race([
+    call.then(
+      (r) => r.outcome,
+      (err: unknown) => `THREW:${err instanceof Error ? err.message : String(err)}`,
+    ),
+    new Promise<string>((resolve) => setTimeout(() => resolve("HUNG"), ms)),
+  ]);
+}
+
+describe("the /changes + /snapshot refusal path never throws (Finding 1)", () => {
+  it("⭐ a refusal body that faults mid-read is changes.list's `network` arm, NOT a throw", async () => {
+    const { c } = client([() => faultingBody(403)]);
+    expect(await outcomeOrHang(c.changes.list({ since: 1 }))).toBe("network");
+  });
+
+  it("⭐ a refusal body that faults mid-read is changes.stream's `network` arm, NOT a throw", async () => {
+    const { c } = client([() => faultingBody(500)]);
+    expect(await outcomeOrHang(c.changes.stream({ since: 1 }))).toBe("network");
+  });
+
+  it("⭐ a 409 whose body faults is the `network` arm — the resync reason is read, not assumed", async () => {
+    const { c } = client([() => faultingBody(409, { "X-Mirror-Cursor": "900" })]);
+    expect(await outcomeOrHang(c.changes.stream({ since: 1 }))).toBe("network");
+  });
+});
+
+describe("the refusal body is read UNDER the idle deadline (Finding 2)", () => {
+  it("⭐ a 409 whose refusal body stalls expires on the deadline instead of wedging forever", async () => {
+    const c = createTenantClient({ key: KEY, baseUrl: BASE, timeoutMs: 80, fetch: stalledBody(409, { "X-Mirror-Cursor": "900" }) });
+    expect(await outcomeOrHang(c.changes.stream({ since: 1 }))).toBe("network");
+  });
+
+  it("⭐ a 503 whose refusal body stalls expires on the deadline too", async () => {
+    const c = createTenantClient({ key: KEY, baseUrl: BASE, timeoutMs: 80, fetch: stalledBody(503) });
+    expect(await outcomeOrHang(c.changes.list({ since: 1 }))).toBe("network");
+  });
+});
+
+describe("an un-iterated stream is released, not leaked (Finding 3)", () => {
+  it("⭐ close() cancels the body of a stream whose rows are never iterated", async () => {
+    const net = signalAwareNdjson(['{"seq":1}\n']);
+    const c = createTenantClient({ key: KEY, baseUrl: BASE, timeoutMs: 60, fetch: net.fetch });
+    const r = await c.changes.stream({ since: 0 });
+    if (r.outcome !== "ok") throw new Error(`expected ok, got ${r.outcome}`);
+    expect(r.head).toBe(7);
+    expect(net.cancelled()).toBe(false);
+    await r.close();
+    expect(net.cancelled()).toBe(true);
+    await r.close(); // idempotent: a second release is not an error
+  });
+
+  it("⭐ the idle deadline starts at the first READ, so a caller slow to iterate is not aborted", async () => {
+    const net = signalAwareNdjson(['{"seq":1}\n', '{"seq":2}\n']);
+    const c = createTenantClient({ key: KEY, baseUrl: BASE, timeoutMs: 50, fetch: net.fetch });
+    const r = await c.changes.stream({ since: 0 });
+    if (r.outcome !== "ok") throw new Error(`expected ok, got ${r.outcome}`);
+    // 3× the deadline with no read at all: an eagerly-armed timer aborts the fetch here.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const got: unknown[] = [];
+    for await (const row of r.rows) got.push(row);
+    expect(got).toEqual([{ seq: 1 }, { seq: 2 }]);
+  });
+});
+
+describe("the caller's signal reaches the fetch (Finding 4)", () => {
+  it("⭐ an abort raised BEFORE the headers arrive cancels the in-flight request", async () => {
+    const controller = new AbortController();
+    const net = neverAnswering();
+    // A deadline far beyond the race: only the CALLER's signal can settle this call.
+    const c = createTenantClient({ key: KEY, baseUrl: BASE, timeoutMs: 30_000, fetch: net.fetch });
+    const pending = c.changes.stream({ since: 0, signal: controller.signal });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort(new Error("caller went away"));
+    expect(await outcomeOrHang(pending)).toBe("network");
+    expect(net.signals[0]?.aborted).toBe(true);
+  });
+
+  it("⭐ a signal already aborted before the call never leaves a request in flight", async () => {
+    const net = neverAnswering();
+    const c = createTenantClient({ key: KEY, baseUrl: BASE, timeoutMs: 30_000, fetch: net.fetch });
+    expect(await outcomeOrHang(c.changes.stream({ since: 0, signal: AbortSignal.abort() }))).toBe("network");
   });
 });

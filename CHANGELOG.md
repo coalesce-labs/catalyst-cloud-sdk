@@ -18,5 +18,9 @@ perform.
 Not included: typed `agent.ticketRelease`/`agent.ticketReleaseClass` (CTC-2156) — that cloud route
 does not exist yet; see the deferral comment in `src/tenant-client.ts` next to `AGENT_ROUTE_NAMES`.
 
+`changes.stream()`'s success arm carries a `close()` alongside `rows`, for the caller that reads
+`head` and never iterates: it cancels the response body and stops the idle deadline. Draining the rows
+or `break`ing out of the `for await` already releases both.
+
 Non-breaking: every existing `createTenantClient({ key, baseUrl })` caller keeps working with
 identical wire behaviour.
