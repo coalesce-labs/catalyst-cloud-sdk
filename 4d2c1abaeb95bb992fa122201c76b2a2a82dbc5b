@@ -1,1 +1,6 @@
-Prepare additive SDK 0.12.0 release candidate and clarify the general public-release approval boundary; no publication performed.
+Revision history for #87:
+
+rev 2 (content) 2026-09-23 23:33 UTC — Prepare additive SDK 0.12.0 release candidate and clarify the general public-release approval boundary; no publication performed.
+rev 1 (initial) 2026-09-23 23:33 UTC
+
+<!-- mergify-revision-data: {"schema_version":1,"pull_number":87,"entries":[{"number":1,"change_type":"initial","old_sha":null,"new_sha":"b51bedf8f48331e3f43f14540d69e7c25d47233e","timestamp_iso":"2026-09-23T23:33:42Z","reason":"","replay_sha":null,"compare_url":null},{"number":2,"change_type":"content","old_sha":"b51bedf8f48331e3f43f14540d69e7c25d47233e","new_sha":"4d2c1abaeb95bb992fa122201c76b2a2a82dbc5b","timestamp_iso":"2026-09-23T23:33:42Z","reason":"Prepare additive SDK 0.12.0 release candidate and clarify the general public-release approval boundary; no publication performed.","replay_sha":null,"compare_url":"https://github.com/coalesce-labs/catalyst-cloud-sdk/compare/b51bedf8f48331e3f43f14540d69e7c25d47233e...4d2c1abaeb95bb992fa122201c76b2a2a82dbc5b"}]} -->
