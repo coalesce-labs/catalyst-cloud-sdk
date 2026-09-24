@@ -116,6 +116,24 @@
       "path": "/api/v1/agent/project-repositories/remove",
       "takesWriteBudgetUnit": false,
       "since": "1.11.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/portal-servers",
+      "takesWriteBudgetUnit": false,
+      "since": "1.18.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/portal-servers/register",
+      "takesWriteBudgetUnit": false,
+      "since": "1.18.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/portal-servers/remove",
+      "takesWriteBudgetUnit": false,
+      "since": "1.18.0"
     }
   ],
   "teams": [
@@ -315,10 +333,10 @@
       "withOptions": "**How to answer:** reply in this thread with the option letter on its own (`A`), `(A)`, `option A`, or the option's own text pasted back. For an answer that is not on the list, reply `DECIDED: <your answer>`.",
       "withoutOptions": "**How to answer:** reply in this thread with `DECIDED: <your answer>` to record your decision."
     },
-    "optionBulletFormat": "- **A** — <label>",
+    "optionBulletFormat": "- **A** \u2014 <label>",
     "maxLetteredOptions": 26,
     "maxAskGenerations": 25,
-    "example": "**Ask:** Should we adopt approach A or approach B?\n\nContext for the decision goes here.\n\n**Options:**\n- **A** — Option A\n- **B** — Option B\n\n**Default if silent:** Option A\n\n**How to answer:** reply in this thread with the option letter on its own (`A`), `(A)`, `option A`, or the option's own text pasted back. For an answer that is not on the list, reply `DECIDED: <your answer>`."
+    "example": "**Ask:** Should we adopt approach A or approach B?\n\nContext for the decision goes here.\n\n**Options:**\n- **A** \u2014 Option A\n- **B** \u2014 Option B\n\n**Default if silent:** Option A\n\n**How to answer:** reply in this thread with the option letter on its own (`A`), `(A)`, `option A`, or the option's own text pasted back. For an answer that is not on the list, reply `DECIDED: <your answer>`."
   },
   "ladder": {
     "phases": [
@@ -340,14 +358,14 @@
         "result": "ok",
         "fromSlots": null,
         "toSlot": null,
-        "because": "CTC-1530 — intake's board moves (Todo→Intake at claim, Intake→Research on completion) are a PARALLEL mechanism (apps/mirror/src/do/intake-state-move.ts), never this table, for the same reason ADR-0069 gives for remediate: a move this table does not own must not desynchronize fromSlots matching here."
+        "because": "CTC-1530 \u2014 intake's board moves (Todo\u2192Intake at claim, Intake\u2192Research on completion) are a PARALLEL mechanism (apps/mirror/src/do/intake-state-move.ts), never this table, for the same reason ADR-0069 gives for remediate: a move this table does not own must not desynchronize fromSlots matching here."
       },
       {
         "phase": "intake",
         "result": "failed",
         "fromSlots": null,
         "toSlot": null,
-        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+        "because": "a failed phase leaves the ticket retryable at its current stage \u2014 see CTC-955's failure comment"
       },
       {
         "phase": "research",
@@ -363,7 +381,7 @@
         "result": "failed",
         "fromSlots": null,
         "toSlot": null,
-        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+        "because": "a failed phase leaves the ticket retryable at its current stage \u2014 see CTC-955's failure comment"
       },
       {
         "phase": "plan",
@@ -372,14 +390,14 @@
           "research"
         ],
         "toSlot": "plan",
-        "because": "the plan artifact exists — the ticket moves into Plan"
+        "because": "the plan artifact exists \u2014 the ticket moves into Plan"
       },
       {
         "phase": "plan",
         "result": "failed",
         "fromSlots": null,
         "toSlot": null,
-        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+        "because": "a failed phase leaves the ticket retryable at its current stage \u2014 see CTC-955's failure comment"
       },
       {
         "phase": "implement",
@@ -388,14 +406,14 @@
           "plan"
         ],
         "toSlot": "implement",
-        "because": "implementation commits landed — the ticket moves into Implement"
+        "because": "implementation commits landed \u2014 the ticket moves into Implement"
       },
       {
         "phase": "implement",
         "result": "failed",
         "fromSlots": null,
         "toSlot": null,
-        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+        "because": "a failed phase leaves the ticket retryable at its current stage \u2014 see CTC-955's failure comment"
       },
       {
         "phase": "validate",
@@ -411,7 +429,7 @@
         "result": "failed",
         "fromSlots": null,
         "toSlot": null,
-        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+        "because": "a failed phase leaves the ticket retryable at its current stage \u2014 see CTC-955's failure comment"
       },
       {
         "phase": "pr",
@@ -427,21 +445,21 @@
         "result": "failed",
         "fromSlots": null,
         "toSlot": null,
-        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+        "because": "a failed phase leaves the ticket retryable at its current stage \u2014 see CTC-955's failure comment"
       },
       {
         "phase": "remediate",
         "result": "ok",
         "fromSlots": null,
         "toSlot": null,
-        "because": "a remediate round fixes findings and resolves threads on an already-PR'd ticket — it is an interrupt, not a ladder step, and never advances workflow state; only merge moves the ticket past pr"
+        "because": "a remediate round fixes findings and resolves threads on an already-PR'd ticket \u2014 it is an interrupt, not a ladder step, and never advances workflow state; only merge moves the ticket past pr"
       },
       {
         "phase": "remediate",
         "result": "failed",
         "fromSlots": null,
         "toSlot": null,
-        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+        "because": "a failed phase leaves the ticket retryable at its current stage \u2014 see CTC-955's failure comment"
       },
       {
         "phase": "merge",
@@ -450,14 +468,14 @@
           "pr"
         ],
         "toSlot": null,
-        "because": "CTC-1187 — the merge PHASE succeeding means `queue:ready` was applied (apps/runner/src/executors/merge.ts: \"never 'PR merged'\"), not that the PR merged. Mergify can still dequeue it on a red Check (full). The terminal Done write is keyed to the real merge webhook instead — see resolveMergedPrAdvance below and ADR-20260902T031406."
+        "because": "CTC-1187 \u2014 the merge PHASE succeeding means `queue:ready` was applied (apps/runner/src/executors/merge.ts: \"never 'PR merged'\"), not that the PR merged. Mergify can still dequeue it on a red Check (full). The terminal Done write is keyed to the real merge webhook instead \u2014 see resolveMergedPrAdvance below and ADR-20260902T031406."
       },
       {
         "phase": "merge",
         "result": "failed",
         "fromSlots": null,
         "toSlot": null,
-        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+        "because": "a failed phase leaves the ticket retryable at its current stage \u2014 see CTC-955's failure comment"
       }
     ]
   },
@@ -501,7 +519,7 @@
     "cleanPassShapes": [
       {
         "kind": "reaction:+1",
-        "description": "a 👍 reaction from chatgpt-codex-connector[bot], posted at or after the head commit's own timestamp",
+        "description": "a \ud83d\udc4d reaction from chatgpt-codex-connector[bot], posted at or after the head commit's own timestamp",
         "honoured": true,
         "ticket": null
       },

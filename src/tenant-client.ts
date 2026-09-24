@@ -247,7 +247,10 @@ export type AgentRouteName =
   | "ask"
   | "ask-accept"
   | "project-repositories"
-  | "project-repositories/remove";
+  | "project-repositories/remove"
+  | "portal-servers"
+  | "portal-servers/register"
+  | "portal-servers/remove";
 
 /** The runtime twin of {@link AgentRouteName}: the list a test can walk against the contract.
  *  Kept in lockstep with the union by a compile-time equality in test/tenant-client-agent.test.ts. */
@@ -255,6 +258,7 @@ export const AGENT_ROUTE_NAMES = [
   "issue-state", "issue-label", "issue-comment", "issue-create", "reaction",
   "attachment", "attachments", "session", "ask", "ask-accept",
   "project-repositories", "project-repositories/remove",
+  "portal-servers", "portal-servers/register", "portal-servers/remove",
 ] as const satisfies readonly AgentRouteName[];
 
 /** The arms every agent call can end in BEFORE the route answers: the contract could not be served,
@@ -466,10 +470,39 @@ export type ProjectRepositoryRegisterResult =
   | { outcome: "not-found"; status: 404; reason: string }
   | AgentCallFailure;
 export type ProjectRepositoryRemoveResult =
-  /** `removed: false` is idempotent success, not a failure — there was nothing to unlink. */
+/** `removed: false` is idempotent success, not a failure — there was nothing to unlink. */
   | { outcome: "removed"; status: number; removed: boolean }
   | { outcome: "not-found"; status: 404; reason: string }
   | AgentCallFailure;
+
+/** Upstream auth references only account vault names, never credential values. */
+export type PortalServerAuth =
+  | { kind: "none" }
+  | { kind: "bearer"; secretName: string }
+  | { kind: "headers"; headers: { name: string; secretName: string }[] };
+
+export interface PortalServerRegisterInput {
+  name: string;
+  url: string;
+  auth: PortalServerAuth;
+}
+
+export interface PortalServer extends PortalServerRegisterInput {
+  id: string;
+  /** Custom servers stay pending until a server-side account admin approves them. */
+  status: "ready" | "pending" | "pending_egress_guard";
+}
+
+export type PortalServerRegisterResult =
+  | { outcome: "registered"; status: number; server: PortalServer }
+  | AgentCallFailure;
+export type PortalServersResult =
+  | { outcome: "ok"; status: number; servers: PortalServer[] }
+  | AgentCallFailure;
+export type PortalServerRemoveResult =
+  | { outcome: "removed"; status: number; removed: boolean }
+  | AgentCallFailure;
+
 
 // ── Header and param names — the mirror's own strings, each in exactly one place ────────────────
 
@@ -590,6 +623,18 @@ export function normalizeBaseUrl(baseUrl: string): string {
   let end = baseUrl.length;
   while (end > 0 && baseUrl.charCodeAt(end - 1) === 47 /* "/" */) end -= 1;
   return baseUrl.slice(0, end);
+}
+
+function isPortalServer(value: unknown): value is PortalServer {
+  if (!isRecord(value) || typeof value["id"] !== "string" || typeof value["name"] !== "string" ||
+      typeof value["url"] !== "string" || (value["status"] !== "ready" && value["status"] !== "pending" && value["status"] !== "pending_egress_guard")) return false;
+  const auth = value["auth"];
+  if (!isRecord(auth)) return false;
+  if (auth["kind"] === "none") return true;
+  if (auth["kind"] === "bearer") return typeof auth["secretName"] === "string";
+  return auth["kind"] === "headers" && Array.isArray(auth["headers"]) &&
+    auth["headers"].every((header: unknown) => isRecord(header) &&
+      typeof header["name"] === "string" && typeof header["secretName"] === "string");
 }
 
 export function createTenantClient(opts: TenantClientOptions): TenantClient {
@@ -960,6 +1005,30 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
       const r = await callAgentRoute("ask-accept", { ...input }, outcomes("recorded", "refused", "record-failed"));
       return r.ok ? stamped<Extract<AskAcceptResult, { outcome: "recorded" | "refused" | "record-failed" }>>(r.body, r.status) : r.failure;
     },
+    async portalServerRegister(input) {
+      const r = await callAgentRoute("portal-servers/register", { ...input },
+        (body) => body["outcome"] === "registered" && isPortalServer(body["server"]));
+      if (r.ok && (r.status < 200 || r.status >= 300)) {
+        return { outcome: "http", status: r.status, reason: "portal server request failed" };
+      }
+      return r.ok ? stamped<Extract<PortalServerRegisterResult, { outcome: "registered" }>>(r.body, r.status) : r.failure;
+    },
+    async portalServers() {
+      const r = await callAgentRoute("portal-servers", {},
+        (body) => body["outcome"] === "ok" && Array.isArray(body["servers"]) && body["servers"].every(isPortalServer));
+      if (r.ok && (r.status < 200 || r.status >= 300)) {
+        return { outcome: "http", status: r.status, reason: "portal server request failed" };
+      }
+      return r.ok ? stamped<Extract<PortalServersResult, { outcome: "ok" }>>(r.body, r.status) : r.failure;
+    },
+    async portalServerRemove(input) {
+      const r = await callAgentRoute("portal-servers/remove", { ...input },
+        (body) => body["outcome"] === "removed" && typeof body["removed"] === "boolean");
+      if (r.ok && (r.status < 200 || r.status >= 300)) {
+        return { outcome: "http", status: r.status, reason: "portal server request failed" };
+      }
+      return r.ok ? stamped<Extract<PortalServerRemoveResult, { outcome: "removed" }>>(r.body, r.status) : r.failure;
+    },
     async projectRepositoryRegister(input) {
       const r = await callAgentRoute("project-repositories", { ...input }, (body) => isRecord(body["registered"]));
       if (!r.ok) return notFound(r) ?? r.failure;
@@ -1015,6 +1084,9 @@ export interface TenantClient {
     session(input: SessionInput): Promise<SessionResult>;
     ask(input: AskInput): Promise<AskResult>;
     askAccept(input: AskAcceptInput): Promise<AskAcceptResult>;
+    portalServerRegister(input: PortalServerRegisterInput): Promise<PortalServerRegisterResult>;
+    portalServers(): Promise<PortalServersResult>;
+    portalServerRemove(input: { name: string }): Promise<PortalServerRemoveResult>;
     projectRepositoryRegister(input: ProjectRepositoryInput): Promise<ProjectRepositoryRegisterResult>;
     projectRepositoryRemove(input: ProjectRepositoryInput): Promise<ProjectRepositoryRemoveResult>;
   };
