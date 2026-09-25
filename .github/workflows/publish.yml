@@ -3,8 +3,11 @@ name: Publish
 # Publishes @catalyst-cloud/sdk to the public npm registry when a GitHub Release is published.
 # Flow: bump "version" in package.json + commit → cut a Release tagged vX.Y.Z → this workflow
 # builds, tests, and `npm publish`es that version. npm rejects re-publishing an existing version,
-# so each release must carry a fresh version. Requires an NPM_TOKEN repo secret (an npm "Automation"
-# token for the @catalyst-cloud org). Provenance is attached (id-token) for a verifiable supply chain.
+# so each release must carry a fresh version. Auth is npm trusted publishing (CTC-3301): npmjs.com
+# trusts this repo's publish.yml, and `npm publish` trades the job's OIDC token for a short-lived
+# publish credential. There is no NPM_TOKEN to expire (the old one did, 90 days after 2026-06-26).
+# A release runs the publish.yml AT THE TAGGED COMMIT, so a tag cut before this file changed still
+# uses the old auth. Provenance is generated automatically.
 
 on:
   release:
@@ -13,7 +16,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # npm provenance
+  id-token: write # npm trusted publishing (OIDC) + provenance
 
 jobs:
   publish:
@@ -28,12 +31,15 @@ jobs:
         with:
           bun-version: latest
 
-      # setup-node wires the npm registry + NODE_AUTH_TOKEN auth for `npm publish`.
-      - name: Set up Node (npm auth)
+      - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing needs npm >= 11.5.1; Node 22 ships npm 10.
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@11 && npm --version
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -46,5 +52,3 @@ jobs:
 
       - name: Publish to npm (public, with provenance)
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
