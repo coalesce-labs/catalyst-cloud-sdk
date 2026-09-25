@@ -75,8 +75,8 @@ export function memoryContractCache(): ContractCacheStore {
 }
 
 export interface TenantClientOptions {
-  /** The tenant key. Reads accept any key with `mirror:read`; every `/api/v1/agent/*` route needs an
-   *  organization-tier key (`ctc_acct_*`) — a workstation key is refused `403 not-machine-principal`. */
+  /** A tenant or personal key. Most agent proxy writes require an organization key; `teamWorkflow`
+   *  and personal connection methods require the caller's own personal key or device login. */
   key: string;
   /** The service origin (e.g. "https://staging.catalystcloud.dev"). A trailing slash is trimmed;
    *  every route path is absolute under it. */
@@ -115,6 +115,126 @@ export type TenantClientFailure =
   | { outcome: "shape"; status: number; reason: string }
   /** Any other non-2xx. */
   | { outcome: "http"; status: number; reason: string };
+
+// Team setup is a personal-admin API. Its named refusals matter to an interactive caller, so this
+// surface retains `error` as well as the shared transport outcome and never retries a stale plan.
+export type TeamWorkflowFailure = TenantClientFailure & { error?: string };
+export type TeamWorkflowResult<T> = ({ outcome: "ok"; status: number } & T) | TeamWorkflowFailure;
+export interface TeamWorkflowReadiness {
+  teamId: string;
+  teamKey: string;
+  teamName: string;
+  status: "ready" | "degraded" | "blocked" | "unchecked";
+  checkedAt?: number;
+  checks: readonly TeamReadinessCheck[];
+  workflowRev: number;
+  [field: string]: unknown;
+}
+export interface TeamReadinessCheck {
+  id: string;
+  state: "pass" | "fail" | "unknown";
+  reason?: string;
+  count?: number;
+}
+export type TeamWorkflowSlot = "dispatch" | "intake" | "research" | "plan" | "implement" | "remediate" | "verify" | "review" | "pr" | "done" | "canceled";
+export interface TeamWorkflowStage { id: string; name: string; type: string; position: number }
+export interface TeamWorkflowRow {
+  slot: TeamWorkflowSlot;
+  linearStateId: string | null;
+  linearStateName?: string;
+  linearStateType?: string;
+  source?: "created" | "matched" | "chosen";
+  stateStillExists?: boolean;
+}
+export interface TeamWorkflowSummary extends TeamWorkflowReadiness {
+  mode: "mapped-existing" | "adopted-recommended" | "mixed" | null;
+  gitAutomation: "off" | "managed";
+  mappedSlots: number;
+  mappedLoadBearingSlots: number;
+  mirrored: boolean | null;
+}
+export interface TeamList {
+  teams: TeamWorkflowSummary[];
+  canManage: boolean;
+  liveTeamRead: { attempted: boolean; error: string | null; reason?: "no-teams-known" | "unnamed-team" };
+  everChecked: boolean;
+  mirrorRead: boolean;
+}
+export interface TeamWorkflowView {
+  config: { teamId: string; mode: "mapped-existing" | "adopted-recommended" | "mixed"; gitAutomation: "off" | "managed"; workflowRev: number };
+  rows: readonly TeamWorkflowRow[];
+  stages: readonly TeamWorkflowStage[];
+  stageSource: "linear" | "mirror" | "none";
+  readiness: TeamWorkflowReadiness;
+  mappingHash: string;
+  checklist: string[] | null;
+}
+/** Save can commit the mapping even when its follow-up readiness recompute is unavailable. */
+export type TeamWorkflowSaveResult = Omit<TeamWorkflowView, "mappingHash" | "checklist" | "readiness"> & {
+  readiness: TeamWorkflowReadiness | null;
+};
+export interface TeamMappingRowInput {
+  slot: TeamWorkflowSlot;
+  linearStateId: string | null;
+  source?: "created" | "matched" | "chosen";
+}
+export interface TeamMappingSaveInput {
+  team: string;
+  expectedMappingHash: string;
+  mode?: "mapped-existing" | "adopted-recommended" | "mixed";
+  gitAutomation?: "off" | "managed";
+  rows: TeamMappingRowInput[];
+}
+export interface TeamMigrationChoice { sourceStateId: string; destinationStateId: string }
+export interface TeamMigrationSource {
+  stateId: string;
+  name: string;
+  type: string;
+  ticketCount: number;
+  destinationStateId: string | null;
+  destinationSlot: TeamWorkflowSlot | null;
+  because: "unique-type" | "terminal-family" | "chosen" | null;
+  outcome: "ready" | "needs-a-choice" | "empty" | "moved" | "partially-moved" | "protected" | "retired-in-catalyst";
+  reason?: string;
+  retiredAt?: number;
+}
+export interface TeamMigrationPlan {
+  teamId: string;
+  sources: readonly TeamMigrationSource[];
+  migrationHash: string;
+  overLimit: boolean;
+  issueCount: number;
+  retireLogReadable: boolean;
+}
+export interface TeamAdoptResult {
+  teamId: string;
+  teamKey: string;
+  mode: "adopted-recommended" | "mapped-existing" | "mixed" | null;
+  stages: readonly { name: string; type: string; outcome: string; stateId?: string; reason?: string }[];
+  planHash: string;
+  unfilledLoadBearing: readonly unknown[];
+  provenanceGaps: readonly unknown[];
+  labels: readonly { name: string; outcome: string; reason?: string }[];
+  labelProvenanceGaps: readonly unknown[];
+  labelsNotCreated: readonly unknown[];
+  checklist?: string[];
+  readiness?: TeamWorkflowReadiness | null;
+}
+export interface TeamUndoPreview { teamId: string; mode: "preview"; candidates: readonly { stateId: string; name: string | null }[]; undoHash: string }
+export interface TeamUndoResult {
+  archived: readonly { stateId: string; name: string | null }[];
+  kept: readonly { stateId: string; name: string | null; reason: string }[];
+  failed: readonly { stateId: string; name: string | null; reason: string }[];
+  readiness: TeamWorkflowReadiness | null;
+}
+export interface TeamMigrationChunk { teamId: string; sources: readonly TeamMigrationSource[]; remaining: number; migrationHash: string; moved: number; readiness: TeamWorkflowReadiness | null }
+export interface TeamMigrationRetire {
+  retired: readonly { stateId: string; name: string }[];
+  kept: readonly { stateId: string; name: string; reason: string }[];
+  failed: readonly { stateId: string; name: string; reason: string }[];
+  logGaps: readonly { stateId: string; reason: string }[];
+  readiness: TeamWorkflowReadiness | null;
+}
 
 // ── The contract ────────────────────────────────────────────────────────────────────────────────
 
@@ -646,6 +766,99 @@ function classify(answer: Answer): TenantClientFailure {
   return { outcome: "http", status, reason };
 }
 
+const SHA256_HEX = /^[a-f0-9]{64}$/;
+// Adopt and migrate use FNV-1a staleness tokens (`hash.toString(36)-count.toString(36)`), not SHA-256.
+// Mapping and undo deliberately use SHA-256; do not conflate the two wire contracts.
+const WORKFLOW_STALENESS_TOKEN = /^[0-9a-z]{1,7}-[0-9a-z]+$/;
+const TEAM_SLOTS = new Set(["dispatch", "intake", "research", "plan", "implement", "remediate", "verify", "review", "pr", "done", "canceled"]);
+function teamStage(value: unknown): value is TeamWorkflowStage {
+  return isRecord(value) && typeof value["id"] === "string" && typeof value["name"] === "string" &&
+    typeof value["type"] === "string" && typeof value["position"] === "number";
+}
+function teamRow(value: unknown): value is TeamWorkflowRow {
+  return isRecord(value) && typeof value["slot"] === "string" && TEAM_SLOTS.has(value["slot"]) &&
+    (value["linearStateId"] === null || typeof value["linearStateId"] === "string") &&
+    (value["linearStateName"] === undefined || typeof value["linearStateName"] === "string") &&
+    (value["linearStateType"] === undefined || typeof value["linearStateType"] === "string") &&
+    (value["stateStillExists"] === undefined || typeof value["stateStillExists"] === "boolean");
+}
+function migrationSource(value: unknown): value is TeamMigrationSource {
+  return isRecord(value) && typeof value["stateId"] === "string" && typeof value["name"] === "string" &&
+    typeof value["type"] === "string" && typeof value["ticketCount"] === "number" &&
+    (value["destinationStateId"] === null || typeof value["destinationStateId"] === "string") &&
+    (value["destinationSlot"] === null || (typeof value["destinationSlot"] === "string" && TEAM_SLOTS.has(value["destinationSlot"]))) &&
+    (value["because"] === null || value["because"] === "unique-type" || value["because"] === "terminal-family" || value["because"] === "chosen") &&
+    (value["outcome"] === "ready" || value["outcome"] === "needs-a-choice" || value["outcome"] === "empty" || value["outcome"] === "moved" || value["outcome"] === "partially-moved" || value["outcome"] === "protected" || value["outcome"] === "retired-in-catalyst");
+}
+function stateResult(value: unknown, reason: boolean, nullableName: boolean): boolean {
+  return isRecord(value) && typeof value["stateId"] === "string" &&
+    (typeof value["name"] === "string" || (nullableName && value["name"] === null)) &&
+    (!reason || typeof value["reason"] === "string");
+}
+function teamReadiness(value: unknown): value is TeamWorkflowReadiness {
+  return isRecord(value) &&
+    typeof value["teamId"] === "string" && typeof value["teamKey"] === "string" && typeof value["teamName"] === "string" &&
+    (value["status"] === "ready" || value["status"] === "degraded" || value["status"] === "blocked" || value["status"] === "unchecked") &&
+    (value["checkedAt"] === undefined || typeof value["checkedAt"] === "number") &&
+    typeof value["workflowRev"] === "number" &&
+    Array.isArray(value["checks"]) && value["checks"].every((check: unknown) => isRecord(check) &&
+      typeof check["id"] === "string" && (check["state"] === "pass" || check["state"] === "fail" || check["state"] === "unknown") &&
+      (check["reason"] === undefined || typeof check["reason"] === "string"));
+}
+
+function teamList(value: unknown): value is TeamList {
+  if (!isRecord(value) || !isRecord(value["liveTeamRead"])) return false;
+  return Array.isArray(value["teams"]) && value["teams"].every((team: unknown) =>
+    teamReadiness(team) && isRecord(team) &&
+    (team["mode"] === null || team["mode"] === "mapped-existing" || team["mode"] === "adopted-recommended" || team["mode"] === "mixed") &&
+    (team["gitAutomation"] === "off" || team["gitAutomation"] === "managed") &&
+    typeof team["mappedSlots"] === "number" && typeof team["mappedLoadBearingSlots"] === "number" &&
+    (team["mirrored"] === null || typeof team["mirrored"] === "boolean")) &&
+    typeof value["canManage"] === "boolean" && typeof value["everChecked"] === "boolean" && typeof value["mirrorRead"] === "boolean" &&
+    typeof value["liveTeamRead"]["attempted"] === "boolean" &&
+    (value["liveTeamRead"]["error"] === null || typeof value["liveTeamRead"]["error"] === "string");
+}
+
+function teamView(value: unknown): value is TeamWorkflowView {
+  if (!isRecord(value) || !isRecord(value["config"])) return false;
+  const config = value["config"];
+  return teamConfig(config) &&
+    Array.isArray(value["rows"]) && value["rows"].every(teamRow) &&
+    Array.isArray(value["stages"]) && value["stages"].every(teamStage) &&
+    (value["stageSource"] === "linear" || value["stageSource"] === "mirror" || value["stageSource"] === "none") &&
+    teamReadiness(value["readiness"]) &&
+    typeof value["mappingHash"] === "string" && SHA256_HEX.test(value["mappingHash"]) &&
+    (value["checklist"] === null || (Array.isArray(value["checklist"]) && value["checklist"].every((line: unknown) => typeof line === "string")));
+}
+
+function teamConfig(config: Record<string, unknown>): boolean {
+  return typeof config["teamId"] === "string" &&
+    (config["mode"] === "mapped-existing" || config["mode"] === "adopted-recommended" || config["mode"] === "mixed") &&
+    (config["gitAutomation"] === "off" || config["gitAutomation"] === "managed") &&
+    typeof config["workflowRev"] === "number";
+}
+
+function teamWriteView(value: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value["config"])) return false;
+  return teamConfig(value["config"]) && Array.isArray(value["rows"]) && value["rows"].every(teamRow) &&
+    Array.isArray(value["stages"]) && value["stages"].every(teamStage) &&
+    (value["stageSource"] === "linear" || value["stageSource"] === "mirror" || value["stageSource"] === "none") &&
+    (value["readiness"] === null || teamReadiness(value["readiness"]));
+}
+
+function teamAdopt(value: unknown, apply: boolean): value is TeamAdoptResult {
+  if (!isRecord(value)) return false;
+  return typeof value["teamId"] === "string" && typeof value["teamKey"] === "string" &&
+    (value["mode"] === null || value["mode"] === "adopted-recommended" || value["mode"] === "mapped-existing" || value["mode"] === "mixed") &&
+    Array.isArray(value["stages"]) && value["stages"].every((stage: unknown) => isRecord(stage) && typeof stage["name"] === "string" && typeof stage["type"] === "string" && typeof stage["outcome"] === "string") &&
+    Array.isArray(value["unfilledLoadBearing"]) &&
+    typeof value["planHash"] === "string" && WORKFLOW_STALENESS_TOKEN.test(value["planHash"]) &&
+    Array.isArray(value["provenanceGaps"]) && Array.isArray(value["labels"]) && value["labels"].every((label: unknown) => isRecord(label) && typeof label["name"] === "string" && typeof label["outcome"] === "string") &&
+    Array.isArray(value["labelProvenanceGaps"]) && Array.isArray(value["labelsNotCreated"]) &&
+    (apply ? (value["readiness"] === null || teamReadiness(value["readiness"]))
+      : Array.isArray(value["checklist"]) && value["checklist"].every((line: unknown) => typeof line === "string"));
+}
+
 /**
  * Trim trailing slashes from the configured origin so route paths (absolute, leading-slash) append
  * cleanly. ⛔ A plain scan, NOT `/\/+$/`: on library input that regex backtracks from every start
@@ -1166,11 +1379,69 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     },
   };
 
+  async function teamCall<T extends object>(method: "GET" | "POST", path: string, body: unknown, guard: (value: unknown) => value is T): Promise<TeamWorkflowResult<T>> {
+    const sent = await send(method, url(path), {}, body);
+    if (!sent.ok) return sent.failure;
+    const answer = sent.answer;
+    const error = isRecord(answer.json) ? stringField(answer.json, "error") : null;
+    if (answer.status < 200 || answer.status >= 300) {
+      const failure = classify(answer);
+      const reason = isRecord(answer.json)
+        ? stringField(answer.json, "reason") ?? stringField(answer.json, "message") ?? error ?? answer.textHead
+        : answer.textHead;
+      // Named 404/409 refusals are actionable in the CLI, not generic HTTP failures.
+      if (error !== null && (answer.status === 404 || answer.status === 409)) {
+        return { outcome: "rejected", status: answer.status, error, reason };
+      }
+      return { ...failure, reason, ...(error === null ? {} : { error }) };
+    }
+    if (!guard(answer.json)) return { outcome: "shape", status: answer.status, reason: "unexpected team workflow response" };
+    return { ...answer.json, outcome: "ok", status: answer.status };
+  }
+
+  function invalidHash(): TeamWorkflowFailure {
+    return { outcome: "rejected", status: 0, error: "invalid-hash", reason: "use the token from the preview" };
+  }
+  const teamPath = "/api/v1/agent/team-workflow";
+  const teamPost = <T extends object>(path: string, body: unknown, guard: (value: unknown) => value is T) => teamCall("POST", path, body, guard);
+  const teamWorkflow: TenantClient["teamWorkflow"] = {
+    teams: () => teamCall("GET", "/api/v1/agent/teams", undefined, teamList),
+    get: (team) => teamCall("GET", `${teamPath}?team=${encodeURIComponent(team)}`, undefined, teamView),
+    check: (team) => teamPost(`${teamPath}/check`, { team },
+      (value): value is { readiness: TeamWorkflowReadiness; ask: Record<string, unknown> } => isRecord(value) && teamReadiness(value["readiness"]) && isRecord(value["ask"]) && typeof value["ask"]["outcome"] === "string"),
+    save: (input) => SHA256_HEX.test(input.expectedMappingHash)
+      ? teamPost(`${teamPath}/save`, input, (value): value is TeamWorkflowSaveResult => teamWriteView(value))
+      : Promise.resolve(invalidHash()),
+    adoptPreview: (team) => teamPost(`${teamPath}/adopt`, { team, mode: "preview" }, (value): value is TeamAdoptResult => teamAdopt(value, false)),
+    adoptApply: (team, planHash) => WORKFLOW_STALENESS_TOKEN.test(planHash)
+      ? teamPost(`${teamPath}/adopt`, { team, mode: "apply", planHash }, (value): value is TeamAdoptResult => teamAdopt(value, true))
+      : Promise.resolve(invalidHash()),
+    undoPreview: (team) => teamPost(`${teamPath}/adopt-undo`, { team, mode: "preview" },
+      (value): value is TeamUndoPreview => isRecord(value) && typeof value["teamId"] === "string" && value["mode"] === "preview" &&
+        Array.isArray(value["candidates"]) && value["candidates"].every((row: unknown) => isRecord(row) && typeof row["stateId"] === "string" && (row["name"] === null || typeof row["name"] === "string")) &&
+        typeof value["undoHash"] === "string" && SHA256_HEX.test(value["undoHash"])),
+    undoApply: (team, undoHash) => SHA256_HEX.test(undoHash)
+      ? teamPost(`${teamPath}/adopt-undo`, { team, mode: "apply", undoHash },
+        (value): value is TeamUndoResult => isRecord(value) && Array.isArray(value["archived"]) && value["archived"].every((row: unknown) => stateResult(row, false, true)) && Array.isArray(value["kept"]) && value["kept"].every((row: unknown) => stateResult(row, true, true)) && Array.isArray(value["failed"]) && value["failed"].every((row: unknown) => stateResult(row, true, true)) && (value["readiness"] === null || teamReadiness(value["readiness"])))
+      : Promise.resolve(invalidHash()),
+    migratePreview: (team, choices = []) => teamPost(`${teamPath}/migrate`, { team, step: "preview", choices },
+      (value): value is { preview: TeamMigrationPlan } => isRecord(value) && isRecord(value["preview"]) && typeof value["preview"]["teamId"] === "string" && Array.isArray(value["preview"]["sources"]) && value["preview"]["sources"].every(migrationSource) && typeof value["preview"]["migrationHash"] === "string" && WORKFLOW_STALENESS_TOKEN.test(value["preview"]["migrationHash"] as string) && typeof value["preview"]["overLimit"] === "boolean" && typeof value["preview"]["issueCount"] === "number" && typeof value["preview"]["retireLogReadable"] === "boolean"),
+    migrateChunk: (team, migrationHash, choices = []) => WORKFLOW_STALENESS_TOKEN.test(migrationHash)
+      ? teamPost(`${teamPath}/migrate`, { team, step: "migrate", migrationHash, choices },
+        (value): value is TeamMigrationChunk => isRecord(value) && typeof value["teamId"] === "string" && Array.isArray(value["sources"]) && value["sources"].every(migrationSource) && typeof value["remaining"] === "number" && typeof value["migrationHash"] === "string" && WORKFLOW_STALENESS_TOKEN.test(value["migrationHash"]) && typeof value["moved"] === "number" && (value["readiness"] === null || teamReadiness(value["readiness"])))
+      : Promise.resolve(invalidHash()),
+    migrateRetire: (team, migrationHash, choices = []) => WORKFLOW_STALENESS_TOKEN.test(migrationHash)
+      ? teamPost(`${teamPath}/migrate`, { team, step: "retire", migrationHash, choices },
+        (value): value is TeamMigrationRetire => isRecord(value) && Array.isArray(value["retired"]) && value["retired"].every((row: unknown) => stateResult(row, false, false)) && Array.isArray(value["kept"]) && value["kept"].every((row: unknown) => stateResult(row, true, false)) && Array.isArray(value["failed"]) && value["failed"].every((row: unknown) => stateResult(row, true, false)) && Array.isArray(value["logGaps"]) && value["logGaps"].every((row: unknown) => isRecord(row) && typeof row["stateId"] === "string" && typeof row["reason"] === "string") && (value["readiness"] === null || teamReadiness(value["readiness"])))
+      : Promise.resolve(invalidHash()),
+  };
+
   return {
     contract,
     me,
     linearIdentity: { get: () => linearIdentityCall(), set: (linearUserId) => linearIdentityCall(linearUserId) },
     personalConnections: { start: personalConnectionStart, status: personalConnectionStatus },
+    teamWorkflow,
     issues: { list: issuesList, get: issuesGet },
     pulls: { list: pullsList, get: pullsGet },
     projects: { list: projectsList },
@@ -1180,6 +1451,20 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
 
 /** The client. See {@link createTenantClient}. */
 export interface TenantClient {
+  /** Personal bearer team setup. The key's tenant and admin role are enforced by the cloud. */
+  teamWorkflow: {
+    teams(): Promise<TeamWorkflowResult<TeamList>>;
+    get(team: string): Promise<TeamWorkflowResult<TeamWorkflowView>>;
+    check(team: string): Promise<TeamWorkflowResult<{ readiness: TeamWorkflowReadiness; ask: Record<string, unknown> }>>;
+    save(input: TeamMappingSaveInput): Promise<TeamWorkflowResult<TeamWorkflowSaveResult>>;
+    adoptPreview(team: string): Promise<TeamWorkflowResult<TeamAdoptResult>>;
+    adoptApply(team: string, planHash: string): Promise<TeamWorkflowResult<TeamAdoptResult>>;
+    undoPreview(team: string): Promise<TeamWorkflowResult<TeamUndoPreview>>;
+    undoApply(team: string, undoHash: string): Promise<TeamWorkflowResult<TeamUndoResult>>;
+    migratePreview(team: string, choices?: TeamMigrationChoice[]): Promise<TeamWorkflowResult<{ preview: TeamMigrationPlan }>>;
+    migrateChunk(team: string, migrationHash: string, choices?: TeamMigrationChoice[]): Promise<TeamWorkflowResult<TeamMigrationChunk>>;
+    migrateRetire(team: string, migrationHash: string, choices?: TeamMigrationChoice[]): Promise<TeamWorkflowResult<TeamMigrationRetire>>;
+  };
   /** Self-service unmatched identity recovery. Personal credentials only. */
   linearIdentity: {
     get(): Promise<LinearIdentityResult>;
