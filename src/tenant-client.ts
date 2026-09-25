@@ -230,6 +230,38 @@ export type MeResult =
     }
   | TenantClientFailure;
 
+/** Personal provider consent is initiated by a user credential, never an account key. */
+export type PersonalConnectionProvider = "linear" | "github";
+
+export type PersonalConnectionStartResult =
+  | { outcome: "ok"; status: 200; authorizationUrl: string; expiresAt: number }
+  | { outcome: "workspace-required"; status: 409 }
+  | TenantClientFailure;
+
+export type PersonalConnectionStatusResult =
+  | { outcome: "absent"; status: 200 }
+  | { outcome: "lapsed"; status: 200; lapsedAt: number | null }
+  | {
+      outcome: "connected";
+      status: 200;
+      provider: "linear";
+      linearUserId: string;
+      grantedScope: string | null;
+      updatedAt: number;
+      expiresAt: number | null;
+    }
+  | {
+      outcome: "connected";
+      status: 200;
+      provider: "github";
+      githubUserId: string;
+      githubLogin: string;
+      updatedAt: number;
+      expiresAt: number | null;
+    }
+  | { outcome: "unavailable"; status: 503; provider: PersonalConnectionProvider }
+  | TenantClientFailure;
+
 // ── The agent proxy — every tenant write, plus the attachments read-back ────────────────────────
 
 /** The routes this client wraps, by the last segment of their contract path. `delegate` (operator
@@ -891,6 +923,84 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     return { outcome: "ok", account, slug, name, permissions, principal };
   }
 
+  // ── Personal provider consent ────────────────────────────────────────────────────────────────
+
+  async function personalConnectionStart(provider: PersonalConnectionProvider): Promise<PersonalConnectionStartResult> {
+    const sent = await send("GET", url(`/connect/${provider}/personal/start`), {});
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    if (answer.status === 409 && isRecord(answer.json) && answer.json["error"] === "linear_workspace_required") {
+      return { outcome: "workspace-required", status: 409 };
+    }
+    if (answer.status !== 200) return classify(answer);
+    const body = answer.json;
+    if (!isRecord(body) || typeof body["authorizationUrl"] !== "string" ||
+        typeof body["expiresAt"] !== "number" || !Number.isFinite(body["expiresAt"])) {
+      return { outcome: "shape", status: 200, reason: "personal consent start returned an unexpected shape" };
+    }
+    // The CLI may open this URL. Refuse a foreign or cross-provider URL even if a bad server answer
+    // produced one, and never copy the signed handoff query into an error message.
+    let consentUrl: URL;
+    try {
+      consentUrl = new URL(body["authorizationUrl"]);
+    } catch {
+      return { outcome: "shape", status: 200, reason: "personal consent start returned an invalid URL" };
+    }
+    if (consentUrl.origin !== new URL(origin).origin ||
+        consentUrl.pathname !== `/connect/${provider}/personal/start` ||
+        !consentUrl.searchParams.get("handoff") ||
+        !["https:", "http:"].includes(consentUrl.protocol)) {
+      return { outcome: "shape", status: 200, reason: "personal consent start returned a URL outside this provider" };
+    }
+    return { outcome: "ok", status: 200, authorizationUrl: body["authorizationUrl"], expiresAt: body["expiresAt"] };
+  }
+
+  async function personalConnectionStatus(provider: PersonalConnectionProvider): Promise<PersonalConnectionStatusResult> {
+    const sent = await send("GET", url(`/me/connections/${provider}/personal`), {});
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    if (answer.status === 503 && isRecord(answer.json) &&
+        answer.json["error"] === `${provider}_grant_check_unavailable`) {
+      return { outcome: "unavailable", status: 503, provider };
+    }
+    if (answer.status !== 200) return classify(answer);
+    const body = answer.json;
+    const malformed = (): PersonalConnectionStatusResult => ({
+      outcome: "shape", status: 200, reason: "personal connection status returned an unexpected shape",
+    });
+    if (!isRecord(body)) return malformed();
+    if (body["connected"] === false) {
+      if (!("reason" in body)) return { outcome: "absent", status: 200 };
+      if (body["reason"] === "lapsed" &&
+          (body["lapsedAt"] === null ||
+            (typeof body["lapsedAt"] === "number" && Number.isFinite(body["lapsedAt"])))) {
+        return { outcome: "lapsed", status: 200, lapsedAt: body["lapsedAt"] };
+      }
+      return malformed();
+    }
+    if (body["connected"] !== true ||
+        typeof body["updatedAt"] !== "number" || !Number.isFinite(body["updatedAt"]) ||
+        !(body["expiresAt"] === null ||
+          (typeof body["expiresAt"] === "number" && Number.isFinite(body["expiresAt"])))) {
+      return malformed();
+    }
+    if (provider === "linear") {
+      if (typeof body["linearUserId"] !== "string" ||
+          !(body["grantedScope"] === null || typeof body["grantedScope"] === "string")) return malformed();
+      return {
+        outcome: "connected", status: 200, provider,
+        linearUserId: body["linearUserId"], grantedScope: body["grantedScope"],
+        updatedAt: body["updatedAt"], expiresAt: body["expiresAt"],
+      };
+    }
+    if (typeof body["githubUserId"] !== "string" || typeof body["githubLogin"] !== "string") return malformed();
+    return {
+      outcome: "connected", status: 200, provider,
+      githubUserId: body["githubUserId"], githubLogin: body["githubLogin"],
+      updatedAt: body["updatedAt"], expiresAt: body["expiresAt"],
+    };
+  }
+
   // ── The agent proxy ───────────────────────────────────────────────────────────────────────────
 
   /**
@@ -1044,6 +1154,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
   return {
     contract,
     me,
+    personalConnections: { start: personalConnectionStart, status: personalConnectionStatus },
     issues: { list: issuesList, get: issuesGet },
     pulls: { list: pullsList, get: pullsGet },
     projects: { list: projectsList },
@@ -1057,6 +1168,13 @@ export interface TenantClient {
   contract(opts?: ContractOptions): Promise<ContractResult>;
   /** `GET /api/v1/me` — the account this key belongs to. */
   me(): Promise<MeResult>;
+  /** User-scoped GitHub and Linear OAuth grants. Use a personal key or device-login credential. */
+  personalConnections: {
+    /** Returns a short lived URL to open in the user's browser. Does not perform consent. */
+    start(provider: PersonalConnectionProvider): Promise<PersonalConnectionStartResult>;
+    /** A provider outage is `unavailable`, never `absent`. */
+    status(provider: PersonalConnectionProvider): Promise<PersonalConnectionStatusResult>;
+  };
   issues: {
     /** `GET /api/v1/issues` — keyset-paged; follow `nextCursor` until it is `null`. */
     list(params?: IssueListParams): Promise<IssueListResult>;
