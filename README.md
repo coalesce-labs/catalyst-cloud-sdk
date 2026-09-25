@@ -257,6 +257,16 @@ const grant = await member.personalConnections.status("github");
 if (grant.outcome === "connected") console.log(grant.githubLogin);
 ```
 
+Personal Linear consent normally binds the member to the provider viewer. For an unmatched member, `linearIdentity.get()` returns the current identity and any available roster choices. Choose an explicit ID with `linearIdentity.set(id)` and read it back afterward. These calls require a personal credential, accept no membership selector, and cannot replace an automatically resolved identity. Conflicts distinguish `already_resolved`, `already_claimed`, and `identity_changed`; reload before retrying.
+
+```ts
+const identity = await member.linearIdentity.get();
+if (identity.outcome === "ok") console.log(identity.identity, identity.options);
+// After the member chooses an ID from the offered roster:
+const saved = await member.linearIdentity.set(selectedLinearUserId);
+if (saved.outcome === "ok") console.log(await member.linearIdentity.get());
+```
+
 ### Durable event cache for node and Bun
 
 `@catalyst-cloud/sdk/events` mirrors the tenant's exact durable Catalyst event backbone into an append-only local cache. It uses bounded HTTP replay with an idle backoff; local consumers tail files and never poll GitHub, Linear, or cloud tables. Start and stop it with the process that currently needs the tenant instead of installing another permanent daemon.
@@ -292,7 +302,7 @@ This API only reads the durable backbone. It does not publish events or treat ra
 | `AuthStrategy` | `{ kind: "token"; token }` (backend) or `{ kind: "cookie" }` (browser). |
 | `LiveSyncStatus` | `"connecting"` · `"live"` · `"reconnecting"` · `"resyncing"` · `"error"` · `"stopped"`. |
 | `ChangeFrame` · `EntityName` · `ChangeOp` | The change shape + the entity/op contract. |
-| `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `issues.list/get`, `pulls.list/get`, `projects.list`, `personalConnections.start/status`, `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept, projectRepositoryRegister, projectRepositoryRemove). |
+| `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `issues.list/get`, `pulls.list/get`, `projects.list`, `personalConnections.start/status`, `linearIdentity.get/set`, `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept, projectRepositoryRegister, projectRepositoryRemove). |
 | `TenantContract` · `routeByName` · `teamByKey` · `teamForTicket` · `stageIdForSlot` · `labelIdFor` | The contract document's shape and the pure accessors over it, each returning a typed miss rather than throwing. |
 | `TenantClientFailure` · `PageCursor` · `pageCursor` · `memoryContractCache` | The shared failure arms, the opaque page token, and the default contract cache store. |
 | `CatalystEventSync` · `readCachedEvents` · `tailCachedEvents` · `EventHistoryGapError` | Node/Bun durable-backbone replay, local cache readers, and explicit history-gap handling from `@catalyst-cloud/sdk/events`. |
