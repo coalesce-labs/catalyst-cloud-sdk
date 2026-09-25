@@ -1,0 +1,1 @@
+Keep the transport happy path on an older preview and isolate paused-preview behavior in its own test.
