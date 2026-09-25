@@ -101,6 +101,17 @@ describe("personal team workflow", () => {
     expect(net.calls).toHaveLength(5);
   });
 
+  it("rejects a migration availability value that is not Boolean", async () => {
+    const { c } = client([json(200, { preview: { teamId: "team-1", sources: [], migrationHash: STALENESS_TOKEN, overLimit: false, issueCount: 0, retireLogReadable: true, actionsAvailable: "false" } })]);
+    expect(await c.teamWorkflow.migratePreview("ENG")).toMatchObject({ outcome: "shape", status: 200 });
+  });
+
+  it("passes a paused migration preview to callers without issuing a write", async () => {
+    const { c, net } = client([json(200, { preview: { teamId: "team-1", sources: [], migrationHash: STALENESS_TOKEN, overLimit: false, issueCount: 0, retireLogReadable: true, actionsAvailable: false } })]);
+    expect(await c.teamWorkflow.migratePreview("ENG")).toMatchObject({ outcome: "ok", preview: { actionsAvailable: false } });
+    expect(net.calls.map((call) => call.body)).toEqual([{ team: "ENG", step: "preview", choices: [] }]);
+  });
+
   it("refuses malformed successes and invalid local hashes before a write", async () => {
     const { c, net } = client([json(200, { checklist: [] }), json(200, { preview: { migrationHash: STALENESS_TOKEN } }), json(200, { ...workflow, stages: [{}] })]);
     expect(await c.teamWorkflow.get("ENG")).toMatchObject({ outcome: "shape", status: 200 });
