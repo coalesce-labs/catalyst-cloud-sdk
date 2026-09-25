@@ -1,0 +1,6 @@
+Revision history for #95:
+
+rev 2 (content) 2026-09-25 06:14 UTC — Keep the transport happy path on an older preview and isolate paused-preview behavior in its own test.
+rev 1 (initial) 2026-09-25 06:14 UTC
+
+<!-- mergify-revision-data: {"schema_version":1,"pull_number":95,"entries":[{"number":1,"change_type":"initial","old_sha":null,"new_sha":"8d204d95fb560e14351092eac2e4b7d8e4db87c4","timestamp_iso":"2026-09-25T06:14:47Z","reason":"","replay_sha":null,"compare_url":null},{"number":2,"change_type":"content","old_sha":"8d204d95fb560e14351092eac2e4b7d8e4db87c4","new_sha":"8efdcfe230010fd84251f7257ca08e0e228bdffd","timestamp_iso":"2026-09-25T06:14:47Z","reason":"Keep the transport happy path on an older preview and isolate paused-preview behavior in its own test.","replay_sha":null,"compare_url":"https://github.com/coalesce-labs/catalyst-cloud-sdk/compare/8d204d95fb560e14351092eac2e4b7d8e4db87c4...8efdcfe230010fd84251f7257ca08e0e228bdffd"}]} -->
