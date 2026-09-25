@@ -1,3 +1,4 @@
+import { parseLinearIdentityView, type LinearIdentityResult } from "./linear-identity.js";
 // tenant-client.ts — CTC-2004. ONE typed client for every tenant read and write, so the CLI, the
 // skill scripts, MCP tools and the cloud repo's own scripts share one implementation instead of six.
 //
@@ -923,6 +924,20 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     return { outcome: "ok", account, slug, name, permissions, principal };
   }
 
+  async function linearIdentityCall(linearUserId?: string): Promise<LinearIdentityResult> {
+    const sent = await send(linearUserId === undefined ? "GET" : "POST", url("/me/linear-identity"), {},
+      linearUserId === undefined ? undefined : { linearUserId });
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    const reason = isRecord(answer.json) ? answer.json["error"] : undefined;
+    if (answer.status === 409 && (reason === "already_resolved" || reason === "already_claimed" || reason === "identity_changed")) {
+      return { outcome: "conflict", status: 409, reason };
+    }
+    if (answer.status !== 200) return classify(answer);
+    const view = parseLinearIdentityView(answer.json);
+    return view ? { outcome: "ok", ...view } : { outcome: "shape", status: 200, reason: "personal Linear identity returned an unexpected shape" };
+  }
+
   // ── Personal provider consent ────────────────────────────────────────────────────────────────
 
   async function personalConnectionStart(provider: PersonalConnectionProvider): Promise<PersonalConnectionStartResult> {
@@ -1154,6 +1169,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
   return {
     contract,
     me,
+    linearIdentity: { get: () => linearIdentityCall(), set: (linearUserId) => linearIdentityCall(linearUserId) },
     personalConnections: { start: personalConnectionStart, status: personalConnectionStatus },
     issues: { list: issuesList, get: issuesGet },
     pulls: { list: pullsList, get: pullsGet },
@@ -1164,6 +1180,12 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
 
 /** The client. See {@link createTenantClient}. */
 export interface TenantClient {
+  /** Self-service unmatched identity recovery. Personal credentials only. */
+  linearIdentity: {
+    get(): Promise<LinearIdentityResult>;
+    /** Records only the authenticated member's choice. Automatically resolved identities refuse. */
+    set(linearUserId: string): Promise<LinearIdentityResult>;
+  };
   /** The tenant's fact document, cached per its own `cache` policy. */
   contract(opts?: ContractOptions): Promise<ContractResult>;
   /** `GET /api/v1/me` — the account this key belongs to. */

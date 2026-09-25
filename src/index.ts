@@ -158,3 +158,5 @@ export {
   type StageLookup,
   type LabelLookup,
 } from "./tenant-contract.js";
+
+export type { MemberLinearIdentity, LinearIdentityOption, LinearIdentityView, LinearIdentityResult } from "./linear-identity.js";
