@@ -205,6 +205,8 @@ export interface TeamMigrationPlan {
   overLimit: boolean;
   issueCount: number;
   retireLogReadable: boolean;
+  /** A false value means the server will refuse stage moves and retirement. Older servers omit it. */
+  actionsAvailable?: boolean;
 }
 export interface TeamAdoptResult {
   teamId: string;
@@ -1425,7 +1427,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
         (value): value is TeamUndoResult => isRecord(value) && Array.isArray(value["archived"]) && value["archived"].every((row: unknown) => stateResult(row, false, true)) && Array.isArray(value["kept"]) && value["kept"].every((row: unknown) => stateResult(row, true, true)) && Array.isArray(value["failed"]) && value["failed"].every((row: unknown) => stateResult(row, true, true)) && (value["readiness"] === null || teamReadiness(value["readiness"])))
       : Promise.resolve(invalidHash()),
     migratePreview: (team, choices = []) => teamPost(`${teamPath}/migrate`, { team, step: "preview", choices },
-      (value): value is { preview: TeamMigrationPlan } => isRecord(value) && isRecord(value["preview"]) && typeof value["preview"]["teamId"] === "string" && Array.isArray(value["preview"]["sources"]) && value["preview"]["sources"].every(migrationSource) && typeof value["preview"]["migrationHash"] === "string" && WORKFLOW_STALENESS_TOKEN.test(value["preview"]["migrationHash"] as string) && typeof value["preview"]["overLimit"] === "boolean" && typeof value["preview"]["issueCount"] === "number" && typeof value["preview"]["retireLogReadable"] === "boolean"),
+      (value): value is { preview: TeamMigrationPlan } => isRecord(value) && isRecord(value["preview"]) && typeof value["preview"]["teamId"] === "string" && Array.isArray(value["preview"]["sources"]) && value["preview"]["sources"].every(migrationSource) && typeof value["preview"]["migrationHash"] === "string" && WORKFLOW_STALENESS_TOKEN.test(value["preview"]["migrationHash"] as string) && typeof value["preview"]["overLimit"] === "boolean" && typeof value["preview"]["issueCount"] === "number" && typeof value["preview"]["retireLogReadable"] === "boolean" && (value["preview"]["actionsAvailable"] === undefined || typeof value["preview"]["actionsAvailable"] === "boolean")),
     migrateChunk: (team, migrationHash, choices = []) => WORKFLOW_STALENESS_TOKEN.test(migrationHash)
       ? teamPost(`${teamPath}/migrate`, { team, step: "migrate", migrationHash, choices },
         (value): value is TeamMigrationChunk => isRecord(value) && typeof value["teamId"] === "string" && Array.isArray(value["sources"]) && value["sources"].every(migrationSource) && typeof value["remaining"] === "number" && typeof value["migrationHash"] === "string" && WORKFLOW_STALENESS_TOKEN.test(value["migrationHash"]) && typeof value["moved"] === "number" && (value["readiness"] === null || teamReadiness(value["readiness"])))
