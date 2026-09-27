@@ -405,7 +405,8 @@ export type AgentRouteName =
   | "project-repositories/remove"
   | "portal-servers"
   | "portal-servers/register"
-  | "portal-servers/remove";
+  | "portal-servers/remove"
+  | "messages";
 
 /** The runtime twin of {@link AgentRouteName}: the list a test can walk against the contract.
  *  Kept in lockstep with the union by a compile-time equality in test/tenant-client-agent.test.ts. */
@@ -414,6 +415,7 @@ export const AGENT_ROUTE_NAMES = [
   "attachment", "attachments", "session", "ask", "ask-accept",
   "project-repositories", "project-repositories/remove",
   "portal-servers", "portal-servers/register", "portal-servers/remove",
+  "messages",
 ] as const satisfies readonly AgentRouteName[];
 
 /** The arms every agent call can end in BEFORE the route answers: the contract could not be served,
@@ -628,6 +630,39 @@ export type ProjectRepositoryRemoveResult =
 /** `removed: false` is idempotent success, not a failure — there was nothing to unlink. */
   | { outcome: "removed"; status: number; removed: boolean }
   | { outcome: "not-found"; status: 404; reason: string }
+  | AgentCallFailure;
+
+/** CTC-3254 — `POST …/agent/messages` (CTC-3121): a message to the agent running a ticket's current
+ *  phase, which it reads as one more user turn when its current turn ends. The SENDER comes from the
+ *  credential, never from this body: a personal key or CLI login is a person, an account key is an
+ *  agent. One write-budget unit per accepted send; no idempotency key (a repeat send is a second
+ *  message). To address a roster `agentId`, resolve it to the ticket its worker runs (the roster
+ *  entry's `scope`) before calling; the cloud does not resolve roster ids. */
+export interface AgentMessageInput {
+  /** The ticket identifier, e.g. `CTC-42`. */
+  ticket: string;
+  /** At most 4096 bytes of UTF-8. */
+  body: string;
+  /** Defaults to `note` on the server. */
+  kind?: "note" | "question" | "answer";
+  /** The id of the earlier message this one answers. */
+  re?: string;
+}
+export type AgentMessageResult =
+  /** The running session reads it at its next turn boundary. */
+  | { outcome: "accepted"; status: number; messageId: string; ticket: string; delivery: "next-turn" }
+  /** It waits for the ticket's next phase, and why: nothing is running, the run has no channel for it
+   *  mid-phase, or the run is not reading messages. */
+  | {
+      outcome: "accepted";
+      status: number;
+      messageId: string;
+      ticket: string;
+      delivery: "next-phase";
+      reason: "no-live-phase" | "run-cannot-receive" | "run-not-reading";
+    }
+  /** The ticket already holds the per-ticket cap of pending messages (20). */
+  | { outcome: "refused"; status: 409; reason: "too_many_pending" }
   | AgentCallFailure;
 
 /** Upstream auth references only account vault names, never credential values. */
@@ -1374,6 +1409,12 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
       if (!r.ok) return notFound(r) ?? r.failure;
       return { outcome: "registered", ...stamped<Omit<Extract<ProjectRepositoryRegisterResult, { outcome: "registered" }>, "outcome">>(r.body, r.status) };
     },
+    async message(input) {
+      const r = await callAgentRoute("messages", { ...input }, (body) =>
+        (body["outcome"] === "accepted" && typeof body["messageId"] === "string") ||
+        (body["outcome"] === "refused" && body["reason"] === "too_many_pending"));
+      return r.ok ? stamped<Exclude<AgentMessageResult, AgentCallFailure>>(r.body, r.status) : r.failure;
+    },
     async projectRepositoryRemove(input) {
       const r = await callAgentRoute("project-repositories/remove", { ...input }, (body) => typeof body["removed"] === "boolean");
       if (!r.ok) return notFound(r) ?? r.failure;
@@ -1516,5 +1557,7 @@ export interface TenantClient {
     portalServerRemove(input: { name: string }): Promise<PortalServerRemoveResult>;
     projectRepositoryRegister(input: ProjectRepositoryInput): Promise<ProjectRepositoryRegisterResult>;
     projectRepositoryRemove(input: ProjectRepositoryInput): Promise<ProjectRepositoryRemoveResult>;
+    /** `POST …/agent/messages` — send a ticket's running agent a message it reads at its next turn. */
+    message(input: AgentMessageInput): Promise<AgentMessageResult>;
   };
 }

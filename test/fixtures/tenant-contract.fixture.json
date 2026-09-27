@@ -134,6 +134,12 @@
       "path": "/api/v1/agent/portal-servers/remove",
       "takesWriteBudgetUnit": false,
       "since": "1.18.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/messages",
+      "takesWriteBudgetUnit": true,
+      "since": "1.19.0"
     }
   ],
   "teams": [
