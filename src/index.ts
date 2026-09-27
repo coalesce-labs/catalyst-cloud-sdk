@@ -149,6 +149,8 @@ export {
   type PortalServersResult,
   type PortalServerRemoveResult,
   type ProjectRepositoryInput,
+  type AgentMessageInput,
+  type AgentMessageResult,
   type RegisteredProjectRepository,
   type ProjectRepositoryRegisterResult,
   type ProjectRepositoryRemoveResult,
