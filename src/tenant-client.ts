@@ -88,14 +88,7 @@ export function memoryContractCache(): ContractCacheStore {
   };
 }
 
-<<<<<<< HEAD
 export interface TenantClientBaseOptions {
-=======
-export interface TenantClientOptions {
-  /** A tenant or personal key. Most agent proxy writes require an organization key; `teamWorkflow`
-   *  and personal connection methods require the caller's own personal key or device login. */
-  key: string;
->>>>>>> 520387a0889aade64af45217dfbb1f11e4e15479
   /** The service origin (e.g. "https://staging.catalystcloud.dev"). A trailing slash is trimmed;
    *  every route path is absolute under it. */
   baseUrl: string;
@@ -119,9 +112,9 @@ export interface TenantClientOptions {
 export type TenantClientOptions = TenantClientBaseOptions &
   (
     | {
-        /** The tenant key. Reads accept any key with `mirror:read`; every `/api/v1/agent/*` route
-         *  needs an organization-tier key (`ctc_acct_*`) — a workstation key is refused `403
-         *  not-machine-principal`. */
+        /** A tenant or personal key. Most agent proxy writes require an organization key;
+         *  `teamWorkflow` and personal connection methods require the caller's own personal key or
+         *  device login. */
         key: string;
         auth?: never;
       }
@@ -390,7 +383,6 @@ export type MeResult =
     }
   | TenantClientFailure;
 
-<<<<<<< HEAD
 /** `GET /api/v1/issues/:id/execution` — the ticket's own execution/telemetry report. ⛔ The fields
  *  below are DOCUMENTED, not compiled: this repo does not depend on `catalyst-cloud`. The index
  *  signature is deliberate (Decision 4, CTC-2132) — a field the cloud adds must reach the caller, not
@@ -533,7 +525,8 @@ export interface RawRequest {
 }
 export type RawRequestResult =
   | { outcome: "ok"; status: number; json: unknown; headers: Headers }
-=======
+  | TenantClientFailure;
+
 /** Personal provider consent is initiated by a user credential, never an account key. */
 export type PersonalConnectionProvider = "linear" | "github";
 
@@ -564,7 +557,6 @@ export type PersonalConnectionStatusResult =
       expiresAt: number | null;
     }
   | { outcome: "unavailable"; status: 503; provider: PersonalConnectionProvider }
->>>>>>> 520387a0889aade64af45217dfbb1f11e4e15479
   | TenantClientFailure;
 
 // ── The agent proxy — every tenant write, plus the attachments read-back ────────────────────────
@@ -1515,7 +1507,6 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     return { outcome: "ok", account, slug, name, permissions, principal };
   }
 
-<<<<<<< HEAD
   async function issuesExecution(identifier: string): Promise<TicketExecutionResult> {
     const sent = await send("GET", url(`/api/v1/issues/${encodeURIComponent(identifier)}/execution`), {});
     if (!sent.ok) return sent.failure;
@@ -1694,7 +1685,12 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
             throw new Error(`/api/v1/changes emitted a line that is not JSON: ${line.slice(0, 120)}`);
           }
           if (!isRecord(parsed)) throw new Error("/api/v1/changes emitted a line that is not an object");
+          // ⛔ PAUSE THE IDLE CLOCK WHILE SUSPENDED AT `yield` (CTC-2132 validate attempt 30). It bounds
+          // time spent awaiting the NETWORK; the caller's per-row work between pulls is not a stall,
+          // so a slow consumer of one chunk's rows no longer aborts a feed that never went quiet.
+          deadline.release();
           yield parsed;
+          deadline.rearm();
         }
       } finally {
         deadline.release();
@@ -1794,7 +1790,8 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     const { answer } = sent;
     if (answer.status < 200 || answer.status >= 300) return classify(answer);
     return { outcome: "ok", status: answer.status, json: answer.json, headers: answer.headers };
-=======
+  }
+
   async function linearIdentityCall(linearUserId?: string): Promise<LinearIdentityResult> {
     const sent = await send(linearUserId === undefined ? "GET" : "POST", url("/me/linear-identity"), {},
       linearUserId === undefined ? undefined : { linearUserId });
@@ -1885,7 +1882,6 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
       githubUserId: body["githubUserId"], githubLogin: body["githubLogin"],
       updatedAt: body["updatedAt"], expiresAt: body["expiresAt"],
     };
->>>>>>> 520387a0889aade64af45217dfbb1f11e4e15479
   }
 
   // ── The agent proxy ───────────────────────────────────────────────────────────────────────────
@@ -2104,15 +2100,11 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
   return {
     contract,
     me,
-<<<<<<< HEAD
     request,
-    issues: { list: issuesList, get: issuesGet, execution: issuesExecution },
-=======
     linearIdentity: { get: () => linearIdentityCall(), set: (linearUserId) => linearIdentityCall(linearUserId) },
     personalConnections: { start: personalConnectionStart, status: personalConnectionStatus },
     teamWorkflow,
-    issues: { list: issuesList, get: issuesGet },
->>>>>>> 520387a0889aade64af45217dfbb1f11e4e15479
+    issues: { list: issuesList, get: issuesGet, execution: issuesExecution },
     pulls: { list: pullsList, get: pullsGet },
     projects: { list: projectsList },
     cycles: { list: cyclesList },
@@ -2158,11 +2150,9 @@ export interface TenantClient {
   contract(opts?: ContractOptions): Promise<ContractResult>;
   /** `GET /api/v1/me` — the account this key belongs to. */
   me(): Promise<MeResult>;
-<<<<<<< HEAD
   /** The generic authed-request escape hatch (CTC-2132) — for a route nobody enumerated. `path` MUST
    *  be an absolute path under this client's own origin; see {@link RawRequest}. */
   request(req: RawRequest): Promise<RawRequestResult>;
-=======
   /** User-scoped GitHub and Linear OAuth grants. Use a personal key or device-login credential. */
   personalConnections: {
     /** Returns a short lived URL to open in the user's browser. Does not perform consent. */
@@ -2170,7 +2160,6 @@ export interface TenantClient {
     /** A provider outage is `unavailable`, never `absent`. */
     status(provider: PersonalConnectionProvider): Promise<PersonalConnectionStatusResult>;
   };
->>>>>>> 520387a0889aade64af45217dfbb1f11e4e15479
   issues: {
     /** `GET /api/v1/issues` — keyset-paged; follow `nextCursor` until it is `null`. */
     list(params?: IssueListParams): Promise<IssueListResult>;

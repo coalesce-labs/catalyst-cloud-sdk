@@ -110,7 +110,6 @@ export {
   type ProjectListParams,
   type ProjectListResult,
   type MeResult,
-<<<<<<< HEAD
   type TicketExecutionReport,
   type TicketExecutionResult,
   type WorkEligibilityReport,
@@ -133,11 +132,9 @@ export {
   type SnapshotHeadResult,
   type RawRequest,
   type RawRequestResult,
-=======
   type PersonalConnectionProvider,
   type PersonalConnectionStartResult,
   type PersonalConnectionStatusResult,
->>>>>>> 520387a0889aade64af45217dfbb1f11e4e15479
   AGENT_ROUTE_NAMES,
   type AgentRouteName,
   type AgentCallFailure,

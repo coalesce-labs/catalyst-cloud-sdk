@@ -1,10 +1,6 @@
 {
   "name": "@catalyst-cloud/sdk",
-<<<<<<< HEAD
-  "version": "0.12.0",
-=======
-  "version": "0.12.3",
->>>>>>> 520387a0889aade64af45217dfbb1f11e4e15479
+  "version": "0.13.0",
   "description": "Keep a live local copy of your Linear and GitHub project data — pushed in real time, without polling rate limits or webhook tunnels.",
   "license": "MIT",
   "author": "Coalesce Labs",

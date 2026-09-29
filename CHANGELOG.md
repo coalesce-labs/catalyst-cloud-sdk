@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.12.0 — CTC-2132
+## 0.13.0 — CTC-2132
 
 `createTenantClient` now covers every route the `catalyst-cloud-skills` bundle's own `src/http.ts`
 transport still hand-rolled: `issues.execution`, `diagnostics.workEligibility/dispatchQueue/

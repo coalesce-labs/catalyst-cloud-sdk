@@ -346,3 +346,99 @@ describe("the caller's signal reaches the fetch (Finding 4)", () => {
     expect(await outcomeOrHang(c.changes.stream({ since: 0, signal: AbortSignal.abort() }))).toBe("network");
   });
 });
+
+// ⭐ Regression, CTC-2132 validate attempt 30 / code-review (src/tenant-client.ts `changes.stream`).
+// The idle deadline was refunded only when a CHUNK arrived off the network, never when the caller
+// pulled, so the clock kept running while `rows()` sat suspended at `yield`. A caller spending more
+// than `timeoutMs` on one chunk's rows (a DB write per row) had a healthy feed aborted with "timed out
+// … without progress" while the next chunk was ready. The stand-in errors the body the moment the
+// fetch signal aborts — as a real socket does — and delivers each chunk only when it is read.
+function pulledOnDemand(chunks: string[]): typeof fetch {
+  const impl = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const signal = init?.signal ?? null;
+    const encoder = new TextEncoder();
+    let i = 0;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        start(ctrl) {
+          signal?.addEventListener(
+            "abort",
+            () => ctrl.error(signal.reason instanceof Error ? signal.reason : new Error("aborted")),
+            { once: true },
+          );
+        },
+        pull(ctrl) {
+          if (i < chunks.length) ctrl.enqueue(encoder.encode(chunks[i++]!));
+          else ctrl.close();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    return new Response(stream, { status: 200, headers: { "content-type": "application/x-ndjson", "X-Mirror-Cursor": "5" } });
+  };
+  return impl as typeof fetch;
+}
+
+describe("the /changes idle deadline measures the NETWORK, not the caller (validate attempt 30)", () => {
+  it("⭐ a caller slower than timeoutMs per chunk — but under it per row — reads a never-stalling feed in full", async () => {
+    const c = createTenantClient({
+      key: KEY,
+      baseUrl: BASE,
+      timeoutMs: 50,
+      // Chunk 1 carries 3 rows: at 30 ms each the caller holds it ~90 ms, nearly 2× the deadline.
+      fetch: pulledOnDemand(['{"seq":1}\n{"seq":2}\n{"seq":3}\n', '{"seq":4}\n', '{"seq":5}\n']),
+    });
+    const r = await c.changes.stream({ since: 0 });
+    if (r.outcome !== "ok") throw new Error(`expected ok, got ${r.outcome}`);
+    const got: unknown[] = [];
+    for await (const row of r.rows) {
+      got.push(row);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    expect(got).toEqual([{ seq: 1 }, { seq: 2 }, { seq: 3 }, { seq: 4 }, { seq: 5 }]);
+  });
+
+  it("⭐ the deadline still fires when the NETWORK stalls after a slow caller resumes", async () => {
+    const stalling: typeof fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const signal = init?.signal ?? null;
+      let sent = false;
+      const stream = new ReadableStream<Uint8Array>(
+        {
+          async pull(ctrl) {
+            if (!sent) {
+              sent = true;
+              ctrl.enqueue(new TextEncoder().encode('{"seq":1}\n'));
+              return;
+            }
+            await new Promise<void>((resolve) => {
+              if (signal === null || signal.aborted) return resolve();
+              signal.addEventListener("abort", () => resolve(), { once: true });
+            });
+            ctrl.error(signal?.reason instanceof Error ? signal.reason : new Error("aborted"));
+          },
+        },
+        { highWaterMark: 0 },
+      );
+      return new Response(stream, { status: 200, headers: { "content-type": "application/x-ndjson" } });
+    }) as typeof fetch;
+    const c = createTenantClient({ key: KEY, baseUrl: BASE, timeoutMs: 50, fetch: stalling });
+    const r = await c.changes.stream({ since: 0 });
+    if (r.outcome !== "ok") throw new Error(`expected ok, got ${r.outcome}`);
+    const got: unknown[] = [];
+    const drained = (async () => {
+      for await (const row of r.rows) {
+        got.push(row);
+        await new Promise((resolve) => setTimeout(resolve, 120)); // paused: must not count
+      }
+    })();
+    const settled = await Promise.race([
+      drained.then(
+        () => "DRAINED",
+        (err: unknown) => `THREW:${err instanceof Error ? err.message : String(err)}`,
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("HUNG"), 1_200)),
+    ]);
+    expect(got).toEqual([{ seq: 1 }]);
+    expect(settled).toContain("without progress");
+  });
+});
