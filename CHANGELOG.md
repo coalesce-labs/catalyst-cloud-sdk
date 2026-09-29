@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — CTC-3780
+
+`createTenantClient` gains `getProjectWipLimit(team)` and `setProjectWipLimit(team, limit)`, over `GET|POST /api/v1/agent/team-wip-limit` with a person's own key or CLI login. `team` is the project's key (`CTC`) or its Linear team id. Any active member reads; only an admin or owner sets, and anyone else gets `outcome: "forbidden"`. `limit` is clamped by the cloud to 0..9999, and `null` returns the project to the default. A non-finite `limit` is refused locally (`error: "invalid-limit"`), because JSON would send it as `null`. Both answer `{team: {id, key}, limit, source, stored, inProgress, countedAt}`.
+
+Additive, so a patch release. Needs a mirror that serves the route (catalyst-cloud CTC-3780).
+
 ## 0.13.0 — CTC-2132
 
 `createTenantClient` now covers every route the `catalyst-cloud-skills` bundle's own `src/http.ts`

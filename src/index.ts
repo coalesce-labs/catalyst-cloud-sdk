@@ -93,6 +93,7 @@ export {
   type TeamUndoResult,
   type TeamMigrationChunk,
   type TeamMigrationRetire,
+  type ProjectWipLimit,
   type ContractCacheEntry,
   type ContractCacheStore,
   type ContractOptions,
