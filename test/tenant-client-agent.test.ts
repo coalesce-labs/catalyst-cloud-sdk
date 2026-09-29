@@ -364,3 +364,51 @@ describe("⭐ the drift guard (CTC-2562): every route this SDK wraps must resolv
     for (const name of AGENT_ROUTE_NAMES) expect([name, routeByName(doc, name) !== null]).toEqual([name, true]);
   });
 });
+
+describe("agent.message — CTC-3254, a message to a ticket's running agent", () => {
+  it("⭐ POSTs the contract's messages path with only the given fields, and passes the delivery through", async () => {
+    const { net, c } = client([
+      () => json(201, { outcome: "accepted", messageId: "msg_1", ticket: "CTC-42", delivery: "next-turn" }),
+    ]);
+    const res = await c.agent.message({ ticket: "CTC-42", body: "the flaky test is known" });
+    expect(res).toEqual({ outcome: "accepted", status: 201, messageId: "msg_1", ticket: "CTC-42", delivery: "next-turn" });
+    const post = net.calls[1]!;
+    expect(post.method).toBe("POST");
+    expect(post.url).toBe(`${BASE}${pathOf(fixture, "messages")}`);
+    // No sender field: the cloud takes it from the credential.
+    expect(post.body).toEqual({ ticket: "CTC-42", body: "the flaky test is known" });
+  });
+
+  it("carries a next-phase answer with its reason, and kind/re only when given", async () => {
+    const { net, c } = client([
+      () =>
+        json(201, {
+          outcome: "accepted",
+          messageId: "msg_2",
+          ticket: "CTC-42",
+          delivery: "next-phase",
+          reason: "run-cannot-receive",
+        }),
+    ]);
+    const res = await c.agent.message({ ticket: "CTC-42", body: "yes", kind: "answer", re: "msg_1" });
+    expect(res).toMatchObject({ outcome: "accepted", delivery: "next-phase", reason: "run-cannot-receive" });
+    expect(net.calls[1]!.body).toEqual({ ticket: "CTC-42", body: "yes", kind: "answer", re: "msg_1" });
+  });
+
+  it("names the per-ticket cap refusal as its own arm", async () => {
+    const { c } = client([() => json(409, { outcome: "refused", reason: "too_many_pending" })]);
+    expect(await c.agent.message({ ticket: "CTC-42", body: "hi" })).toEqual({
+      outcome: "refused",
+      status: 409,
+      reason: "too_many_pending",
+    });
+  });
+
+  it("⛔ a seat refusal is not an accepted send", async () => {
+    const { c } = client([
+      () => json(403, { outcome: "rejected", code: "team-not-accessible", reason: "your seat is scoped" }),
+    ]);
+    const res = await c.agent.message({ ticket: "CTC-42", body: "hi" });
+    expect(res.outcome).not.toBe("accepted");
+  });
+});
