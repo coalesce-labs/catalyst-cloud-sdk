@@ -267,6 +267,19 @@ export interface TeamMigrationRetire {
   logGaps: readonly { stateId: string; reason: string }[];
   readiness: TeamWorkflowReadiness | null;
 }
+/** CTC-3780 — a project's WIP limit, from `GET|POST /api/v1/agent/team-wip-limit`. */
+export interface ProjectWipLimit {
+  team: { id: string; key: string };
+  /** The limit that applies: the project's own, else the tenant flag's, else the default (12). */
+  limit: number;
+  source: "project" | "flag" | "default";
+  /** The project's own stored value; null when it takes the flag or the default. */
+  stored: number | null;
+  /** The project's work in progress, counted as the WIP gate counts it. */
+  inProgress: number;
+  /** Epoch ms at which `inProgress` was counted. */
+  countedAt: number;
+}
 
 // ── The contract ────────────────────────────────────────────────────────────────────────────────
 
@@ -1048,6 +1061,15 @@ function teamList(value: unknown): value is TeamList {
     typeof value["canManage"] === "boolean" && typeof value["everChecked"] === "boolean" && typeof value["mirrorRead"] === "boolean" &&
     typeof value["liveTeamRead"]["attempted"] === "boolean" &&
     (value["liveTeamRead"]["error"] === null || typeof value["liveTeamRead"]["error"] === "string");
+}
+
+function projectWipLimit(value: unknown): value is ProjectWipLimit {
+  return isRecord(value) && isRecord(value["team"]) &&
+    typeof value["team"]["id"] === "string" && typeof value["team"]["key"] === "string" &&
+    typeof value["limit"] === "number" &&
+    (value["source"] === "project" || value["source"] === "flag" || value["source"] === "default") &&
+    (value["stored"] === null || typeof value["stored"] === "number") &&
+    typeof value["inProgress"] === "number" && typeof value["countedAt"] === "number";
 }
 
 function teamView(value: unknown): value is TeamWorkflowView {
@@ -2104,6 +2126,12 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     linearIdentity: { get: () => linearIdentityCall(), set: (linearUserId) => linearIdentityCall(linearUserId) },
     personalConnections: { start: personalConnectionStart, status: personalConnectionStatus },
     teamWorkflow,
+    getProjectWipLimit: (team) =>
+      teamCall("GET", `/api/v1/agent/team-wip-limit?team=${encodeURIComponent(team)}`, undefined, projectWipLimit),
+    // A non-finite number would serialize as `null`, which the cloud reads as "back to the default".
+    setProjectWipLimit: (team, limit) => limit === null || Number.isFinite(limit)
+      ? teamCall("POST", "/api/v1/agent/team-wip-limit", { team, limit }, projectWipLimit)
+      : Promise.resolve({ outcome: "rejected", status: 0, error: "invalid-limit", reason: "limit must be a finite number, or null for the default" }),
     issues: { list: issuesList, get: issuesGet, execution: issuesExecution },
     pulls: { list: pullsList, get: pullsGet },
     projects: { list: projectsList },
@@ -2140,6 +2168,11 @@ export interface TenantClient {
     migrateChunk(team: string, migrationHash: string, choices?: TeamMigrationChoice[]): Promise<TeamWorkflowResult<TeamMigrationChunk>>;
     migrateRetire(team: string, migrationHash: string, choices?: TeamMigrationChoice[]): Promise<TeamWorkflowResult<TeamMigrationRetire>>;
   };
+  /** A project's WIP limit (CTC-3780). Any active member reads; personal key or CLI login. */
+  getProjectWipLimit(team: string): Promise<TeamWorkflowResult<ProjectWipLimit>>;
+  /** Sets it, clamped by the cloud to 0..9999; `null` returns the project to the default. Admin or
+   *  owner only: anyone else gets `outcome: "forbidden"`. Answers the value after the write. */
+  setProjectWipLimit(team: string, limit: number | null): Promise<TeamWorkflowResult<ProjectWipLimit>>;
   /** Self-service unmatched identity recovery. Personal credentials only. */
   linearIdentity: {
     get(): Promise<LinearIdentityResult>;
