@@ -21,6 +21,7 @@
 import { applyMigrations, MIRROR_MIGRATIONS, type MigrationDb } from "@catalyst-cloud/schema";
 import { migrationsChangeRowShape } from "./migration-shape.js";
 import { buildKnownColumnsByTable } from "./known-columns.js";
+import { applyReadModelDdl } from "./read-model-ddl.js";
 import {
   applyDelta,
   truncateReplica,
@@ -570,6 +571,19 @@ export class CatalystReplica {
     };
     const { appliedTags } = applyMigrations(migrationDb, MIRROR_MIGRATIONS);
     engine.exec(SYNC_META_DDL);
+
+    // CTC-4324: read-model's index set and FTS5 search tables, the same DDL the Mirror DO applies after
+    // its migrations. Without it the pulls list full-scans pull_requests, reviews and commit_statuses,
+    // and no search can run. A no-op on every open after the first.
+    const searchBuilt = applyReadModelDdl({
+      all: (sql, ...bindings) =>
+        engine.all(sql, ...bindings.map(engine.toBindable)) as Record<string, SqlValue>[],
+      run: (sql, ...bindings) => engine.run(sql, ...bindings.map(engine.toBindable)),
+      transaction: (fn) => engine.transaction(fn),
+    });
+    if (searchBuilt.length > 0) {
+      this.log("info", "read-model search indexes built", { dbPath: this.opts.dbPath, tables: searchBuilt });
+    }
 
     // CTC-582, the other half: ADOPT an unstamped replica — never reject one.
     //
