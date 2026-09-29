@@ -18,6 +18,7 @@ import type { SqlExecutor, SqlValue } from "@catalyst-cloud/read-model";
 import { applyMigrations, MIRROR_MIGRATIONS, type MigrationDb } from "@catalyst-cloud/schema";
 import { migrationsChangeRowShape } from "../migration-shape.js";
 import { buildKnownColumnsByTable } from "../known-columns.js";
+import { applyReadModelDdl } from "../read-model-ddl.js";
 
 /**
  * The write port the delta-apply path (apply.ts) drives. `run` executes a mutation with positional `?`
@@ -171,6 +172,10 @@ export function buildOpenedReplica(db: Database): OpenedReplica {
   // Host-only bookkeeping table (NOT in the DO mirror schema, so not in the bundle) — the cursor.
   // Identical to the node engine's SYNC_META_DDL.
   db.exec("CREATE TABLE IF NOT EXISTS sync_meta (key TEXT PRIMARY KEY, value TEXT)");
+
+  // CTC-4324: read-model's index set and FTS5 search tables, as the node replica and the Mirror DO
+  // apply them. `write` is the eager port; the `read` executor runs nothing until `toArray()`.
+  applyReadModelDdl(write);
 
   // CTC-127's browser twin (CTC-114 review, KtI). A migration that adds a column or a table leaves a
   // WARM replica's existing rows holding NULL for it forever — deltas only carry CHANGED rows, so
