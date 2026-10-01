@@ -12,6 +12,7 @@ import {
   BLOCKED_ON_ASK_TOTAL_HEADER,
   HEAD_SEQ_HEADER,
   NEXT_CURSOR_HEADER,
+  SCOPE_HEADER,
   TOTAL_HEADER,
   createTenantClient,
   normalizeBaseUrl,
@@ -76,15 +77,35 @@ describe("issues.list", () => {
       waiting_mode: "all",
     });
     expect(net.calls[0]!.headers["authorization"]).toBe(`Bearer ${KEY}`);
-    expect(res).toEqual({ outcome: "ok", rows: [ROW], nextCursor: "tok2", total: 298, head: 1201 });
+    expect(res).toEqual({ outcome: "ok", rows: [ROW], nextCursor: "tok2", total: 298, head: 1201, scope: null });
   });
 
   it("⭐ the last page has NO next-cursor header → nextCursor: null; absent totals → null", async () => {
     const net = scriptedFetch([() => json(200, [ROW])]);
     const client = createTenantClient({ key: KEY, baseUrl: BASE, fetch: net.fetch });
     const res = await client.issues.list();
-    expect(res).toEqual({ outcome: "ok", rows: [ROW], nextCursor: null, total: null, head: null });
+    expect(res).toEqual({ outcome: "ok", rows: [ROW], nextCursor: null, total: null, head: null, scope: null });
     expect(new URL(net.calls[0]!.url).search).toBe("");
+  });
+
+  // CTC-4556 — `?state=` takes only the buckets, so a state NAME rides as `state_name`, and the
+  // mirror's X-Mirror-Scope says which params narrowed the page.
+  it("⭐ a state name rides as state_name, and X-Mirror-Scope says which params narrowed the page", async () => {
+    expect(SCOPE_HEADER).toBe("X-Mirror-Scope");
+    const net = scriptedFetch([() => json(200, [ROW], { "X-Mirror-Scope": "team_key,state_name" })]);
+    const client = createTenantClient({ key: KEY, baseUrl: BASE, fetch: net.fetch });
+    const res = await client.issues.list({ teamKey: "ENG", stateName: "In Review" });
+    expect(Object.fromEntries(new URL(net.calls[0]!.url).searchParams)).toEqual({
+      team_key: "ENG",
+      state_name: "In Review",
+    });
+    expect(res).toMatchObject({ outcome: "ok", scope: ["team_key", "state_name"] });
+  });
+
+  it("an empty X-Mirror-Scope is no narrowing at all, distinct from a mirror that sent none", async () => {
+    const net = scriptedFetch([() => json(200, [ROW], { "X-Mirror-Scope": "" })]);
+    const client = createTenantClient({ key: KEY, baseUrl: BASE, fetch: net.fetch });
+    expect(await client.issues.list({ teamKey: "ENG" })).toMatchObject({ outcome: "ok", scope: [] });
   });
 
   it("the next cursor is typed: it feeds straight back into `after` and pageCursor() admits a persisted token", async () => {

@@ -333,6 +333,9 @@ export interface IssueListParams {
   teamKey?: string;
   /** An unrecognised value is no narrowing server-side, never a 400 — so the type is closed here. */
   state?: "active" | "backlog" | "done";
+  /** CTC-4556 — one Linear state by name (`state_name`), any case. A name no issue carries is an
+   *  empty page, unlike an unknown `state` bucket. Needs a mirror that lists it in `scope`. */
+  stateName?: string;
   /** Linear's 1..4. */
   priority?: 1 | 2 | 3 | 4;
   assigneeId?: string;
@@ -354,7 +357,15 @@ export interface KeysetPageMeta {
   head: number | null;
 }
 
-export type IssueListResult = ({ outcome: "ok"; rows: IssueView[] } & KeysetPageMeta) | TenantClientFailure;
+export type IssueListResult =
+  | ({
+      outcome: "ok";
+      rows: IssueView[];
+      /** CTC-4556 — the params that narrowed this page (`X-Mirror-Scope`), or `null` when the mirror
+       *  did not say. A filter you sent that is missing here was NOT applied: the rows are wider. */
+      scope: string[] | null;
+    } & KeysetPageMeta)
+  | TenantClientFailure;
 export type IssueGetResult =
   | { outcome: "ok"; issue: IssueDetailView; head: number | null }
   | { outcome: "not-found"; status: 404 }
@@ -907,6 +918,8 @@ export const NEXT_CURSOR_HEADER = "X-Mirror-Next-Cursor";
 export const HEAD_SEQ_HEADER = "X-Mirror-Cursor";
 /** The scope's full row count on `/issues` and `/pulls` — the page can never report what lies past it. */
 export const TOTAL_HEADER = "X-Mirror-Total";
+/** `/issues` only (CTC-4556): the params that narrowed the page, comma-separated. */
+export const SCOPE_HEADER = "X-Mirror-Scope";
 /** `/pulls` only: the "N of M blocked on an ask" numerator. */
 export const BLOCKED_ON_ASK_TOTAL_HEADER = "X-Mirror-Blocked-On-Ask-Total";
 /** The contract route's own version header, equal to the body's `contractVersion`. */
@@ -1432,6 +1445,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
         team_id: params.teamId,
         team_key: params.teamKey,
         state: params.state,
+        state_name: params.stateName,
         priority: params.priority,
         assignee_id: params.assigneeId,
         assignee: params.assignee,
@@ -1450,7 +1464,15 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     if (page === null || rows === null) {
       return { outcome: "shape", status: 200, reason: "GET /api/v1/issues did not answer an array of rows" };
     }
-    return { outcome: "ok", rows, nextCursor: page.nextCursor, total: page.total, head: page.head };
+    const scope = sent.answer.headers.get(SCOPE_HEADER);
+    return {
+      outcome: "ok",
+      rows,
+      nextCursor: page.nextCursor,
+      total: page.total,
+      head: page.head,
+      scope: scope === null ? null : scope.split(",").map((p) => p.trim()).filter((p) => p !== ""),
+    };
   }
 
   async function issuesGet(identifier: string): Promise<IssueGetResult> {

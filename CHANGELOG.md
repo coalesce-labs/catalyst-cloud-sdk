@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — CTC-4556
+
+`issues.list` takes `stateName`, sent as `state_name`, which narrows the list to one Linear state by name in any case. `state` still takes only the `active`, `backlog` and `done` buckets. An `ok` result now carries `scope`, the params the mirror says narrowed the page (`X-Mirror-Scope`, exported as `SCOPE_HEADER`), or `null` when the mirror did not say. A filter missing from `scope` was not applied, so the rows are wider than asked.
+
+Additive, so a patch release. `state_name` and the header need a mirror with catalyst-cloud CTC-4556 (#9319).
+
 ## Unreleased — CTC-3780
 
 `createTenantClient` gains `getProjectWipLimit(team)` and `setProjectWipLimit(team, limit)`, over `GET|POST /api/v1/agent/team-wip-limit` with a person's own key or CLI login. `team` is the project's key (`CTC`) or its Linear team id. Any active member reads; only an admin or owner sets, and anyone else gets `outcome: "forbidden"`. `limit` is clamped by the cloud to 0..9999, and `null` returns the project to the default. A non-finite `limit` is refused locally (`error: "invalid-limit"`), because JSON would send it as `null`. Both answer `{team: {id, key}, limit, source, stored, inProgress, countedAt}`.
