@@ -416,6 +416,9 @@ export type MeResult =
  *  be refused as a shape error. The tenant decides which principals may read this route (Decision 5);
  *  the client reports whatever it answers. */
 export interface TicketExecutionReport {
+  /** The ticket the report is about. The server always sends it, under any selection. */
+  readonly ticket: string;
+  /** ⚠️ Never sent by the server; kept so code that read it still compiles. Read `ticket`. */
   readonly identifier?: string;
   readonly [key: string]: unknown;
 }

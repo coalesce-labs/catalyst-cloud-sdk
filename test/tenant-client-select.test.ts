@@ -161,3 +161,27 @@ describe("repairLoop is typed on the issue", () => {
     } | null>();
   });
 });
+
+// ── The execution report names its ticket as `ticket` (the server's `always` key in
+//    read-projections.ts's ISSUE_EXECUTION_SELECT); `identifier` was the type's only key and the
+//    server never sends it. ──
+
+describe("the execution report types ticket", () => {
+  const REPORT = { ticket: "ENG-1", unreadable: false, note: null, attemptHistory: [] };
+
+  it("a full read carries ticket, typed as a string", async () => {
+    const { c } = client([() => json(200, REPORT)]);
+    const r = await c.issues.execution("ENG-1");
+    if (r.outcome !== "ok") throw new Error(r.outcome);
+    expect(r.report.ticket).toBe("ENG-1");
+    expectTypeOf(r.report.ticket).toEqualTypeOf<string>();
+    expectTypeOf(r.report.identifier).toEqualTypeOf<string | undefined>();
+  });
+
+  it("a projected read keeps it, as the server always does", async () => {
+    const { c } = client([() => json(200, REPORT)]);
+    const r = await c.issues.execution("ENG-1", { projection: "status" });
+    if (r.outcome !== "ok") throw new Error(r.outcome);
+    expect(r.report.ticket).toBe("ENG-1");
+  });
+});
