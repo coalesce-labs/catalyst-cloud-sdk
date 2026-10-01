@@ -434,6 +434,91 @@ describe("requestResync() — the consumer-driven resync entry point (CTC-114 re
     client.stop();
   });
 
+  it("stopAndWait accepts only this attempt's exact intentional cancellation reason", async () => {
+    const { sockets, factory } = recordingFactory();
+    let seedEntered = false;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: (signal) => new Promise<number>((_resolve, reject) => {
+        if (!signal) throw new Error("missing attempt cancellation signal");
+        seedEntered = true;
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+      getCursor: () => null,
+      onChange: () => {},
+      wsFactory: factory,
+    });
+    const running = client.start();
+    await vi.waitFor(() => expect(seedEntered).toBe(true));
+    await client.stopAndWait();
+    await running;
+    expect(sockets).toHaveLength(0);
+  });
+
+  it("stopAndWait preserves a distinct callback AbortError after requesting cancellation", async () => {
+    const { sockets, factory } = recordingFactory();
+    const failedWrite = new Error("consumer write aborted independently");
+    failedWrite.name = "AbortError";
+    let seedEntered = false;
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: (signal) => new Promise<number>((_resolve, reject) => {
+        if (!signal) throw new Error("missing attempt cancellation signal");
+        seedEntered = true;
+        signal.addEventListener("abort", () => reject(failedWrite), { once: true });
+      }),
+      getCursor: () => null,
+      onChange: () => {},
+      wsFactory: factory,
+    });
+    const running = client.start();
+    await vi.waitFor(() => expect(seedEntered).toBe(true));
+    const failure: unknown = await client.stopAndWait().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    if (!(failure instanceof AggregateError)) throw new Error("shutdown did not preserve callback failure");
+    expect(failure.errors).toEqual([failedWrite]);
+    await running;
+    expect(sockets).toHaveLength(0);
+  });
+
+  it("stopAndWait joins the actual cold-seed callback after start() has been released", async () => {
+    const { sockets, factory } = recordingFactory();
+    let releaseSeed!: () => void;
+    let seedSettled = false;
+    const seedGate = new Promise<void>((resolve) => {
+      releaseSeed = resolve;
+    });
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: async () => {
+        await seedGate;
+        seedSettled = true;
+        return 3;
+      },
+      getCursor: () => null,
+      onChange: () => {},
+      wsFactory: factory,
+    });
+
+    const run = client.start();
+    const shutdown = client.stopAndWait();
+    await run; // the legacy run promise settles at stop(), before the callback has unwound
+    await Promise.resolve();
+    expect(seedSettled).toBe(false);
+    expect(sockets).toHaveLength(0);
+
+    releaseSeed();
+    await shutdown;
+    expect(seedSettled).toBe(true);
+    expect(sockets).toHaveLength(0); // the late seed cannot reopen after stop
+  });
+
   it("is a no-op BEFORE start() — no reseed, no orphaned socket", async () => {
     // CTC-114 review round 5. `stopped` is false on a client that has never started, so it could not
     // carry this guard by itself: requestResync() ran the reseed and opened a socket with no lifecycle

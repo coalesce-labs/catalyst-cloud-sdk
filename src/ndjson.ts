@@ -27,10 +27,15 @@ export async function* iterateNdjson(
   const body = res.body;
   if (body && typeof body.getReader === "function") {
     const reader = body.getReader();
+    let cancelPromise: Promise<void> | null = null;
+    const cancelOnce = (): Promise<void> => {
+      if (cancelPromise === null) cancelPromise = reader.cancel();
+      return cancelPromise;
+    };
     const onAbort = (): void => {
-      void reader.cancel().catch(() => {
-        // already released/closed — the abort still surfaces via throwIfAborted
-      });
+      // Keep the FIRST cancellation promise: a later reader.cancel() can resolve immediately after
+      // cancellation has begun, while the stream source is still awaiting its own cleanup.
+      void cancelOnce().catch(() => {});
     };
     if (signal) {
       if (signal.aborted) onAbort();
@@ -58,11 +63,9 @@ export async function* iterateNdjson(
       }
     } finally {
       signal?.removeEventListener("abort", onAbort);
-      try {
-        await reader.cancel(); // release the body/connection on EVERY exit path (no-op when done)
-      } catch {
-        // already released/closed
-      }
+      // Join that same first cancellation (including its failure) before the generator settles.
+      // Shutdown callers rely on this acknowledgement before closing the engine or releasing lock.
+      await cancelOnce();
     }
     return;
   }

@@ -532,6 +532,8 @@ export class LiveSyncClient {
   private started = false;
   /** The in-flight boot task, or null once it settles — `requestResync()` serializes behind it. */
   private bootTask: Promise<void> | null = null;
+  /** Actual consumer seed callbacks, which may outlive the bounded boot/reseed wrapper on stop. */
+  private readonly seedOperations = new Map<Promise<number>, AbortSignal>();
   /** Settles an in-flight `boundedReseed` wrapper on stop(), so an awaited resync cannot hang. */
   private abandonReseed: (() => void) | null = null;
   /**
@@ -875,6 +877,34 @@ export class LiveSyncClient {
     const abandon = this.abandonReseed;
     this.abandonReseed = null;
     abandon?.();
+  }
+
+  /** Stop reconnecting and acknowledge settlement of boot, reseed, and consumer seed I/O. */
+  async stopAndWait(): Promise<void> {
+    this.stop();
+    // The public start() promise settles as soon as stop is requested. These internal owners are the
+    // work that can still touch the consumer's store, so join them before a caller closes that store.
+    while (this.bootTask || this.activeResync || this.seedOperations.size > 0) {
+      const seeds = [...this.seedOperations.entries()];
+      const pending = [
+        this.bootTask,
+        this.activeResync,
+        ...seeds.map(([operation]) => operation),
+      ].filter((task): task is Promise<void> | Promise<number> => task != null);
+      if (pending.length === 0) continue;
+      const settled = await Promise.allSettled(pending);
+      const seedOffset = pending.length - seeds.length;
+      const failures = settled.slice(seedOffset).flatMap((result, index) => {
+        if (result.status !== "rejected") return [];
+        const reason = result.reason;
+        // Aborting a fetch-backed seed is the expected shutdown path. Other callback failures remain
+        // visible to the owner; a shutdown receipt must not convert a failed write into success.
+        const signal = seeds[index]?.[1];
+        // Match this attempt's owned reason, not a name that an unrelated I/O failure can share.
+        return signal?.aborted === true && reason === signal.reason ? [] : [reason];
+      });
+      if (failures.length) throw new AggregateError(failures, "LiveSyncClient seed shutdown failed");
+    }
   }
 
   /**
@@ -1587,7 +1617,7 @@ export class LiveSyncClient {
     // deadline off — which skipped installing `abandonReseed` and so bypassed round 7's stop() fix
     // entirely on that path. Disabling the DEADLINE must not also disable teardown: the two are
     // independent, and `stop()` has to be able to settle an awaited `requestResync()` either way.
-    return new Promise<number>((resolve, reject) => {
+    const operation = new Promise<number>((resolve, reject) => {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | null = null;
       const finish = (fn: () => void): void => {
@@ -1673,6 +1703,9 @@ export class LiveSyncClient {
           ),
       );
     });
+    this.seedOperations.set(seed, cancel.signal);
+    void seed.finally(() => this.seedOperations.delete(seed)).catch(() => {});
+    return operation;
   }
 
   /**

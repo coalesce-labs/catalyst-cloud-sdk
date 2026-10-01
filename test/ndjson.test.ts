@@ -54,6 +54,65 @@ describe("iterateNdjson", () => {
     expect(cancelled).toBe(true);
   });
 
+  it("waits for the first underlying reader-cancel acknowledgement before finishing abort", async () => {
+    const controller = new AbortController();
+    let acknowledgeCancel!: () => void;
+    let cancelStarted = false;
+    let settled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('{"a":1}\n'));
+      },
+      pull() {
+        return new Promise<void>(() => {});
+      },
+      cancel() {
+        cancelStarted = true;
+        return new Promise<void>((resolve) => { acknowledgeCancel = resolve; });
+      },
+    });
+    const consuming = (async () => {
+      for await (const _line of iterateNdjson(new Response(stream), { signal: controller.signal })) {
+        // The next read is held open so abort must cancel the reader.
+      }
+    })().finally(() => { settled = true; });
+    await Promise.resolve();
+    controller.abort(new DOMException("stop now", "AbortError"));
+    await Promise.resolve();
+    expect(cancelStarted).toBe(true);
+    expect(settled).toBe(false);
+
+    acknowledgeCancel();
+    await expect(consuming).rejects.toThrow("stop now");
+    expect(settled).toBe(true);
+  });
+
+  it("surfaces a failed underlying cancellation instead of acknowledging cleanup", async () => {
+    const controller = new AbortController();
+    let failCancel!: (error: Error) => void;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('{"a":1}\n'));
+      },
+      pull() {
+        return new Promise<void>(() => {});
+      },
+      cancel() {
+        return new Promise<void>((_resolve, reject) => { failCancel = reject; });
+      },
+    });
+    const consuming = (async () => {
+      for await (const _line of iterateNdjson(new Response(stream), { signal: controller.signal })) {
+        // Hold the body until the signal cancels its reader.
+      }
+    })();
+    await Promise.resolve();
+    controller.abort(new DOMException("stop now", "AbortError"));
+    await Promise.resolve();
+    failCancel(new Error("cancel cleanup failed"));
+    await expect(consuming).rejects.toThrow("cancel cleanup failed");
+  });
+
   it("emits a trailing line with no final newline", async () => {
     const res = streamedResponse(['{"a":1}\n{"a":2}']);
     const got: string[] = [];
