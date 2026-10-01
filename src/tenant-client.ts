@@ -366,8 +366,23 @@ export type IssueListResult =
       scope: string[] | null;
     } & KeysetPageMeta)
   | TenantClientFailure;
+
+/** CTC-1889 — the ticket's repair loop: remediate rounds, validate attempts, an active hold and the
+ *  parks that apply. The server's detail handler adds it after the view builder, and only when there
+ *  is something to show, so it is absent rather than null on a quiet ticket. Mirrors the cloud's
+ *  `TicketRepairLoopWire` (apps/mirror/src/do/ticket-repair-loop.ts). */
+export interface TicketRepairLoop {
+  remediateRounds: number;
+  validateAttempts: number;
+  hold: { reason: string; headSha: string | null; heldAtMs: number } | null;
+  parks: ReadonlyArray<{ phase: string; sentinel: string; label: string }>;
+}
+
+/** `GET /api/v1/issues/:identifier`: the read-model's detail view plus the server-added fields. */
+export type IssueDetail = IssueDetailView & { repairLoop?: TicketRepairLoop };
+
 export type IssueGetResult =
-  | { outcome: "ok"; issue: IssueDetailView; head: number | null }
+  | { outcome: "ok"; issue: IssueDetail; head: number | null }
   | { outcome: "not-found"; status: 404 }
   | TenantClientFailure;
 
@@ -413,12 +428,130 @@ export type MeResult =
  *  be refused as a shape error. The tenant decides which principals may read this route (Decision 5);
  *  the client reports whatever it answers. */
 export interface TicketExecutionReport {
+  /** The ticket the report is about. The server always sends it, under any selection. */
+  readonly ticket: string;
+  /** ⚠️ Never sent by the server; kept so code that read it still compiles. Read `ticket`. */
   readonly identifier?: string;
   readonly [key: string]: unknown;
 }
 export type TicketExecutionResult =
   | { outcome: "ok"; status: 200; report: TicketExecutionReport }
   | { outcome: "not-found"; status: 404 }
+  | TenantClientFailure;
+
+// ── Read selection — CTC-4549. `?fields=a,b` names top-level keys, `?projection=<name>` names a
+//    server-owned key set, both together return the union. The server's catalog is closed: a name
+//    outside it is a 400 listing what is allowed, never a body silently missing the key. An older
+//    server ignores both params and answers the full body, which the partial typing already covers.
+
+/** The projections `GET /api/v1/issues/:identifier` names. */
+export type IssueGetProjection = "status" | "brief";
+/** The projections `GET /api/v1/issues/:identifier/execution` names. */
+export type IssueExecutionProjection = "status" | "failures";
+
+export interface ReadSelectOptions<P extends string> {
+  /** Top-level keys only, sent joined by commas. An empty list is the server's `invalid_field`. */
+  fields?: readonly string[];
+  projection?: P;
+}
+export type IssueGetOptions = ReadSelectOptions<IssueGetProjection>;
+export type IssueExecutionOptions = ReadSelectOptions<IssueExecutionProjection>;
+
+/** The server refused a selection. `name` is the field or projection it did not know (`"fields"`
+ *  for an empty list); `allowed` is its catalog, so a caller can retry with a name that exists. */
+export interface ReadSelectRefusal {
+  outcome: "select-refused";
+  status: 400;
+  error: "unknown_field" | "unknown_projection" | "invalid_field";
+  name: string | null;
+  allowed: readonly string[];
+  reason: string;
+}
+
+/** A selected issue: any key may be absent, and the server always keeps `identifier`. */
+export type ProjectedIssueDetail = {
+  [K in keyof IssueDetail as K extends "identifier" ? never : K]?: IssueDetail[K];
+} & { identifier: IssueDetail["identifier"] } extends infer T
+  ? { [K in keyof T]: T[K] }
+  : never;
+export type IssueGetProjectedResult =
+  | { outcome: "ok"; issue: ProjectedIssueDetail; head: number | null }
+  | { outcome: "not-found"; status: 404 }
+  | ReadSelectRefusal
+  | TenantClientFailure;
+/** The report type is already open, so a selected report needs no narrower type. */
+export type TicketExecutionProjectedResult = TicketExecutionResult | ReadSelectRefusal;
+
+// ── Event history — CTC-4549. `GET /api/v1/events/query`: the backbone filtered by ticket and
+//    type, served from the cloud's event index. A page is JSON, complete or absent.
+
+export interface EventQueryParams {
+  ticket?: string;
+  /** One durable event type, or several (each sent as its own `type=`). */
+  type?: string | readonly string[];
+  /** The server's default is 50, its maximum 200. */
+  limit?: number;
+  /** The server's default is `desc`, newest first. */
+  order?: "asc" | "desc";
+  afterSeq?: number;
+  beforeSeq?: number;
+}
+
+/** Where the next page starts: the param to set and its value. `null` on the last page. */
+export interface EventQueryCursor {
+  param: "afterSeq" | "beforeSeq";
+  value: number;
+}
+
+/** The sequence range the cloud's index holds. An event outside it is not missing, only unindexed. */
+export interface EventIndexCoverage {
+  indexedFromSeq: number | null;
+  indexedToSeq: number | null;
+}
+
+/** One backbone event, verbatim: the same object a `/events/backbone` line carries. ⛔ DOCUMENTED,
+ *  not compiled beyond `sequence` and `type`, so a field the cloud adds reaches the caller. */
+export interface QueriedBackboneEvent {
+  readonly sequence: number;
+  readonly type: string;
+  readonly bodyUnavailable?: undefined;
+  readonly [key: string]: unknown;
+}
+
+/** An event whose body the cloud never archived (its archive write was given up on). The page
+ *  serves this stub in the event's place, never a gap, so a cursor never skips it unseen. */
+export interface QueriedEventStub {
+  readonly tenantId: string;
+  readonly sequence: number;
+  readonly eventId: string;
+  readonly type: string;
+  readonly ticket?: string;
+  readonly bodyUnavailable: true;
+  /** `archive_write_failed` today. */
+  readonly reason: string;
+}
+
+/** Branch on `bodyUnavailable === true`. */
+export type QueriedEvent = QueriedBackboneEvent | QueriedEventStub;
+
+export type EventQueryResult =
+  | { outcome: "ok"; status: 200; events: QueriedEvent[]; next: EventQueryCursor | null; coverage: EventIndexCoverage }
+  /** The server has no event query route (404). Fall back; this is not "no events". */
+  | { outcome: "unsupported"; status: 404; reason: string }
+  /** One event is larger than a whole page (413). `next` resumes past it; `pages()` does so itself. */
+  | { outcome: "too-large"; status: 413; sequence: number; maxBytes: number; eventBytes: number; next: EventQueryCursor }
+  /** The index or archive could not be read (503). Retry the same request: `resume` is the cursor
+   *  this request sent (null on a first page), and `sequence` names the event whose read failed. */
+  | {
+      outcome: "unavailable";
+      status: 503;
+      error: "archive_read_failed" | "index_unavailable" | "archive_unavailable";
+      retryable: true;
+      sequence: number | null;
+      resume: EventQueryCursor | null;
+    }
+  /** A `type` outside the cloud's durable registry (400). `types` lists every one it refused. */
+  | { outcome: "event-type-refused"; status: 400; types: string[]; reason: string }
   | TenantClientFailure;
 
 // ── The diagnosis / telemetry reads — CTC-2132 (Ryan/M2: customer delegate agents diagnosing and
@@ -1023,6 +1156,104 @@ function classify(answer: Answer): TenantClientFailure {
   return { outcome: "http", status, reason };
 }
 
+/** The selection params, or none at all: a call without options must send today's exact request. */
+function selectQuery(select: ReadSelectOptions<string> | undefined): Record<string, string | undefined> {
+  return { fields: select?.fields?.join(","), projection: select?.projection };
+}
+
+const SELECT_ERRORS = new Set<string>(["unknown_field", "unknown_projection", "invalid_field"]);
+
+/** The read-selection 400 as its own arm, or `null` for any other answer (left to `classify`). */
+function selectRefusal(answer: Answer): ReadSelectRefusal | null {
+  if (answer.status !== 400 || !isRecord(answer.json)) return null;
+  const error = stringField(answer.json, "error");
+  if (error === null || !SELECT_ERRORS.has(error)) return null;
+  const allowed = answer.json["allowed"];
+  return {
+    outcome: "select-refused",
+    status: 400,
+    error: error as ReadSelectRefusal["error"],
+    name: stringField(answer.json, "field") ?? stringField(answer.json, "projection"),
+    allowed: Array.isArray(allowed) ? allowed.filter((a): a is string => typeof a === "string") : [],
+    reason: reasonOf(answer),
+  };
+}
+
+function eventQueryCursor(value: unknown): value is EventQueryCursor {
+  return (
+    isRecord(value) &&
+    (value["param"] === "afterSeq" || value["param"] === "beforeSeq") &&
+    Number.isSafeInteger(value["value"])
+  );
+}
+
+/** A full event needs a sequence and a type; a stub also needs its id. */
+function queriedEvent(value: unknown): value is QueriedEvent {
+  if (!isRecord(value) || !Number.isSafeInteger(value["sequence"]) || typeof value["type"] !== "string") {
+    return false;
+  }
+  if (value["bodyUnavailable"] === undefined) return true;
+  return value["bodyUnavailable"] === true && typeof value["eventId"] === "string" && typeof value["reason"] === "string";
+}
+
+const UNAVAILABLE_ERRORS = new Set<string>(["archive_read_failed", "index_unavailable", "archive_unavailable"]);
+
+/** The cursor a request sent, in the order it pages: what a retry of the same page sends again. */
+function sentCursor(params: EventQueryParams): EventQueryCursor | null {
+  if ((params.order ?? "desc") === "asc") {
+    return params.afterSeq === undefined ? null : { param: "afterSeq", value: params.afterSeq };
+  }
+  return params.beforeSeq === undefined ? null : { param: "beforeSeq", value: params.beforeSeq };
+}
+
+/** The event query's own refusals as typed arms, or `null` for any other answer (left to `classify`). */
+function eventQueryRefusal(answer: Answer, params: EventQueryParams): EventQueryResult | null {
+  const rec = isRecord(answer.json) ? answer.json : null;
+  const error = rec === null ? null : stringField(rec, "error");
+  if (rec === null || error === null) return null;
+  if (answer.status === 413 && error === "event_too_large") {
+    const sequence = rec["sequence"];
+    const next = rec["next"];
+    if (!Number.isSafeInteger(sequence) || !eventQueryCursor(next)) {
+      return { outcome: "shape", status: 413, reason: "event_too_large did not name its sequence and next cursor" };
+    }
+    return {
+      outcome: "too-large",
+      status: 413,
+      sequence: sequence as number,
+      maxBytes: numberField(rec, "maxBytes") ?? 0,
+      eventBytes: numberField(rec, "eventBytes") ?? 0,
+      next,
+    };
+  }
+  if (answer.status === 503 && UNAVAILABLE_ERRORS.has(error)) {
+    const sequence = rec["sequence"];
+    return {
+      outcome: "unavailable",
+      status: 503,
+      error: error as "archive_read_failed" | "index_unavailable" | "archive_unavailable",
+      retryable: true,
+      sequence: Number.isSafeInteger(sequence) ? (sequence as number) : null,
+      resume: sentCursor(params),
+    };
+  }
+  if (answer.status === 400 && error === "unknown_event_type") {
+    const types = rec["types"];
+    return {
+      outcome: "event-type-refused",
+      status: 400,
+      types: Array.isArray(types) ? types.filter((t): t is string => typeof t === "string") : [],
+      reason: stringField(rec, "detail") ?? error,
+    };
+  }
+  return null;
+}
+
+function eventIndexCoverage(value: unknown): value is EventIndexCoverage {
+  const seq = (v: unknown) => v === null || Number.isSafeInteger(v);
+  return isRecord(value) && seq(value["indexedFromSeq"]) && seq(value["indexedToSeq"]);
+}
+
 const SHA256_HEX = /^[a-f0-9]{64}$/;
 // Adopt and migrate use FNV-1a staleness tokens (`hash.toString(36)-count.toString(36)`), not SHA-256.
 // Mapping and undo deliberately use SHA-256; do not conflate the two wire contracts.
@@ -1475,12 +1706,14 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     };
   }
 
-  async function issuesGet(identifier: string): Promise<IssueGetResult> {
-    const sent = await send("GET", url(`/api/v1/issues/${encodeURIComponent(identifier)}`), {});
+  async function issuesGet(identifier: string): Promise<IssueGetResult>;
+  async function issuesGet(identifier: string, select: IssueGetOptions): Promise<IssueGetProjectedResult>;
+  async function issuesGet(identifier: string, select?: IssueGetOptions): Promise<IssueGetProjectedResult> {
+    const sent = await send("GET", url(`/api/v1/issues/${encodeURIComponent(identifier)}`, selectQuery(select)), {});
     if (!sent.ok) return sent.failure;
     const { answer } = sent;
     if (answer.status === 404) return { outcome: "not-found", status: 404 };
-    if (answer.status !== 200) return classify(answer);
+    if (answer.status !== 200) return (select && selectRefusal(answer)) ?? classify(answer);
     if (!isRecord(answer.json)) return { outcome: "shape", status: 200, reason: "GET /api/v1/issues/:identifier did not answer an object" };
     return { outcome: "ok", issue: asView<IssueDetailView>(answer.json), head: integerHeader(answer.headers, HEAD_SEQ_HEADER) };
   }
@@ -1551,16 +1784,75 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     return { outcome: "ok", account, slug, name, permissions, principal };
   }
 
-  async function issuesExecution(identifier: string): Promise<TicketExecutionResult> {
-    const sent = await send("GET", url(`/api/v1/issues/${encodeURIComponent(identifier)}/execution`), {});
+  async function issuesExecution(identifier: string): Promise<TicketExecutionResult>;
+  async function issuesExecution(identifier: string, select: IssueExecutionOptions): Promise<TicketExecutionProjectedResult>;
+  async function issuesExecution(identifier: string, select?: IssueExecutionOptions): Promise<TicketExecutionProjectedResult> {
+    const sent = await send("GET", url(`/api/v1/issues/${encodeURIComponent(identifier)}/execution`, selectQuery(select)), {});
     if (!sent.ok) return sent.failure;
     const { answer } = sent;
     if (answer.status === 404) return { outcome: "not-found", status: 404 };
-    if (answer.status !== 200) return classify(answer);
+    if (answer.status !== 200) return (select && selectRefusal(answer)) ?? classify(answer);
     if (!isRecord(answer.json)) {
       return { outcome: "shape", status: 200, reason: "GET /api/v1/issues/:id/execution did not answer an object" };
     }
     return { outcome: "ok", status: 200, report: answer.json as TicketExecutionReport };
+  }
+
+  // ── Event history (CTC-4549) ──────────────────────────────────────────────────────────────────
+
+  async function eventsQuery(params: EventQueryParams = {}): Promise<EventQueryResult> {
+    const target = new URL(url("/api/v1/events/query", { ticket: params.ticket }));
+    // `type` repeats (`type=a&type=b`), which the one-value `url()` helper cannot say.
+    for (const type of typeof params.type === "string" ? [params.type] : params.type ?? []) {
+      target.searchParams.append("type", type);
+    }
+    for (const [k, v] of Object.entries({ limit: params.limit, order: params.order, afterSeq: params.afterSeq, beforeSeq: params.beforeSeq })) {
+      if (v !== undefined) target.searchParams.set(k, String(v));
+    }
+    const sent = await send("GET", target.toString(), {});
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    // The route takes no resource id, so a 404 can only mean the server predates it.
+    if (answer.status === 404) return { outcome: "unsupported", status: 404, reason: "this server has no GET /api/v1/events/query" };
+    if (answer.status !== 200) return eventQueryRefusal(answer, params) ?? classify(answer);
+    const body = answer.json;
+    if (
+      !isRecord(body) ||
+      !Array.isArray(body["events"]) ||
+      !body["events"].every(queriedEvent) ||
+      !(body["next"] === null || eventQueryCursor(body["next"])) ||
+      !eventIndexCoverage(body["coverage"])
+    ) {
+      return { outcome: "shape", status: 200, reason: "GET /api/v1/events/query did not answer the documented page" };
+    }
+    return {
+      outcome: "ok",
+      status: 200,
+      events: body["events"] as QueriedEvent[],
+      next: body["next"] as EventQueryCursor | null,
+      coverage: body["coverage"] as EventIndexCoverage,
+    };
+  }
+
+  /** Every page from `params` on, following `next`. Yields each page, and ends after the last one or
+   *  after the first page that is neither `ok` nor `too-large` (yielded, never thrown). A
+   *  `too-large` event is yielded and stepped past through its own `next`. */
+  async function* eventsPages(params: EventQueryParams = {}): AsyncGenerator<EventQueryResult, void, undefined> {
+    let current = params;
+    let previous: EventQueryCursor | null = null;
+    for (;;) {
+      const page = await eventsQuery(current);
+      yield page;
+      if (page.outcome !== "ok" && page.outcome !== "too-large") return;
+      if (page.next === null) return;
+      if (previous !== null && previous.param === page.next.param && previous.value === page.next.value) {
+        // A cursor that does not move would page forever.
+        yield { outcome: "shape", status: 200, reason: `GET /api/v1/events/query repeated next ${page.next.param}=${page.next.value}` };
+        return;
+      }
+      previous = page.next;
+      current = { ...current, [page.next.param]: page.next.value };
+    }
   }
 
   // ── The diagnosis / telemetry reads ───────────────────────────────────────────────────────────
@@ -2161,6 +2453,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     search,
     workflowStages,
     changes: { stream: changesStream, list: changesListFn },
+    events: { query: eventsQuery, pages: eventsPages },
     snapshot: { head: snapshotHead },
     diagnostics: {
       workEligibility,
@@ -2220,8 +2513,13 @@ export interface TenantClient {
     list(params?: IssueListParams): Promise<IssueListResult>;
     /** `GET /api/v1/issues/:identifier`. */
     get(identifier: string): Promise<IssueGetResult>;
+    /** The same read, asking for only some top-level keys (CTC-4549). The issue is partial; a name
+     *  the server does not know is `select-refused` with its catalog. */
+    get(identifier: string, select: IssueGetOptions): Promise<IssueGetProjectedResult>;
     /** `GET /api/v1/issues/:id/execution` — the ticket's own execution/telemetry report. */
     execution(identifier: string): Promise<TicketExecutionResult>;
+    /** The same report, asking for only some top-level keys (CTC-4549). */
+    execution(identifier: string, select: IssueExecutionOptions): Promise<TicketExecutionProjectedResult>;
   };
   pulls: {
     list(params?: PullListParams): Promise<PullListResult>;
@@ -2245,6 +2543,13 @@ export interface TenantClient {
     stream(params: { since: number | "head"; signal?: AbortSignal }): Promise<ChangesStreamResult>;
     /** The same feed, buffered — never throws; a mid-stream fault comes back as the `network` arm. */
     list(params: { since: number | "head"; signal?: AbortSignal }): Promise<ChangesListResult>;
+  };
+  /** A tenant's event history from the cloud (CTC-4549). An older server answers `unsupported`. */
+  events: {
+    /** `GET /api/v1/events/query` — one page, filtered by ticket and type. */
+    query(params?: EventQueryParams): Promise<EventQueryResult>;
+    /** Every page, following `next`. Never throws; a failed page is yielded and ends the walk. */
+    pages(params?: EventQueryParams): AsyncGenerator<EventQueryResult, void, undefined>;
   };
   snapshot: {
     /** `GET /api/v1/snapshot?head=1` — the cheap head probe; never falls back to a full snapshot. */

@@ -43,6 +43,8 @@ describe("⭐ every method on the TenantClient interface is present on a constru
       "workflowStages",
       "changes.stream",
       "changes.list",
+      "events.query",
+      "events.pages",
       "snapshot.head",
       "diagnostics.workEligibility",
       "diagnostics.dispatchQueue",
