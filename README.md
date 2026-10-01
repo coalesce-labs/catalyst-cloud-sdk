@@ -49,7 +49,9 @@ Existing `/node`, `/browser`, `/browser/db-worker` and `/events` paths remain co
 
 Before updating catalyst-cloud consumers, adapt its schema-publish gate to validate the optional replica modules and install the appropriate module alongside any compatibility replica import. The current gate deliberately reads schema pins only from SDK hard dependencies, so it will reject a 0.14 core-only pin as unrecognized. Keep existing cloud consumers on 0.13 until that migration passes.
 
-Build and pack the core and optional modules together before release. Publish core 0.14 first, then the matching optional modules; their SDK peer requires the new replica aliases. The module manifests are release artifacts in `modules/`. New npm packages need their own trusted-publishing setup before registry publication.
+The normal `publish.yml` release workflow builds, tests and packs all three packages, then publishes the core followed by the Node and browser modules. A rerun skips an already published version only when its registry integrity matches the packed artifact. Different bytes require a version bump. The module manifests are release artifacts in `modules/`; their versions and core SDK peers must match.
+
+For the first publication of the two new names, dispatch that workflow on main with `bootstrap_modules` enabled and a temporary `SDK_BOOTSTRAP_TOKEN` repository secret. Core publication still uses its existing npm trusted publisher. After the initial module publication, configure each module's trusted publisher for `coalesce-labs/catalyst-cloud-sdk`, workflow `publish.yml`, then remove that temporary secret. Later releases use GitHub OIDC for all three packages. The optional modules' first publication must not be mistaken for completion of the catalyst-cloud dependency-gate migration above.
 
 The remaining examples describe the optional transport and replica lifecycle.
 

@@ -1,6 +1,6 @@
 name: Publish
 
-# Publishes @catalyst-cloud/sdk to the public npm registry when a GitHub Release is published.
+# Publishes the core SDK and both optional replica modules when a GitHub Release is published.
 # Flow: bump "version" in package.json + commit → cut a Release tagged vX.Y.Z → this workflow
 # builds, tests, and `npm publish`es that version. npm rejects re-publishing an existing version,
 # so each release must carry a fresh version. Auth is npm trusted publishing (CTC-3301): npmjs.com
@@ -12,7 +12,16 @@ name: Publish
 on:
   release:
     types: [published]
-  workflow_dispatch: # manual re-run (still gated on the version being unpublished)
+  workflow_dispatch:
+    inputs:
+      bootstrap_modules:
+        description: First publication of new module names using SDK_BOOTSTRAP_TOKEN
+        type: boolean
+        default: false
+
+concurrency:
+  group: sdk-publication
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -20,8 +29,10 @@ permissions:
 
 jobs:
   publish:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     name: build · test · publish
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,7 +62,10 @@ jobs:
       - name: Test
         run: bunx vitest run
 
-      - name: Publish to npm (public, with provenance)
+      - name: Packed consumer and optional module boundaries
+        run: bun run test:pack
+
+      - name: Publish core and optional modules (public, with provenance)
         env:
-          NPM_CONFIG_LOGLEVEL: verbose # shows the OIDC token exchange result
-        run: npm publish --provenance --access public
+          SDK_BOOTSTRAP_TOKEN: ${{ inputs.bootstrap_modules && secrets.SDK_BOOTSTRAP_TOKEN || '' }}
+        run: node scripts/release.mjs
