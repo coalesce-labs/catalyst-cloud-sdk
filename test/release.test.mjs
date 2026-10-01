@@ -33,8 +33,8 @@ describe('registry publication visibility', () => {
   });
   it('has a finite deadline when npm never makes the publication visible', async () => {
     let clock = 0;
-    await expect(waitForPublication(entry, 'sha512-ok', {now:() => clock, pause:async ms => {clock += ms;}, lookup:async () => null})).rejects.toThrow('120 seconds');
-    expect(clock).toBe(120_000);
+    await expect(waitForPublication(entry, 'sha512-ok', {now:() => clock, pause:async ms => {clock += ms;}, lookup:async () => null})).rejects.toThrow('300 seconds');
+    expect(clock).toBe(300_000);
   });
   it('refuses incorrect bytes instead of retrying them', async () => {
     await expect(waitForPublication(entry, 'sha512-ok', {lookup:async () => 'sha512-wrong'})).rejects.toThrow('integrity mismatch');

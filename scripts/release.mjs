@@ -14,7 +14,7 @@ export function releaseCatalog(root) {
   return entries;
 }
 export async function publishedIntegrity(name, version, fetcher = fetch) {
-  const response = await fetcher(`https://registry.npmjs.org/${encodeURIComponent(name)}/${encodeURIComponent(version)}`, {signal:AbortSignal.timeout(15_000)});
+  const response = await fetcher(`https://registry.npmjs.org/${encodeURIComponent(name)}/${encodeURIComponent(version)}`, {signal:AbortSignal.timeout(15_000), headers:{"cache-control":"no-cache"}});
   if (response.status === 404) return null;
   if (!response.ok) throw new Error(`Registry lookup failed for ${name}@${version}: HTTP ${response.status}`);
   const metadata = await response.json();
@@ -30,7 +30,7 @@ export async function waitForPublication(entry, integrity, options = {}) {
   const lookup = options.lookup ?? publishedIntegrity;
   const now = options.now ?? Date.now;
   const pause = options.pause ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
-  const deadline = now() + 120_000;
+  const deadline = now() + 300_000;
   while (now() < deadline) {
     const published = await lookup(entry.name, entry.version);
     if (published !== null) {
@@ -39,7 +39,7 @@ export async function waitForPublication(entry, integrity, options = {}) {
     }
     await pause(Math.min(5_000, Math.max(0, deadline - now())));
   }
-  throw new Error(`Registry visibility timed out after 120 seconds for ${entry.name}@${entry.version}; rerun this release`);
+  throw new Error(`Registry visibility timed out after 300 seconds for ${entry.name}@${entry.version}; rerun this release`);
 }
 export async function release(root = process.cwd()) {
   const catalog = releaseCatalog(root);
