@@ -352,6 +352,9 @@ export class CatalystReplica {
   private readonly log: NonNullable<CatalystReplicaOptions["log"]>;
 
   private engine: ReplicaEngine | null = null;
+  /** The dynamic engine open is owned until it settles; closeAndWait must not release the lock first. */
+  private engineOpening: Promise<ReplicaEngine> | null = null;
+  private shutdownTask: Promise<void> | null = null;
   private writeDb: ReplicaWriteDb<unknown> | null = null;
   private sqlExecutor: SqlExecutor | null = null;
   private client: LiveSyncClient | null = null;
@@ -368,11 +371,9 @@ export class CatalystReplica {
   /** The claimed single-writer lock (writers only; null for readers / `:memory:` / disabled). */
   private writerLock: WriterLockHandle | null = null;
 
-  /** The in-flight seed's AbortController (CTC-281), or null when no seed is running. close() aborts
-   *  it SYNCHRONOUSLY so the pending /snapshot fetch + body read release their connection instead of
-   *  keeping the event loop referenced after close() resolved — the "close() succeeded but the
-   *  process can't exit" hostage mechanism from the incident chain. Also the seed idle-timeout's
-   *  abort seam. One controller per seed RUN (a retried seed gets a fresh one). */
+  /** The in-flight seed's AbortController (CTC-281), synchronously aborted by closeAndWait before it
+   *  joins the fetch/body-reader unwind. Also the seed idle-timeout's abort seam. One controller per
+   *  seed RUN (a retried seed gets a fresh one). */
   private seedAbort: AbortController | null = null;
 
   /** Resolved on the first 'live' status (start() = caught-up + ready to read); rejected on close /
@@ -481,7 +482,20 @@ export class CatalystReplica {
     // writer rejects here instead of racing the cursor/seed. A no-op for ':memory:' or when disabled.
     this.writerLock = claimWriterLock(this.opts.dbPath, this.opts.writerGuard ?? {}, this.log);
 
-    const engine = await this.resolveEngine();
+    const engineOpening = this.resolveEngine();
+    this.engineOpening = engineOpening;
+    let engine: ReplicaEngine;
+    try {
+      engine = await engineOpening;
+    } finally {
+      if (this.engineOpening === engineOpening) this.engineOpening = null;
+    }
+    // close() may have been requested while the sqlite driver was opening. The lock stays held until
+    // that opener settles, and a late opener is closed before migrations or any other writes begin.
+    if (this.closed) {
+      this.engine = engine;
+      throw new Error("CatalystReplica: start cancelled by close()");
+    }
     this.engine = engine;
 
     // ── CTC-582: THE ACCOUNT FENCE ────────────────────────────────────────────────────────────────
@@ -706,6 +720,7 @@ export class CatalystReplica {
       tracerName: DEFAULT_SCOPE_NAME,
       meterName: DEFAULT_SCOPE_NAME,
     });
+    if (this.closed) throw new Error("CatalystReplica: start cancelled by close()");
     this.registerMetrics();
 
     this.client = new LiveSyncClient({
@@ -713,7 +728,7 @@ export class CatalystReplica {
       accountId: this.opts.account,
       connectPath: this.opts.connectPath,
       auth: this.opts.auth,
-      reseed: () => this.seedFromSnapshot(),
+      reseed: (signal) => this.seedFromSnapshot(signal),
       getCursor: () => getCursor(this.writeDb as ReplicaWriteDb<unknown>),
       connectParams: () => this.workflowRevParams(),
       onChange: (frame) => this.applyFrame(frame),
@@ -758,14 +773,15 @@ export class CatalystReplica {
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
-        void this.close().finally(() => {
-          reject(
-            new Error(
-              `CatalystReplica.start() did not reach 'live' within ${timeoutMs}ms ` +
-                `(account=${this.opts.account}, dbPath=${this.opts.dbPath})`,
-            ),
-          );
-        });
+        const timeoutMessage =
+          `CatalystReplica.start() did not reach 'live' within ${timeoutMs}ms ` +
+          `(account=${this.opts.account}, dbPath=${this.opts.dbPath})`;
+        // Consume both shutdown outcomes. An ignored finally() promise would reject independently
+        // when cleanup fails, leaving the caller with only the timeout and an unhandled rejection.
+        void this.close().then(
+          () => reject(new Error(timeoutMessage)),
+          (cleanupError: unknown) => reject(new Error(timeoutMessage, { cause: cleanupError })),
+        );
       }, timeoutMs);
       (timer as unknown as { unref?: () => void }).unref?.();
 
@@ -800,18 +816,25 @@ export class CatalystReplica {
     this.client.resume();
   }
 
-  /** Stop the socket, release the writer lock, close the DB. Idempotent. Rejects a still-pending
-   *  start(). On a reader: no socket/lock to release — just closes the read-only handle. */
-  async close(): Promise<void> {
-    if (this.closed) return;
+  /**
+   * Compatibility shutdown entrypoint. It now acknowledges actual seed/engine settlement before
+   * releasing the writer guard or closing SQLite; callers that need an explicit lifecycle name can
+   * use closeAndWait().
+   */
+  close(): Promise<void> {
+    return this.closeAndWait();
+  }
+
+  /** Stop the socket and join engine-open and transport seed/reseed work before releasing ownership. */
+  async closeAndWait(): Promise<void> {
+    if (this.shutdownTask) return this.shutdownTask;
     this.closed = true;
     this.client?.stop();
-    // Abort any in-flight seed SYNCHRONOUSLY (CTC-281) — never await its settlement (close() must
-    // stay one-tick). Without this, the pending /snapshot fetch + un-cancelled body reader kept the
-    // TCP connection referenced after close() resolved, holding a supervised process's exit hostage.
-    // stop() ran first, so the seed's rejection lands in paths that already refuse to reopen.
+    // Abort any in-flight seed synchronously, then join its actual I/O in LiveSyncClient.stopAndWait.
     try {
-      this.seedAbort?.abort(new Error("CatalystReplica closed"));
+      const abortError = new Error("CatalystReplica closed");
+      abortError.name = "AbortError";
+      this.seedAbort?.abort(abortError);
     } catch (err) {
       this.log("warn", "seed abort threw", err);
     }
@@ -819,26 +842,49 @@ export class CatalystReplica {
     const rej = this.liveReject;
     this.clearLiveDeferred();
     rej?.(new Error("CatalystReplica: closed before first 'live'"));
-    try {
-      this.writerLock?.release();
-    } catch (err) {
-      this.log("warn", "writer-lock release threw", err);
-    }
-    this.writerLock = null;
-    // Unregister the observable-gauge callbacks so a closed replica stops being scraped + can be GC'd.
-    for (const reg of this.metricRegs) {
+    const client = this.client;
+    const shutdown = async (): Promise<void> => {
+      const failures: unknown[] = [];
+      // The replica lock remains held while either an engine opener or client-owned seed can still
+      // write. Startup checks `closed` immediately after the opener and before client construction.
+      if (this.engineOpening) await this.engineOpening.catch(() => undefined);
+      let seedIoAcknowledged = false;
       try {
-        reg.remove();
+        await client?.stopAndWait();
+        seedIoAcknowledged = true;
       } catch (err) {
-        this.log("warn", "metric unregister threw", err);
+        failures.push(err);
       }
-    }
-    this.metricRegs = [];
-    try {
-      this.engine?.close();
-    } catch (err) {
-      this.log("warn", "engine close threw", err);
-    }
+      for (const reg of this.metricRegs) {
+        try {
+          reg.remove();
+        } catch (err) {
+          failures.push(err);
+        }
+      }
+      this.metricRegs = [];
+      let engineClosed = this.engine == null;
+      try {
+        this.engine?.close();
+        engineClosed = true;
+        this.engine = null;
+      } catch (err) {
+        failures.push(err);
+      }
+      // Do not admit a successor while the old handle may still be live. Keep the sidecar on an
+      // engine-close or seed-I/O acknowledgement failure so ownership remains conservatively held.
+      if (engineClosed && seedIoAcknowledged) {
+        try {
+          this.writerLock?.release();
+          this.writerLock = null;
+        } catch (err) {
+          failures.push(err);
+        }
+      }
+      if (failures.length) throw new AggregateError(failures, "CatalystReplica shutdown failed");
+    };
+    this.shutdownTask = shutdown();
+    return this.shutdownTask;
   }
 
   // ── Reads ───────────────────────────────────────────────────────────────────────────────────────
@@ -1223,7 +1269,7 @@ export class CatalystReplica {
    * interrupted seed self-heals (getCursor → null → re-seed on the next start), preserving host-sync's
    * atomic truncate+apply+setCursor safety without holding one giant transaction.
    */
-  private async seedFromSnapshot(): Promise<number> {
+  private async seedFromSnapshot(attemptSignal?: AbortSignal): Promise<number> {
     // The whole seed (fetch + truncate + batched apply + setCursor) runs inside ONE active span so it
     // nests under the resync span when triggered by a {type:"resync"} frame, and stands alone on a cold
     // start. Active so the per-batch apply spans auto-parent under it.
@@ -1238,9 +1284,14 @@ export class CatalystReplica {
         // it synchronously. Every await below (fetch, each body chunk) is bounded by it — a hung
         // /snapshot can no longer wedge the transport in "resyncing" (no socket, no timers) or keep
         // the event loop referenced after close().
+        if (attemptSignal?.aborted) throw attemptSignal.reason;
         if (this.closed) throw new Error("CatalystReplica: seed aborted (already closed)");
         const abort = new AbortController();
         this.seedAbort = abort;
+        // Carry the transport's exact owned cancellation into fetch/body reads. A distinct cleanup
+        // error, even one named AbortError, must remain distinguishable at stopAndWait().
+        const onAttemptAbort = (): void => abort.abort(attemptSignal?.reason);
+        attemptSignal?.addEventListener("abort", onAttemptAbort, { once: true });
 
         // The idle (NO-PROGRESS) deadline: (re)armed before the fetch and on every body chunk, so a
         // big-but-flowing seed never trips it while a silent half-open connection always does.
@@ -1404,6 +1455,7 @@ export class CatalystReplica {
           throw err;
         } finally {
           clearIdle();
+          attemptSignal?.removeEventListener("abort", onAttemptAbort);
           if (this.seedAbort === abort) this.seedAbort = null;
         }
       },
@@ -1451,4 +1503,3 @@ export class CatalystReplica {
     return h;
   }
 }
-

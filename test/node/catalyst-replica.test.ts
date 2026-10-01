@@ -1067,32 +1067,38 @@ describe("CatalystReplica bounded teardown + seed abort (CTC-281)", () => {
     await expect(started).rejects.toThrow(/closed before/);
   });
 
-  it("close() resolves even when engine.close() throws (teardown never propagates)", async () => {
+  it("close() rejects an engine cleanup failure and retains its error on repeated close", async () => {
     const { sockets, factory } = recordingFactory();
     const seed = bufferedSnapshotFetch([], 0);
     const real = await nodeSqliteEngine(":memory:");
-    // Same engine, hostile close — the contract is that close() absorbs it (it already try/catches).
+    const failure = new Error("engine close boom");
+    let closeCalls = 0;
     const engine: ReplicaEngine = {
       ...real,
-      close: () => {
-        throw new Error("engine close boom");
-      },
+      close: () => { closeCalls++; throw failure; },
     };
-    const replica = track(
-      new CatalystReplica({
-        baseUrl: BASE,
-        account: "tenant-0",
-        auth: { kind: "cookie" },
-        dbPath: ":memory:",
-        engine,
-        fetchImpl: seed.fetchImpl,
-        wsFactory: factory,
-      }),
-    );
-    await startToLive(replica, sockets);
-    await settlesWithin(replica.close(), 250, "close() with a throwing engine.close()");
-    expect(replica.status).toBe("stopped");
-    real.close(); // release the real handle the wrapper shadowed
+    // This fixture intentionally cannot acknowledge cleanup. It owns its real underlying handle
+    // separately, rather than letting the normal afterEach pretend that rejected close succeeded.
+    const replica = new CatalystReplica({
+      baseUrl: BASE,
+      account: "tenant-0",
+      auth: { kind: "cookie" },
+      dbPath: ":memory:",
+      engine,
+      fetchImpl: seed.fetchImpl,
+      wsFactory: factory,
+    });
+    try {
+      await startToLive(replica, sockets);
+      await expect(replica.close()).rejects.toMatchObject({
+        message: "CatalystReplica shutdown failed", errors: [failure],
+      });
+      await expect(replica.close()).rejects.toMatchObject({
+        message: "CatalystReplica shutdown failed", errors: [failure],
+      });
+      expect(closeCalls).toBe(1);
+      expect(replica.status).toBe("stopped");
+    } finally { real.close(); }
   });
 
   it("snapshotIdleTimeoutMs: a no-progress /snapshot aborts the seed — start() fails fast instead of wedging in 'resyncing' forever (W3)", async () => {

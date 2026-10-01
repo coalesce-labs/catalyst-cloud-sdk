@@ -196,6 +196,167 @@ describe("claimWriterLock — ownerKey fast-reclaim (kill -9 + fast relaunch)", 
 });
 
 describe("CatalystReplica writer guard — end to end", () => {
+  it("holds the writer guard through a pending engine open and cancels before migration", async () => {
+    const dbPath = tmpDbPath();
+    let releaseOpen!: () => void;
+    const openGate = new Promise<void>((resolve) => {
+      releaseOpen = resolve;
+    });
+    let engineClosed = false;
+    let migrationWrites = 0;
+    const replica = new CatalystReplica({
+      baseUrl: BASE,
+      account: "tenant-0",
+      auth: { kind: "cookie" },
+      dbPath,
+      engine: async (path) => {
+        await openGate;
+        const engine = await nodeSqliteEngine(path);
+        const instrumented: typeof engine = {
+          ...engine,
+          exec: (sql) => { migrationWrites += 1; engine.exec(sql); },
+          run: (sql, ...bindings) => { migrationWrites += 1; return engine.run(sql, ...bindings); },
+          close: () => { engineClosed = true; engine.close(); },
+        };
+        return instrumented;
+      },
+      fetchImpl: emptySnapshotFetch(),
+    });
+    replicas.push(replica);
+
+    const start = replica.start();
+    expect(fs.existsSync(`${dbPath}.writer.lock`)).toBe(true);
+    const shutdown = replica.closeAndWait();
+    await Promise.resolve();
+    expect(fs.existsSync(`${dbPath}.writer.lock`)).toBe(true);
+
+    releaseOpen();
+    await expect(start).rejects.toThrow(/cancelled by close/);
+    await shutdown;
+    expect(engineClosed).toBe(true);
+    expect(migrationWrites).toBe(0);
+    expect(fs.existsSync(`${dbPath}.writer.lock`)).toBe(false);
+  });
+
+  it("keeps the writer guard until the cancelled snapshot reader acknowledges cleanup", async () => {
+    const dbPath = tmpDbPath();
+    let releaseCancel!: () => void;
+    let cancelSeen = false;
+    let readPending = false;
+    let engineClosed = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"cursor":0}\n'));
+      },
+      pull() {
+        readPending = true;
+        return new Promise<void>(() => {}); // hold the second read until close() cancels the reader
+      },
+      cancel() {
+        cancelSeen = true;
+        return new Promise<void>((resolve) => { releaseCancel = resolve; });
+      },
+    });
+    const replica = new CatalystReplica({
+      baseUrl: BASE,
+      account: "tenant-0",
+      auth: { kind: "cookie" },
+      dbPath,
+      engine: async (path) => {
+        const engine = await nodeSqliteEngine(path);
+        return { ...engine, close: () => { engineClosed = true; engine.close(); } };
+      },
+      fetchImpl: (async () => new Response(body, { status: 200 })) as typeof fetch,
+    });
+    replicas.push(replica);
+
+    const start = replica.start();
+    await vi.waitFor(() => expect(fs.existsSync(`${dbPath}.writer.lock`)).toBe(true));
+    await vi.waitFor(() => expect(readPending).toBe(true));
+    const shutdown = replica.closeAndWait();
+    await vi.waitFor(() => expect(cancelSeen).toBe(true));
+    expect(fs.existsSync(`${dbPath}.writer.lock`)).toBe(true);
+    expect(engineClosed).toBe(false);
+
+    releaseCancel();
+    await expect(start).rejects.toThrow();
+    await shutdown;
+    expect(engineClosed).toBe(true);
+    expect(fs.existsSync(`${dbPath}.writer.lock`)).toBe(false);
+  });
+
+  it("reports a real reader-cancel AbortError and keeps ownership after closing the engine", async () => {
+    const dbPath = tmpDbPath();
+    const failedCancel = new Error("reader cleanup aborted independently");
+    failedCancel.name = "AbortError";
+    let readPending = false;
+    let cancelSeen = false;
+    let engineClosed = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"cursor":0}\n'));
+      },
+      pull() {
+        readPending = true;
+        return new Promise<void>(() => {});
+      },
+      cancel() {
+        cancelSeen = true;
+        return Promise.reject(failedCancel);
+      },
+    });
+    const fetchImpl: typeof fetch = async () => new Response(body, { status: 200 });
+    const replica = new CatalystReplica({
+      baseUrl: BASE,
+      account: "tenant-0",
+      auth: { kind: "cookie" },
+      dbPath,
+      engine: async (path) => {
+        const engine = await nodeSqliteEngine(path);
+        return { ...engine, close: () => { engineClosed = true; engine.close(); } };
+      },
+      fetchImpl,
+    });
+    replicas.push(replica);
+    const starting = replica.start();
+    const startFailure = starting.catch((error: unknown) => error);
+    await vi.waitFor(() => expect(readPending).toBe(true));
+    const failure: unknown = await replica.closeAndWait().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    if (!(failure instanceof AggregateError)) throw new Error("shutdown did not preserve failed cancel");
+    const seedFailure: unknown = failure.errors[0];
+    expect(seedFailure).toBeInstanceOf(AggregateError);
+    if (!(seedFailure instanceof AggregateError)) throw new Error("missing transport cleanup failure");
+    expect(seedFailure.errors).toEqual([failedCancel]);
+    expect(cancelSeen).toBe(true);
+    expect(engineClosed).toBe(true);
+    expect(fs.existsSync(`${dbPath}.writer.lock`)).toBe(true);
+    expect(() => claimWriterLock(dbPath, {})).toThrow(/another writer owns this replica/);
+    expect(await startFailure).toBeInstanceOf(Error);
+  });
+
+  it("surfaces engine-close failure and keeps the writer guard held", async () => {
+    const dbPath = tmpDbPath();
+    const { sockets, factory } = recordingFactory();
+    const replica = new CatalystReplica({
+      baseUrl: BASE,
+      account: "tenant-0",
+      auth: { kind: "cookie" },
+      dbPath,
+      engine: async (path) => {
+        const engine = await nodeSqliteEngine(path);
+        return { ...engine, close: () => { throw new Error("close sentinel"); } };
+      },
+      fetchImpl: emptySnapshotFetch(),
+      wsFactory: factory,
+    });
+    replicas.push(replica);
+    await startToLive(replica, sockets);
+
+    await expect(replica.closeAndWait()).rejects.toThrow(/shutdown failed/);
+    expect(fs.existsSync(`${dbPath}.writer.lock`)).toBe(true);
+  });
+
   it("rejects a second concurrent writer on the same file", async () => {
     const dbPath = tmpDbPath();
     const w1 = newWriter(dbPath);
@@ -232,6 +393,47 @@ describe("CatalystReplica writer guard — end to end", () => {
 });
 
 describe("CatalystReplica startTimeoutMs — fail-fast on a wedged start", () => {
+  it("consumes timeout cleanup rejection and retains its actual cause", async () => {
+    const dbPath = tmpDbPath();
+    const closeFailure = new Error("timeout engine close failed");
+    const opened: { close: (() => void) | null } = { close: null };
+    const { sockets, factory } = recordingFactory();
+    const replica = new CatalystReplica({
+      baseUrl: BASE,
+      account: "tenant-0",
+      auth: { kind: "cookie" },
+      dbPath,
+      startTimeoutMs: 100,
+      engine: async (path) => {
+        const engine = await nodeSqliteEngine(path);
+        opened.close = () => engine.close();
+        return { ...engine, close: () => { throw closeFailure; } };
+      },
+      fetchImpl: emptySnapshotFetch(),
+      wsFactory: factory,
+    });
+    replicas.push(replica);
+    try {
+      // Never open the socket. The real deadline initiates the rejecting close path.
+      const failure: unknown = await replica.start().catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(Error);
+      if (!(failure instanceof Error)) throw new Error("start did not report its timeout");
+      expect(failure.message).toMatch(/did not reach 'live' within 100ms/);
+      expect(failure.cause).toBeInstanceOf(AggregateError);
+      if (!(failure.cause instanceof AggregateError)) throw new Error("timeout lost cleanup cause");
+      expect(failure.cause.errors).toContain(closeFailure);
+      expect(sockets).toHaveLength(1);
+      expect(sockets[0]?.closed).toBe(true);
+      expect(fs.existsSync(`${dbPath}.writer.lock`)).toBe(true);
+      // Let the runtime emit any ignored derived rejection; Vitest treats it as an unhandled error.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    } finally {
+      // The intentionally failing engine port cannot clean its native handle; the test owns it.
+      opened.close?.();
+    }
+  });
+
   it("rejects within the timeout when start() never reaches 'live', then leaves no held lock / open socket", async () => {
     const dbPath = tmpDbPath();
     const w = newWriter(dbPath, { startTimeoutMs: 100 });
