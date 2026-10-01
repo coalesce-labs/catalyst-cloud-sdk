@@ -47,6 +47,8 @@ The replica modules own the schema, replication and shared-query dependencies. T
 
 Existing `/node`, `/browser`, `/browser/db-worker` and `/events` paths remain compatibility exports. From 0.14, users of those replica paths must install the corresponding optional module or explicitly install their SQL peers. New explicit `/replica/node`, `/replica/browser` and `/replica/browser/db-worker` aliases identify the opt-in. Default HTTP/live installs do not need those peers. The root and HTTP declaration bundles contain the pinned wire view types so a TypeScript consumer does not need a SQL package merely to read a response.
 
+Before updating catalyst-cloud consumers, adapt its schema-publish gate to validate the optional replica modules and install the appropriate module alongside any compatibility replica import. The current gate deliberately reads schema pins only from SDK hard dependencies, so it will reject a 0.14 core-only pin as unrecognized. Keep existing cloud consumers on 0.13 until that migration passes.
+
 Build and pack the core and optional modules together before release. Publish core 0.14 first, then the matching optional modules; their SDK peer requires the new replica aliases. The module manifests are release artifacts in `modules/`. New npm packages need their own trusted-publishing setup before registry publication.
 
 The remaining examples describe the optional transport and replica lifecycle.
