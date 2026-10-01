@@ -42,3 +42,6 @@ jobs:
 
       - name: Test
         run: bunx vitest run
+
+      - name: Packed consumer and optional module boundaries
+        run: bun run test:pack
