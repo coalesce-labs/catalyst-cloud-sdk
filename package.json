@@ -81,7 +81,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node scripts/build-wire-types.mjs && esbuild src/node.ts --bundle --platform=node --format=esm --target=node22 --external:bun:sqlite --external:better-sqlite3 --external:@opentelemetry/api --outfile=dist/node.js",
+    "build": "tsc -p tsconfig.build.json && node scripts/build-wire-types.mjs && node scripts/build-node.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepublishOnly": "npm run build",
