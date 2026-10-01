@@ -20,7 +20,11 @@ try {
   const modulePack = JSON.parse(execFileSync('npm',['pack','--json','--pack-destination',consumer],{cwd:join(root,'modules/replica-node'),encoding:'utf8'}))[0];
   execFileSync('npm',['install','--ignore-scripts','--no-audit','--no-fund',join(consumer,modulePack.filename)],{cwd:consumer,stdio:'pipe'});
   assert.equal(existsSync(join(consumer,'node_modules/@catalyst-cloud/replicate')),true,'optional module did not install replication');
-  execFileSync('node',['--input-type=module','-e','const {CatalystReplica} = await import("@catalyst-cloud/sdk-replica-node"); if (typeof CatalystReplica.openReadOnly !== "function") process.exit(1);'],{cwd:consumer,stdio:'inherit'});
+  // Skip third-party SQL declaration checks; the live-class assignment is still checked.
+  writeFileSync(join(consumer,'identity.ts'),'import {LiveSyncClient as CoreClient} from "@catalyst-cloud/sdk"; import {LiveSyncClient as NativeClient} from "@catalyst-cloud/sdk-replica-node"; const core: typeof CoreClient = NativeClient; void core;\n');
+  writeFileSync(join(consumer,'tsconfig.json'), JSON.stringify({compilerOptions:{noEmit:true,strict:true,module:'ES2022',moduleResolution:'Bundler',target:'ES2022',types:[],skipLibCheck:true},files:['index.ts','identity.ts']}));
+  execFileSync(resolve('node_modules/.bin/tsc'),['-p',join(consumer,'tsconfig.json')],{cwd:consumer,stdio:'inherit'});
+  execFileSync('node',['--input-type=module','-e','const {CatalystReplica} = await import("@catalyst-cloud/sdk-replica-node"); if (typeof CatalystReplica.openReadOnly !== "function") process.exit(1); const core = await import("@catalyst-cloud/sdk"); const native = await import("@catalyst-cloud/sdk-replica-node"); if (core.AuthError !== native.AuthError || core.LiveSyncClient !== native.LiveSyncClient) throw new Error("Native entry duplicated live classes");'],{cwd:consumer,stdio:'inherit'});
   const browserPack = JSON.parse(execFileSync('npm',['pack','--json','--pack-destination',consumer],{cwd:join(root,'modules/replica-browser'),encoding:'utf8'}))[0];
   execFileSync('npm',['install','--ignore-scripts','--no-audit','--no-fund',join(consumer,browserPack.filename)],{cwd:consumer,stdio:'pipe'});
   assert.equal(existsSync(join(consumer,'node_modules/@sqlite.org/sqlite-wasm')),true,'browser module did not resolve driver peer');
