@@ -1,14 +1,55 @@
 # @catalyst-cloud/sdk
 
-**Keep a live local copy of your Linear and GitHub project data — pushed to you in real time, without polling rate limits or webhook tunnels.**
+Read Catalyst's cloud mirror through the typed HTTP client. Subscribe to live updates without starting SQLite or downloading a tenant replica. Catalyst ingests Linear and GitHub once for the tenant; clients read the mirror rather than each polling the providers.
 
-When you run coding agents at scale — dozens or more working in parallel — they all need the same live view of your Linear and GitHub state to coordinate, and you quickly hit the rate limits of the very systems your team depends on. catalyst-cloud is a service that mirrors your Linear + GitHub state **once** and pushes every change out to your fleet; this SDK is how your code subscribes to that stream and keeps a local copy current.
+```sh
+npm install @catalyst-cloud/sdk
+```
 
-## Why
+```ts
+import { createTenantClient } from "@catalyst-cloud/sdk";
 
-- **Real-time updates, no tunnels.** catalyst-cloud is the single webhook subscriber for your Linear and GitHub. Changes are **pushed** to you over an outbound connection — so you never stand up a public endpoint, smee/ngrok tunnel, or webhook gateway just to hear about an update locally.
-- **One subscriber, not N.** Your whole fleet reads from the shared mirror instead of each agent polling Linear and GitHub directly — so a large fleet doesn't multiply load against those rate limits.
-- **A local copy, not just a feed.** You don't get a firehose of events to babysit — you get your data, kept current, that you can query locally.
+const client = createTenantClient({
+  baseUrl: "https://staging.catalystcloud.dev",
+  auth: { kind: "bearer", getToken: async () => credentialProvider.accessToken() },
+});
+const result = await client.issues.get("CTC-4504");
+if (result.outcome === "ok") console.log(result.issue);
+```
+
+Use your existing credential provider for token refresh. A native desktop process owns its bearer and returns typed data to the webview. The internal web BFF is cookie-only and is not a supported SDK contract. Read methods retain the deployed tenant contract; this release does not invent the projected or batched routes proposed by the API research.
+
+## Imports
+
+| Import | Purpose | Local database |
+| --- | --- | --- |
+| `@catalyst-cloud/sdk` | Typed HTTP and live transport | None |
+| `@catalyst-cloud/sdk/http` | HTTP client only | None |
+| `@catalyst-cloud/sdk/live` | Storage-independent WebSocket transport | None |
+| `@catalyst-cloud/sdk-replica-node` | Optional Node/Bun replica | Native SQLite |
+| `@catalyst-cloud/sdk-replica-browser` | Optional browser replica | SQLite WASM and OPFS |
+| `@catalyst-cloud/sdk/events` | Existing opt-in Node event cache | Local JSONL files |
+
+`LiveSyncClient` is a change-feed transport. The caller supplies cursor and resync handlers. Importing or constructing it does not open a database. A consumer may use changes to invalidate cloud views; replay underflow requires refreshing those views and its cursor, not seeding SQL. An authoritative domain-event stream is separate from this row feed.
+
+## Optional replicas and migration from 0.13
+
+Local sync is optional for every client. There is no offline-browsing promise. A disconnected cache is stale and cannot authorize a write. Execution hosts may keep their shared replicas while cloud capacity is measured. Native desktop caching uses the same supervised per-tenant daemon as the CLI and hosts. A desktop window opens a read-only reader instead of creating a second writer.
+
+```sh
+# Only when local SQL is required
+npm install @catalyst-cloud/sdk-replica-node
+# Browser SQL also needs its explicit driver peer
+npm install @catalyst-cloud/sdk-replica-browser @sqlite.org/sqlite-wasm
+```
+
+The replica modules own the schema, replication and shared-query dependencies. The Node module uses built-in SQLite on Bun or Node 22; `better-sqlite3` is an optional injected driver peer. The browser module declares its SQLite WASM peer separately. npm has no per-export peer dependencies, so these are separate optional package manifests rather than pretending a subpath can own peers.
+
+Existing `/node`, `/browser`, `/browser/db-worker` and `/events` paths remain compatibility exports. From 0.14, users of those replica paths must install the corresponding optional module or explicitly install their SQL peers. New explicit `/replica/node`, `/replica/browser` and `/replica/browser/db-worker` aliases identify the opt-in. Default HTTP/live installs do not need those peers. The root and HTTP declaration bundles contain the pinned wire view types so a TypeScript consumer does not need a SQL package merely to read a response.
+
+Build and pack the core and optional modules together before release. Publish core 0.14 first, then the matching optional modules; their SDK peer requires the new replica aliases. The module manifests are release artifacts in `modules/`. New npm packages need their own trusted-publishing setup before registry publication.
+
+The remaining examples describe the optional transport and replica lifecycle.
 
 ## Coverage
 
@@ -23,11 +64,6 @@ A catalyst-cloud account and an auth token. (In the browser, a same-origin sessi
 ```sh
 npm install @catalyst-cloud/sdk
 ```
-
-## Today, and where this is going
-
-- **Today** — the SDK is the live-sync client. It keeps your local store current: it manages the connection, replays anything you missed while disconnected, and recovers automatically. You provide the storage (any SQLite, OPFS in the browser, or in-memory) and apply each change.
-- **Coming** — a fully managed local replica: a strongly-typed SQLite database you read **directly via [Drizzle ORM](https://orm.drizzle.team)**, with the syncing handled for you. The typed read layer already exists; we're folding it into the SDK so the database is something you read, not something you assemble.
 
 ## Usage
 
