@@ -26,6 +26,21 @@ export function publicationNeeded(entry, packedIntegrity, registryIntegrity) {
   if (registryIntegrity !== packedIntegrity) throw new Error(`Published bytes differ for ${entry.name}@${entry.version}; bump the version instead of replacing it`);
   return false;
 }
+export async function waitForPublication(entry, integrity, options = {}) {
+  const lookup = options.lookup ?? publishedIntegrity;
+  const now = options.now ?? Date.now;
+  const pause = options.pause ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const deadline = now() + 120_000;
+  while (now() < deadline) {
+    const published = await lookup(entry.name, entry.version);
+    if (published !== null) {
+      if (published !== integrity) throw new Error(`Publication integrity mismatch for ${entry.name}@${entry.version}`);
+      return;
+    }
+    await pause(Math.min(5_000, Math.max(0, deadline - now())));
+  }
+  throw new Error(`Registry visibility timed out after 120 seconds for ${entry.name}@${entry.version}; rerun this release`);
+}
 export async function release(root = process.cwd()) {
   const catalog = releaseCatalog(root);
   if (process.env.GITHUB_EVENT_NAME === 'release' && process.env.GITHUB_REF_NAME !== `v${catalog[0].version}`) throw new Error('Release tag does not match the package version');
@@ -49,8 +64,7 @@ export async function release(root = process.cwd()) {
         delete env.SDK_BOOTSTRAP_TOKEN;
       }
       execFileSync('npm', ['publish', join(scratch, packed.filename), '--provenance', '--access', 'public'], {cwd:root, env, stdio:'inherit'});
-      const verified = await publishedIntegrity(entry.name, entry.version);
-      if (verified !== packed.integrity) throw new Error(`Publication verification failed for ${entry.name}@${entry.version}`);
+      await waitForPublication(entry, packed.integrity);
       console.log(`Verified publication: ${entry.name}@${entry.version}`);
     }
   } finally { rmSync(scratch, {recursive:true, force:true}); }

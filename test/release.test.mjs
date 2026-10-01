@@ -1,5 +1,5 @@
 import {describe, it, expect} from 'vitest';
-import {publishedIntegrity, publicationNeeded, releaseCatalog} from '../scripts/release.mjs';
+import {publishedIntegrity, publicationNeeded, releaseCatalog, waitForPublication} from '../scripts/release.mjs';
 
 describe('release recovery', () => {
   const entry = {name:'@catalyst-cloud/sdk', version:'0.14.0'};
@@ -19,5 +19,24 @@ describe('release recovery', () => {
   it('keeps optional modules on the core version and publishes core first', () => {
     const entries = releaseCatalog(process.cwd());
     expect(entries.map(entry => entry.name)).toEqual(['@catalyst-cloud/sdk','@catalyst-cloud/sdk-replica-node','@catalyst-cloud/sdk-replica-browser']);
+  });
+});
+
+describe('registry publication visibility', () => {
+  const entry = {name:'@catalyst-cloud/sdk', version:'0.14.0'};
+  it('waits for a processing package to become visible', async () => {
+    let clock = 0;
+    let calls = 0;
+    await waitForPublication(entry, 'sha512-ok', {now:() => clock, pause:async ms => {clock += ms;}, lookup:async () => ++calls < 3 ? null : 'sha512-ok'});
+    expect(calls).toBe(3);
+    expect(clock).toBe(10_000);
+  });
+  it('has a finite deadline when npm never makes the publication visible', async () => {
+    let clock = 0;
+    await expect(waitForPublication(entry, 'sha512-ok', {now:() => clock, pause:async ms => {clock += ms;}, lookup:async () => null})).rejects.toThrow('120 seconds');
+    expect(clock).toBe(120_000);
+  });
+  it('refuses incorrect bytes instead of retrying them', async () => {
+    await expect(waitForPublication(entry, 'sha512-ok', {lookup:async () => 'sha512-wrong'})).rejects.toThrow('integrity mismatch');
   });
 });
