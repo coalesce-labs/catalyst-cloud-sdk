@@ -6,4 +6,4 @@ Install this module only when you need local SQL. The default `@catalyst-cloud/s
 import { BrowserReplica } from "@catalyst-cloud/sdk-replica-browser";
 ```
 
-An optional native cache shares the supervised tenant daemon. Readers use `openReadOnly`; they never start a second writer. No offline-browsing promise.
+The browser replica uses the SDK worker and origin lock for its lifecycle. This is an explicit opt-in; it is not the default web read path and makes no offline-browsing promise. A native desktop cache uses the Node module and the supervised tenant daemon instead.
