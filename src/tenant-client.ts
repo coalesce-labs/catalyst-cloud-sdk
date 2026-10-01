@@ -355,8 +355,22 @@ export interface KeysetPageMeta {
 }
 
 export type IssueListResult = ({ outcome: "ok"; rows: IssueView[] } & KeysetPageMeta) | TenantClientFailure;
+/** CTC-1889 — the ticket's repair loop: remediate rounds, validate attempts, an active hold and the
+ *  parks that apply. The server's detail handler adds it after the view builder, and only when there
+ *  is something to show, so it is absent rather than null on a quiet ticket. Mirrors the cloud's
+ *  `TicketRepairLoopWire` (apps/mirror/src/do/ticket-repair-loop.ts). */
+export interface TicketRepairLoop {
+  remediateRounds: number;
+  validateAttempts: number;
+  hold: { reason: string; headSha: string | null; heldAtMs: number } | null;
+  parks: ReadonlyArray<{ phase: string; sentinel: string; label: string }>;
+}
+
+/** `GET /api/v1/issues/:identifier`: the read-model's detail view plus the server-added fields. */
+export type IssueDetail = IssueDetailView & { repairLoop?: TicketRepairLoop };
+
 export type IssueGetResult =
-  | { outcome: "ok"; issue: IssueDetailView; head: number | null }
+  | { outcome: "ok"; issue: IssueDetail; head: number | null }
   | { outcome: "not-found"; status: 404 }
   | TenantClientFailure;
 
@@ -441,8 +455,8 @@ export interface ReadSelectRefusal {
 
 /** A selected issue: any key may be absent, and the server always keeps `identifier`. */
 export type ProjectedIssueDetail = {
-  [K in keyof IssueDetailView as K extends "identifier" ? never : K]?: IssueDetailView[K];
-} & { identifier: IssueDetailView["identifier"] } extends infer T
+  [K in keyof IssueDetail as K extends "identifier" ? never : K]?: IssueDetail[K];
+} & { identifier: IssueDetail["identifier"] } extends infer T
   ? { [K in keyof T]: T[K] }
   : never;
 export type IssueGetProjectedResult =
@@ -481,17 +495,48 @@ export interface EventIndexCoverage {
 }
 
 /** One backbone event, verbatim: the same object a `/events/backbone` line carries. ⛔ DOCUMENTED,
- *  not compiled; only the container is checked, so a field the cloud adds reaches the caller. */
-export interface QueriedEvent {
-  readonly sequence?: number;
-  readonly type?: string;
+ *  not compiled beyond `sequence` and `type`, so a field the cloud adds reaches the caller. */
+export interface QueriedBackboneEvent {
+  readonly sequence: number;
+  readonly type: string;
+  readonly bodyUnavailable?: undefined;
   readonly [key: string]: unknown;
 }
+
+/** An event whose body the cloud never archived (its archive write was given up on). The page
+ *  serves this stub in the event's place, never a gap, so a cursor never skips it unseen. */
+export interface QueriedEventStub {
+  readonly tenantId: string;
+  readonly sequence: number;
+  readonly eventId: string;
+  readonly type: string;
+  readonly ticket?: string;
+  readonly bodyUnavailable: true;
+  /** `archive_write_failed` today. */
+  readonly reason: string;
+}
+
+/** Branch on `bodyUnavailable === true`. */
+export type QueriedEvent = QueriedBackboneEvent | QueriedEventStub;
 
 export type EventQueryResult =
   | { outcome: "ok"; status: 200; events: QueriedEvent[]; next: EventQueryCursor | null; coverage: EventIndexCoverage }
   /** The server has no event query route (404). Fall back; this is not "no events". */
   | { outcome: "unsupported"; status: 404; reason: string }
+  /** One event is larger than a whole page (413). `next` resumes past it; `pages()` does so itself. */
+  | { outcome: "too-large"; status: 413; sequence: number; maxBytes: number; eventBytes: number; next: EventQueryCursor }
+  /** The index or archive could not be read (503). Retry the same request: `resume` is the cursor
+   *  this request sent (null on a first page), and `sequence` names the event whose read failed. */
+  | {
+      outcome: "unavailable";
+      status: 503;
+      error: "archive_read_failed" | "index_unavailable" | "archive_unavailable";
+      retryable: true;
+      sequence: number | null;
+      resume: EventQueryCursor | null;
+    }
+  /** A `type` outside the cloud's durable registry (400). `types` lists every one it refused. */
+  | { outcome: "event-type-refused"; status: 400; types: string[]; reason: string }
   | TenantClientFailure;
 
 // ── The diagnosis / telemetry reads — CTC-2132 (Ryan/M2: customer delegate agents diagnosing and
@@ -1125,6 +1170,68 @@ function eventQueryCursor(value: unknown): value is EventQueryCursor {
   );
 }
 
+/** A full event needs a sequence and a type; a stub also needs its id. */
+function queriedEvent(value: unknown): value is QueriedEvent {
+  if (!isRecord(value) || !Number.isSafeInteger(value["sequence"]) || typeof value["type"] !== "string") {
+    return false;
+  }
+  if (value["bodyUnavailable"] === undefined) return true;
+  return value["bodyUnavailable"] === true && typeof value["eventId"] === "string" && typeof value["reason"] === "string";
+}
+
+const UNAVAILABLE_ERRORS = new Set<string>(["archive_read_failed", "index_unavailable", "archive_unavailable"]);
+
+/** The cursor a request sent, in the order it pages: what a retry of the same page sends again. */
+function sentCursor(params: EventQueryParams): EventQueryCursor | null {
+  if ((params.order ?? "desc") === "asc") {
+    return params.afterSeq === undefined ? null : { param: "afterSeq", value: params.afterSeq };
+  }
+  return params.beforeSeq === undefined ? null : { param: "beforeSeq", value: params.beforeSeq };
+}
+
+/** The event query's own refusals as typed arms, or `null` for any other answer (left to `classify`). */
+function eventQueryRefusal(answer: Answer, params: EventQueryParams): EventQueryResult | null {
+  const rec = isRecord(answer.json) ? answer.json : null;
+  const error = rec === null ? null : stringField(rec, "error");
+  if (rec === null || error === null) return null;
+  if (answer.status === 413 && error === "event_too_large") {
+    const sequence = rec["sequence"];
+    const next = rec["next"];
+    if (!Number.isSafeInteger(sequence) || !eventQueryCursor(next)) {
+      return { outcome: "shape", status: 413, reason: "event_too_large did not name its sequence and next cursor" };
+    }
+    return {
+      outcome: "too-large",
+      status: 413,
+      sequence: sequence as number,
+      maxBytes: numberField(rec, "maxBytes") ?? 0,
+      eventBytes: numberField(rec, "eventBytes") ?? 0,
+      next,
+    };
+  }
+  if (answer.status === 503 && UNAVAILABLE_ERRORS.has(error)) {
+    const sequence = rec["sequence"];
+    return {
+      outcome: "unavailable",
+      status: 503,
+      error: error as "archive_read_failed" | "index_unavailable" | "archive_unavailable",
+      retryable: true,
+      sequence: Number.isSafeInteger(sequence) ? (sequence as number) : null,
+      resume: sentCursor(params),
+    };
+  }
+  if (answer.status === 400 && error === "unknown_event_type") {
+    const types = rec["types"];
+    return {
+      outcome: "event-type-refused",
+      status: 400,
+      types: Array.isArray(types) ? types.filter((t): t is string => typeof t === "string") : [],
+      reason: stringField(rec, "detail") ?? error,
+    };
+  }
+  return null;
+}
+
 function eventIndexCoverage(value: unknown): value is EventIndexCoverage {
   const seq = (v: unknown) => v === null || Number.isSafeInteger(v);
   return isRecord(value) && seq(value["indexedFromSeq"]) && seq(value["indexedToSeq"]);
@@ -1681,12 +1788,12 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     const { answer } = sent;
     // The route takes no resource id, so a 404 can only mean the server predates it.
     if (answer.status === 404) return { outcome: "unsupported", status: 404, reason: "this server has no GET /api/v1/events/query" };
-    if (answer.status !== 200) return classify(answer);
+    if (answer.status !== 200) return eventQueryRefusal(answer, params) ?? classify(answer);
     const body = answer.json;
     if (
       !isRecord(body) ||
       !Array.isArray(body["events"]) ||
-      !body["events"].every(isRecord) ||
+      !body["events"].every(queriedEvent) ||
       !(body["next"] === null || eventQueryCursor(body["next"])) ||
       !eventIndexCoverage(body["coverage"])
     ) {
@@ -1702,14 +1809,16 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
   }
 
   /** Every page from `params` on, following `next`. Yields each page, and ends after the last one or
-   *  after the first page that is not `ok` (yielded, never thrown). */
+   *  after the first page that is neither `ok` nor `too-large` (yielded, never thrown). A
+   *  `too-large` event is yielded and stepped past through its own `next`. */
   async function* eventsPages(params: EventQueryParams = {}): AsyncGenerator<EventQueryResult, void, undefined> {
     let current = params;
     let previous: EventQueryCursor | null = null;
     for (;;) {
       const page = await eventsQuery(current);
       yield page;
-      if (page.outcome !== "ok" || page.next === null) return;
+      if (page.outcome !== "ok" && page.outcome !== "too-large") return;
+      if (page.next === null) return;
       if (previous !== null && previous.param === page.next.param && previous.value === page.next.value) {
         // A cursor that does not move would page forever.
         yield { outcome: "shape", status: 200, reason: `GET /api/v1/events/query repeated next ${page.next.param}=${page.next.value}` };

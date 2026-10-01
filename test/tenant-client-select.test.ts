@@ -6,7 +6,12 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import type { IssueDetailView } from "@catalyst-cloud/read-model";
 import { json, scriptedFetch } from "./helpers/scripted-fetch";
-import { createTenantClient, type IssueGetResult, type TicketExecutionResult } from "../src/index";
+import {
+  createTenantClient,
+  type IssueGetResult,
+  type TicketExecutionResult,
+  type TicketRepairLoop,
+} from "../src/index";
 
 const BASE = "https://cloud.example";
 const KEY = "ctc_user_reader";
@@ -121,5 +126,38 @@ describe("issues.execution with a selection", () => {
     ]);
     const r = await c.issues.execution("ENG-1", { projection: "brief" as "status" });
     expect(r).toMatchObject({ outcome: "select-refused", status: 400, error: "unknown_projection", allowed: ["status", "failures"] });
+  });
+});
+
+// ── repairLoop (CTC-1889): the server's detail handler adds it after the view builder, and both
+//    projections (`status`, `brief`) name it, so it is typed on the full and the selected issue. ──
+
+const REPAIR_LOOP = {
+  remediateRounds: 2,
+  validateAttempts: 3,
+  hold: { reason: "validate-budget", headSha: "abc123", heldAtMs: 1_700_000_000_000 },
+  parks: [{ phase: "validate", sentinel: "repeated_failure", label: "repeated failures" }],
+};
+
+describe("repairLoop is typed on the issue", () => {
+  it("a projected read carries it", async () => {
+    const { c } = client([() => json(200, { identifier: "ENG-1", repairLoop: REPAIR_LOOP })]);
+    const r = await c.issues.get("ENG-1", { projection: "status" });
+    if (r.outcome !== "ok") throw new Error(r.outcome);
+    expect(r.issue.repairLoop).toEqual(REPAIR_LOOP);
+    expectTypeOf(r.issue.repairLoop).toEqualTypeOf<TicketRepairLoop | undefined>();
+  });
+
+  it("the full read carries it too", async () => {
+    const { c } = client([() => json(200, { identifier: "ENG-1", title: "t", repairLoop: REPAIR_LOOP })]);
+    const r = await c.issues.get("ENG-1");
+    if (r.outcome !== "ok") throw new Error(r.outcome);
+    expect(r.issue.repairLoop?.remediateRounds).toBe(2);
+    expectTypeOf(r.issue.repairLoop).toEqualTypeOf<TicketRepairLoop | undefined>();
+    expectTypeOf<TicketRepairLoop["hold"]>().toEqualTypeOf<{
+      reason: string;
+      headSha: string | null;
+      heldAtMs: number;
+    } | null>();
   });
 });
