@@ -14,7 +14,7 @@ export function releaseCatalog(root) {
   return entries;
 }
 export async function publishedIntegrity(name, version, fetcher = fetch) {
-  const response = await fetcher(`https://registry.npmjs.org/${encodeURIComponent(name)}/${encodeURIComponent(version)}`, {signal:AbortSignal.timeout(15_000)});
+  const response = await fetcher(`https://registry.npmjs.org/${encodeURIComponent(name)}/${encodeURIComponent(version)}`, {signal:AbortSignal.timeout(15_000), headers:{"cache-control":"no-cache"}});
   if (response.status === 404) return null;
   if (!response.ok) throw new Error(`Registry lookup failed for ${name}@${version}: HTTP ${response.status}`);
   const metadata = await response.json();
@@ -25,6 +25,21 @@ export function publicationNeeded(entry, packedIntegrity, registryIntegrity) {
   if (registryIntegrity === null) return true;
   if (registryIntegrity !== packedIntegrity) throw new Error(`Published bytes differ for ${entry.name}@${entry.version}; bump the version instead of replacing it`);
   return false;
+}
+export async function waitForPublication(entry, integrity, options = {}) {
+  const lookup = options.lookup ?? publishedIntegrity;
+  const now = options.now ?? Date.now;
+  const pause = options.pause ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const deadline = now() + 300_000;
+  while (now() < deadline) {
+    const published = await lookup(entry.name, entry.version);
+    if (published !== null) {
+      if (published !== integrity) throw new Error(`Publication integrity mismatch for ${entry.name}@${entry.version}`);
+      return;
+    }
+    await pause(Math.min(5_000, Math.max(0, deadline - now())));
+  }
+  throw new Error(`Registry visibility timed out after 300 seconds for ${entry.name}@${entry.version}; rerun this release`);
 }
 export async function release(root = process.cwd()) {
   const catalog = releaseCatalog(root);
@@ -49,8 +64,7 @@ export async function release(root = process.cwd()) {
         delete env.SDK_BOOTSTRAP_TOKEN;
       }
       execFileSync('npm', ['publish', join(scratch, packed.filename), '--provenance', '--access', 'public'], {cwd:root, env, stdio:'inherit'});
-      const verified = await publishedIntegrity(entry.name, entry.version);
-      if (verified !== packed.integrity) throw new Error(`Publication verification failed for ${entry.name}@${entry.version}`);
+      await waitForPublication(entry, packed.integrity);
       console.log(`Verified publication: ${entry.name}@${entry.version}`);
     }
   } finally { rmSync(scratch, {recursive:true, force:true}); }
