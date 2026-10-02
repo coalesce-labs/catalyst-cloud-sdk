@@ -82,14 +82,21 @@ export interface ContractTeam {
   };
 }
 
-export interface ContractRoute {
+export type ContractRoute = {
   method: "GET" | "POST";
   path: string;
   /** Whether a call spends a unit of the per-host daily write budget. */
   takesWriteBudgetUnit: boolean;
   /** The contract version this route first appeared in. */
   since: string;
-}
+} | {
+  // CTC-4633 — the existing CTC-1916 write row is the sole supported PUT.
+  method: "PUT";
+  path: "/api/v1/agent/tenant/review-agents/write";
+  takesWriteBudgetUnit: false;
+  since: "2.8.0";
+  idempotencyKeyField: null;
+};
 
 export interface ContractMergeRepository {
   repoId: string;
@@ -247,7 +254,12 @@ export function isTenantContract(value: unknown): value is TenantContract {
     !routes.every(
       (r: unknown) =>
         isRecord(r) &&
-        (r["method"] === "GET" || r["method"] === "POST") &&
+        (r["method"] === "GET" || r["method"] === "POST" ||
+          (r["method"] === "PUT" &&
+            r["path"] === "/api/v1/agent/tenant/review-agents/write" &&
+            r["takesWriteBudgetUnit"] === false &&
+            r["since"] === "2.8.0" &&
+            r["idempotencyKeyField"] === null)) &&
         typeof r["path"] === "string" &&
         typeof r["takesWriteBudgetUnit"] === "boolean" &&
         typeof r["since"] === "string",
