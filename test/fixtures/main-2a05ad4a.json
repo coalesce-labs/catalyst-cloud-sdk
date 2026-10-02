@@ -1,0 +1,2254 @@
+{
+  "contractVersion": "2.3.0",
+  "protocolVersion": 4,
+  "cache": {
+    "maxAgeSeconds": 900,
+    "staleRefusalSeconds": 3600
+  },
+  "account": {
+    "id": "acct-fixture",
+    "slug": "acme-fixture",
+    "name": "Acme (contract fixture)",
+    "linearWorkspaceId": "lw-fixture",
+    "linearWorkspaceSlug": "acme"
+  },
+  "apiPrefix": "/api/v1",
+  "slots": [
+    "dispatch",
+    "intake",
+    "research",
+    "plan",
+    "implement",
+    "remediate",
+    "verify",
+    "review",
+    "pr",
+    "done",
+    "canceled"
+  ],
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/portal-servers",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.27.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/portal-servers/register",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.27.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/portal-servers/remove",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.27.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/delegate",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/issue-state",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/issue-label",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/issue-comment",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": "idempotencyId",
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/ask-accept",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/ask",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": "askKey",
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/attachment",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "1.0.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/attachments",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/session",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/reaction",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "1.0.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/issue-create",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": "idempotencyId",
+      "since": "1.0.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/linear/read",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.0.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/contract",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.0.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/account-environment",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.5.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/account-environment/propose",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.5.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/account-environment/approve",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.5.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/ticket-release",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "1.6.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/ticket-release-class",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "1.6.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/credential-checkout",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "1.9.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/credential-release",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "1.9.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/project-repositories",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.11.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/project-repositories/remove",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.11.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/messages",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "1.19.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/tenant/readiness",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.8.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/tenant/readiness/re-evaluate",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.8.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/tenant/workflow-adopt",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.8.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/tenant/review-agents",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.8.0"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/agent/tenant/review-agents/write",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.8.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/tenant/repositories",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.8.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/repos",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.11.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/repos/pause",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.11.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/repos/resume",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.11.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/local-phase/claim",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "2.4.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/local-phase/renew",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.4.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/local-phase/release",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.4.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/issue-relation",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "1.25.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/feedback",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": "feedbackKey",
+      "since": "2.1.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/ask-triage",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "2.3.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/auth/cli",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.4.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/teams",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.18.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/team-workflow",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.18.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/team-workflow/check",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.18.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/team-workflow/save",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.18.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/team-workflow/adopt",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.18.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/team-workflow/adopt-undo",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.18.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/team-workflow/migrate",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "1.18.0"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent/team-wip-limit",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.10.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/team-wip-limit",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.10.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/mcp",
+      "takesWriteBudgetUnit": false,
+      "idempotencyKeyField": null,
+      "since": "2.2.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/work/request",
+      "takesWriteBudgetUnit": true,
+      "idempotencyKeyField": null,
+      "since": "2.4.0"
+    }
+  ],
+  "onboarding": {
+    "schema": 1,
+    "routes": [
+      {
+        "method": "GET",
+        "path": "/api/v1/me",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/me/runner-capacity",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/agent/contract",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/agent/teams",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/agent/team-workflow",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/agent/tenant/readiness",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/repos",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/me/repositories/options",
+        "personalBearer": true
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/me/repositories",
+        "personalBearer": true
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/coding-accounts",
+        "personalBearer": true
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/coding-accounts/:slot/validate",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/coding-accounts",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/me/connections/linear/workspace",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/me/connections/linear/personal",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/me/connections/github/workspace",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/me/connections/github/personal",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/me/connections/linear/workspace/start",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/me/connections/github/workspace/start",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/connect/linear/personal/start",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/connect/github/personal/start",
+        "personalBearer": true
+      },
+      {
+        "method": "POST",
+        "path": "/me/secrets/import",
+        "personalBearer": true
+      },
+      {
+        "method": "GET",
+        "path": "/me/env-vars",
+        "personalBearer": true
+      },
+      {
+        "method": "POST",
+        "path": "/me/env-vars",
+        "personalBearer": true
+      }
+    ],
+    "web": {
+      "connections": "/a/account/connections",
+      "personalConnections": "/settings/connected-accounts"
+    }
+  },
+  "reads": [
+    {
+      "name": "issues-list",
+      "method": "GET",
+      "path": "/api/v1/issues",
+      "authClass": "open",
+      "cursor": {
+        "param": "after",
+        "semantics": "keyset"
+      },
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "issue-get",
+      "method": "GET",
+      "path": "/api/v1/issues/{identifier}",
+      "authClass": "open",
+      "cursor": null,
+      "select": {
+        "fieldsParam": "fields",
+        "projectionParam": "projection",
+        "fields": [
+          "id",
+          "identifier",
+          "title",
+          "description",
+          "state",
+          "state_id",
+          "assignee",
+          "assignee_id",
+          "assignee_name",
+          "assignee_avatar_url",
+          "priority",
+          "estimate",
+          "project_id",
+          "project_name",
+          "project_state",
+          "project_description",
+          "project_progress",
+          "project_health",
+          "cycle_id",
+          "cycle_number",
+          "cycle_name",
+          "cycle_starts_at",
+          "cycle_ends_at",
+          "team_id",
+          "team_key",
+          "team_name",
+          "delegate_id",
+          "delegate_name",
+          "delegate_avatar_url",
+          "bot_actor_name",
+          "bot_actor_type",
+          "bot_actor_sub_type",
+          "parent_id",
+          "parent_identifier",
+          "url",
+          "started_at",
+          "completed_at",
+          "canceled_at",
+          "created_at",
+          "due_date",
+          "priority_label",
+          "sort_order",
+          "updated_at",
+          "comments",
+          "agent_sessions",
+          "activity",
+          "labels",
+          "relations",
+          "linked_pulls",
+          "repairLoop"
+        ],
+        "always": [
+          "identifier"
+        ],
+        "projections": [
+          {
+            "name": "status",
+            "fields": [
+              "identifier",
+              "title",
+              "state",
+              "state_id",
+              "assignee_name",
+              "delegate_name",
+              "priority",
+              "updated_at",
+              "completed_at",
+              "canceled_at",
+              "url",
+              "linked_pulls",
+              "repairLoop"
+            ]
+          },
+          {
+            "name": "brief",
+            "fields": [
+              "identifier",
+              "title",
+              "state",
+              "state_id",
+              "assignee_name",
+              "delegate_name",
+              "priority",
+              "updated_at",
+              "completed_at",
+              "canceled_at",
+              "url",
+              "linked_pulls",
+              "repairLoop",
+              "description",
+              "team_key",
+              "project_name",
+              "cycle_number",
+              "parent_identifier",
+              "labels",
+              "relations"
+            ]
+          }
+        ],
+        "revision": 1
+      },
+      "since": "1.15.0"
+    },
+    {
+      "name": "issue-execution",
+      "method": "GET",
+      "path": "/api/v1/issues/{identifier}/execution",
+      "authClass": "open",
+      "cursor": null,
+      "select": {
+        "fieldsParam": "fields",
+        "projectionParam": "projection",
+        "fields": [
+          "ticket",
+          "observedAtMs",
+          "attemptHistory",
+          "hasLadderHistory",
+          "phases",
+          "failure",
+          "remediate",
+          "park",
+          "retryBackoffInForce",
+          "lease",
+          "lastAdvance",
+          "hostInterrupted",
+          "governors",
+          "releases",
+          "unreadable",
+          "reader",
+          "note",
+          "runs"
+        ],
+        "always": [
+          "ticket",
+          "unreadable",
+          "note",
+          "attemptHistory"
+        ],
+        "projections": [
+          {
+            "name": "status",
+            "fields": [
+              "ticket",
+              "observedAtMs",
+              "hasLadderHistory",
+              "lastAdvance",
+              "lease",
+              "park",
+              "governors",
+              "failure",
+              "phases",
+              "retryBackoffInForce",
+              "reader"
+            ]
+          },
+          {
+            "name": "failures",
+            "fields": [
+              "ticket",
+              "observedAtMs",
+              "hasLadderHistory",
+              "lastAdvance",
+              "lease",
+              "park",
+              "governors",
+              "failure",
+              "phases",
+              "retryBackoffInForce",
+              "reader",
+              "remediate",
+              "hostInterrupted"
+            ]
+          }
+        ],
+        "revision": 1
+      },
+      "since": "1.15.0"
+    },
+    {
+      "name": "pulls-list",
+      "method": "GET",
+      "path": "/api/v1/pulls",
+      "authClass": "open",
+      "cursor": {
+        "param": "after",
+        "semantics": "keyset"
+      },
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "pull-get",
+      "method": "GET",
+      "path": "/api/v1/pulls/{id}",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "projects-list",
+      "method": "GET",
+      "path": "/api/v1/projects",
+      "authClass": "open",
+      "cursor": {
+        "param": "cursor",
+        "semantics": "offset"
+      },
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "project-get",
+      "method": "GET",
+      "path": "/api/v1/projects/{id}",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "initiatives-list",
+      "method": "GET",
+      "path": "/api/v1/initiatives",
+      "authClass": "open",
+      "cursor": {
+        "param": "cursor",
+        "semantics": "offset"
+      },
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "initiative-get",
+      "method": "GET",
+      "path": "/api/v1/initiatives/{id}",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "cycles-list",
+      "method": "GET",
+      "path": "/api/v1/cycles",
+      "authClass": "open",
+      "cursor": {
+        "param": "cursor",
+        "semantics": "offset"
+      },
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "search",
+      "method": "GET",
+      "path": "/api/v1/search",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "me",
+      "method": "GET",
+      "path": "/api/v1/me",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "workflow-stages",
+      "method": "GET",
+      "path": "/api/v1/workflow-stages",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "work-eligibility",
+      "method": "GET",
+      "path": "/api/v1/work-eligibility",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "fleet-activity-current",
+      "method": "GET",
+      "path": "/api/v1/fleet-activity/current",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "agent-roster-current",
+      "method": "GET",
+      "path": "/api/v1/agent-roster/current",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "lease-attributions",
+      "method": "GET",
+      "path": "/api/v1/lease/attributions",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "dispatch-queue-current",
+      "method": "GET",
+      "path": "/api/v1/dispatch-queue/current",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "coding-accounts",
+      "method": "GET",
+      "path": "/api/v1/coding-accounts",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "1.15.0"
+    },
+    {
+      "name": "coding-accounts-explain",
+      "method": "GET",
+      "path": "/api/v1/coding-accounts/explain",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "2.5.0"
+    },
+    {
+      "name": "routing",
+      "method": "GET",
+      "path": "/api/v1/routing",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "1.22.0"
+    },
+    {
+      "name": "flow",
+      "method": "GET",
+      "path": "/api/v1/flow",
+      "authClass": "open",
+      "cursor": null,
+      "select": null,
+      "since": "2.4.0"
+    },
+    {
+      "name": "events-query",
+      "method": "GET",
+      "path": "/api/v1/events/query",
+      "authClass": "feed",
+      "cursor": {
+        "param": "beforeSeq",
+        "semantics": "exclusive"
+      },
+      "select": {
+        "fieldsParam": "fields",
+        "projectionParam": "projection",
+        "fields": [
+          "tenantId",
+          "sequence",
+          "eventId",
+          "type",
+          "schemaVersion",
+          "recordedAt",
+          "occurredAt",
+          "entity",
+          "actor",
+          "correlationId",
+          "causationId",
+          "idempotencyKey",
+          "payload",
+          "bodyUnavailable",
+          "reason",
+          "payload.phase",
+          "payload.ticket",
+          "payload.summary",
+          "payload.failureMode",
+          "payload.failureDetail",
+          "payload.nonce",
+          "payload.artifactRef",
+          "ticket",
+          "team",
+          "phase",
+          "outcome"
+        ],
+        "always": [
+          "sequence",
+          "type",
+          "bodyUnavailable",
+          "reason"
+        ],
+        "projections": [
+          {
+            "name": "summary",
+            "fields": [
+              "sequence",
+              "type",
+              "recordedAt",
+              "ticket",
+              "phase",
+              "outcome"
+            ]
+          },
+          {
+            "name": "full",
+            "fields": [
+              "tenantId",
+              "sequence",
+              "eventId",
+              "type",
+              "schemaVersion",
+              "recordedAt",
+              "occurredAt",
+              "entity",
+              "actor",
+              "correlationId",
+              "causationId",
+              "idempotencyKey",
+              "payload",
+              "bodyUnavailable",
+              "reason"
+            ]
+          }
+        ],
+        "revision": 1
+      },
+      "since": "2.19.0"
+    }
+  ],
+  "feeds": [
+    {
+      "name": "events",
+      "method": "GET",
+      "path": "/api/v1/events",
+      "authClass": "feed",
+      "cursor": {
+        "param": "since",
+        "semantics": "exclusive"
+      },
+      "since": "1.15.0"
+    },
+    {
+      "name": "events-stream",
+      "method": "GET",
+      "path": "/api/v1/events/stream",
+      "authClass": "host",
+      "cursor": {
+        "param": "since",
+        "semantics": "exclusive"
+      },
+      "since": "1.15.0"
+    },
+    {
+      "name": "events-backbone",
+      "method": "GET",
+      "path": "/api/v1/events/backbone",
+      "authClass": "feed",
+      "cursor": {
+        "param": "since",
+        "semantics": "exclusive"
+      },
+      "since": "1.15.0"
+    },
+    {
+      "name": "changes",
+      "method": "GET",
+      "path": "/api/v1/changes",
+      "authClass": "feed",
+      "cursor": {
+        "param": "since",
+        "semantics": "exclusive"
+      },
+      "since": "1.15.0"
+    },
+    {
+      "name": "snapshot",
+      "method": "GET",
+      "path": "/api/v1/snapshot",
+      "authClass": "open",
+      "cursor": {
+        "param": "head",
+        "semantics": "head-only"
+      },
+      "since": "1.15.0"
+    },
+    {
+      "name": "coordination-changes",
+      "method": "GET",
+      "path": "/api/v1/coordination/changes",
+      "authClass": "feed",
+      "cursor": {
+        "param": "since",
+        "semantics": "exclusive"
+      },
+      "since": "1.15.0"
+    },
+    {
+      "name": "event-stream-feed",
+      "method": "GET",
+      "path": "/api/v1/event-stream/feed",
+      "authClass": "host",
+      "cursor": {
+        "param": "from",
+        "semantics": "inclusive"
+      },
+      "since": "1.15.0"
+    },
+    {
+      "name": "telemetry-feed",
+      "method": "GET",
+      "path": "/api/v1/telemetry/feed",
+      "authClass": "feed",
+      "cursor": {
+        "param": "before",
+        "semantics": "exclusive"
+      },
+      "since": "1.15.0"
+    },
+    {
+      "name": "fleet-activity-feed",
+      "method": "GET",
+      "path": "/api/v1/fleet-activity/feed",
+      "authClass": "feed",
+      "cursor": {
+        "param": "before",
+        "semantics": "exclusive"
+      },
+      "since": "1.15.0"
+    }
+  ],
+  "skillsBundle": {
+    "package": "@catalyst-cloud/cli",
+    "minVersion": "0.3.0"
+  },
+  "releaseLine": "0.13",
+  "runner": {
+    "toolchain": [
+      "agent-browser",
+      "bun",
+      "bundle",
+      "bunx",
+      "cc",
+      "chromium",
+      "claude",
+      "cmake",
+      "codex",
+      "corepack",
+      "curl",
+      "diff",
+      "g++",
+      "gcc",
+      "gem",
+      "gh",
+      "git",
+      "git-lfs",
+      "go",
+      "gpg",
+      "gzip",
+      "humanlayer",
+      "java",
+      "javac",
+      "jq",
+      "make",
+      "mise",
+      "mvn",
+      "node",
+      "npm",
+      "npx",
+      "opencode",
+      "patch",
+      "pip",
+      "pip3",
+      "pkg-config",
+      "pnpx",
+      "poetry",
+      "ps",
+      "psql",
+      "python",
+      "python3",
+      "rake",
+      "redis-cli",
+      "redis-server",
+      "rg",
+      "ruby",
+      "rustup",
+      "setpriv",
+      "sqlite3",
+      "ssh",
+      "tar",
+      "unzip",
+      "uv",
+      "uvx",
+      "xz",
+      "zip"
+    ]
+  },
+  "teams": [
+    {
+      "id": "team-eng",
+      "key": "ENG",
+      "name": "Engineering",
+      "workflowMode": "auto",
+      "gitAutomation": "full",
+      "dispatchGate": {
+        "status": "mapping_missing",
+        "missingSlots": [
+          "canceled"
+        ],
+        "remedy": "A tenant admin opens Settings → Linear teams → ENG and presses Map my stages (or Adopt the Catalyst workflow) to give canceled a stage, or uses their own credential to read GET /api/v1/agent/team-workflow?team=ENG and follow the documented save or adoption preview-and-apply steps with the full mapping and returned hash. Until then Catalyst starts nothing in ENG; git automation is not involved."
+      },
+      "stages": {
+        "dispatch": {
+          "stateId": "state-todo",
+          "name": "Todo",
+          "type": "unstarted",
+          "stateStillExists": true,
+          "source": "matched"
+        },
+        "intake": {
+          "stateId": "state-intake",
+          "name": "Intake",
+          "type": "unstarted",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "research": {
+          "stateId": "state-research",
+          "name": "Research",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "plan": {
+          "stateId": "state-plan",
+          "name": "Plan",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "implement": {
+          "stateId": "state-implement",
+          "name": "In Progress",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "chosen"
+        },
+        "remediate": {
+          "stateId": "state-remediate",
+          "name": "Remediate",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "verify": {
+          "stateId": "state-verify",
+          "name": "Validate",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "review": {
+          "stateId": "state-deleted",
+          "name": null,
+          "type": null,
+          "stateStillExists": false,
+          "source": "matched"
+        },
+        "pr": {
+          "stateId": "state-pr",
+          "name": "In Review",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "matched"
+        },
+        "done": {
+          "stateId": "state-done",
+          "name": "Done",
+          "type": "completed",
+          "stateStillExists": true,
+          "source": "matched"
+        }
+      },
+      "labels": {
+        "ask": [
+          {
+            "name": "catalyst-ask",
+            "unscopedId": "label-ask-unscoped",
+            "teamScopedId": "label-ask-eng",
+            "scope": "unscoped",
+            "preferredId": "label-ask-unscoped"
+          }
+        ],
+        "hold": [
+          {
+            "name": "hold:needs-remediation",
+            "unscopedId": null,
+            "teamScopedId": "label-remediate-eng",
+            "scope": "team",
+            "preferredId": "label-remediate-eng"
+          }
+        ],
+        "release": [
+          {
+            "name": "catalyst-not-an-ask",
+            "unscopedId": null,
+            "teamScopedId": null,
+            "scope": "absent",
+            "preferredId": null
+          }
+        ]
+      },
+      "readiness": {
+        "status": "degraded",
+        "checks": [
+          {
+            "id": "oauth_scope",
+            "state": "pass"
+          },
+          {
+            "id": "mapping_total",
+            "state": "pass"
+          },
+          {
+            "id": "webhook_covers_team",
+            "state": "unknown"
+          },
+          {
+            "id": "thoughts_reachable",
+            "state": "fail",
+            "reason": "thoughts_repo_unreachable",
+            "thoughts": [
+              {
+                "codeRepository": "acme/api",
+                "repository": "acme/thoughts",
+                "status": "thoughts_repo_unreachable"
+              },
+              {
+                "codeRepository": "acme/web",
+                "repository": "acme/notes",
+                "status": "resolved"
+              }
+            ]
+          },
+          {
+            "id": "environment_declared",
+            "state": "pass",
+            "repos": [
+              {
+                "repo": "acme/web",
+                "reason": "no_environment_declaration"
+              }
+            ]
+          }
+        ],
+        "checkedAt": 1756000000000,
+        "expiresAt": 1756003600000,
+        "workflowRev": 7
+      },
+      "repositories": {
+        "default": "acme/api",
+        "registered": [
+          "acme/api",
+          "acme/web"
+        ],
+        "declared": [
+          "acme/api",
+          "acme/gone",
+          "acme/web"
+        ],
+        "notConnected": [
+          {
+            "repository": "acme/gone",
+            "reason": "repository_not_connected"
+          }
+        ],
+        "declaration": {
+          "homeRepository": "acme/api",
+          "commitSha": "ffffffffffffffffffffffffffffffffffffffff",
+          "outcome": "applied",
+          "observedAt": 1700000000000
+        },
+        "selection": {
+          "unit": "one_primary_per_ticket",
+          "precedence": [
+            "label",
+            "intake",
+            "team_default"
+          ]
+        }
+      }
+    },
+    {
+      "id": "team-ops",
+      "key": "OPS",
+      "name": "Operations",
+      "workflowMode": "manual",
+      "gitAutomation": "off",
+      "dispatchGate": {
+        "status": "mapping_missing",
+        "missingSlots": [
+          "dispatch",
+          "pr",
+          "done",
+          "canceled"
+        ],
+        "remedy": "A tenant admin opens Settings → Linear teams → OPS and presses Map my stages (or Adopt the Catalyst workflow) to give dispatch, pr, done, canceled a stage, or uses their own credential to read GET /api/v1/agent/team-workflow?team=OPS and follow the documented save or adoption preview-and-apply steps with the full mapping and returned hash. Until then Catalyst starts nothing in OPS; git automation is not involved."
+      },
+      "stages": {},
+      "labels": {
+        "ask": [
+          {
+            "name": "catalyst-ask",
+            "unscopedId": "label-ask-unscoped",
+            "teamScopedId": null,
+            "scope": "unscoped",
+            "preferredId": "label-ask-unscoped"
+          }
+        ],
+        "hold": [
+          {
+            "name": "hold:needs-remediation",
+            "unscopedId": null,
+            "teamScopedId": null,
+            "scope": "absent",
+            "preferredId": null
+          }
+        ],
+        "release": [
+          {
+            "name": "catalyst-not-an-ask",
+            "unscopedId": null,
+            "teamScopedId": null,
+            "scope": "absent",
+            "preferredId": null
+          }
+        ]
+      },
+      "readiness": {
+        "status": "unchecked",
+        "checks": [],
+        "checkedAt": null,
+        "expiresAt": null,
+        "workflowRev": null
+      },
+      "repositories": {
+        "default": null,
+        "registered": [],
+        "declared": [],
+        "notConnected": [],
+        "declaration": null,
+        "selection": {
+          "unit": "one_primary_per_ticket",
+          "precedence": [
+            "label",
+            "intake",
+            "team_default"
+          ]
+        }
+      }
+    }
+  ],
+  "projects": [
+    {
+      "id": "team-eng",
+      "key": "ENG",
+      "name": "Engineering",
+      "workflowMode": "auto",
+      "gitAutomation": "full",
+      "dispatchGate": {
+        "status": "mapping_missing",
+        "missingSlots": [
+          "canceled"
+        ],
+        "remedy": "A tenant admin opens Settings → Linear teams → ENG and presses Map my stages (or Adopt the Catalyst workflow) to give canceled a stage, or uses their own credential to read GET /api/v1/agent/team-workflow?team=ENG and follow the documented save or adoption preview-and-apply steps with the full mapping and returned hash. Until then Catalyst starts nothing in ENG; git automation is not involved."
+      },
+      "stages": {
+        "dispatch": {
+          "stateId": "state-todo",
+          "name": "Todo",
+          "type": "unstarted",
+          "stateStillExists": true,
+          "source": "matched"
+        },
+        "intake": {
+          "stateId": "state-intake",
+          "name": "Intake",
+          "type": "unstarted",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "research": {
+          "stateId": "state-research",
+          "name": "Research",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "plan": {
+          "stateId": "state-plan",
+          "name": "Plan",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "implement": {
+          "stateId": "state-implement",
+          "name": "In Progress",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "chosen"
+        },
+        "remediate": {
+          "stateId": "state-remediate",
+          "name": "Remediate",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "verify": {
+          "stateId": "state-verify",
+          "name": "Validate",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "created"
+        },
+        "review": {
+          "stateId": "state-deleted",
+          "name": null,
+          "type": null,
+          "stateStillExists": false,
+          "source": "matched"
+        },
+        "pr": {
+          "stateId": "state-pr",
+          "name": "In Review",
+          "type": "started",
+          "stateStillExists": true,
+          "source": "matched"
+        },
+        "done": {
+          "stateId": "state-done",
+          "name": "Done",
+          "type": "completed",
+          "stateStillExists": true,
+          "source": "matched"
+        }
+      },
+      "labels": {
+        "ask": [
+          {
+            "name": "catalyst-ask",
+            "unscopedId": "label-ask-unscoped",
+            "teamScopedId": "label-ask-eng",
+            "scope": "unscoped",
+            "preferredId": "label-ask-unscoped"
+          }
+        ],
+        "hold": [
+          {
+            "name": "hold:needs-remediation",
+            "unscopedId": null,
+            "teamScopedId": "label-remediate-eng",
+            "scope": "team",
+            "preferredId": "label-remediate-eng"
+          }
+        ],
+        "release": [
+          {
+            "name": "catalyst-not-an-ask",
+            "unscopedId": null,
+            "teamScopedId": null,
+            "scope": "absent",
+            "preferredId": null
+          }
+        ]
+      },
+      "readiness": {
+        "status": "degraded",
+        "checks": [
+          {
+            "id": "oauth_scope",
+            "state": "pass"
+          },
+          {
+            "id": "mapping_total",
+            "state": "pass"
+          },
+          {
+            "id": "webhook_covers_team",
+            "state": "unknown"
+          },
+          {
+            "id": "thoughts_reachable",
+            "state": "fail",
+            "reason": "thoughts_repo_unreachable",
+            "thoughts": [
+              {
+                "codeRepository": "acme/api",
+                "repository": "acme/thoughts",
+                "status": "thoughts_repo_unreachable"
+              },
+              {
+                "codeRepository": "acme/web",
+                "repository": "acme/notes",
+                "status": "resolved"
+              }
+            ]
+          },
+          {
+            "id": "environment_declared",
+            "state": "pass",
+            "repos": [
+              {
+                "repo": "acme/web",
+                "reason": "no_environment_declaration"
+              }
+            ]
+          }
+        ],
+        "checkedAt": 1756000000000,
+        "expiresAt": 1756003600000,
+        "workflowRev": 7
+      },
+      "repositories": {
+        "default": "acme/api",
+        "registered": [
+          "acme/api",
+          "acme/web"
+        ],
+        "declared": [
+          "acme/api",
+          "acme/gone",
+          "acme/web"
+        ],
+        "notConnected": [
+          {
+            "repository": "acme/gone",
+            "reason": "repository_not_connected"
+          }
+        ],
+        "declaration": {
+          "homeRepository": "acme/api",
+          "commitSha": "ffffffffffffffffffffffffffffffffffffffff",
+          "outcome": "applied",
+          "observedAt": 1700000000000
+        },
+        "selection": {
+          "unit": "one_primary_per_ticket",
+          "precedence": [
+            "label",
+            "intake",
+            "team_default"
+          ]
+        }
+      }
+    },
+    {
+      "id": "team-ops",
+      "key": "OPS",
+      "name": "Operations",
+      "workflowMode": "manual",
+      "gitAutomation": "off",
+      "dispatchGate": {
+        "status": "mapping_missing",
+        "missingSlots": [
+          "dispatch",
+          "pr",
+          "done",
+          "canceled"
+        ],
+        "remedy": "A tenant admin opens Settings → Linear teams → OPS and presses Map my stages (or Adopt the Catalyst workflow) to give dispatch, pr, done, canceled a stage, or uses their own credential to read GET /api/v1/agent/team-workflow?team=OPS and follow the documented save or adoption preview-and-apply steps with the full mapping and returned hash. Until then Catalyst starts nothing in OPS; git automation is not involved."
+      },
+      "stages": {},
+      "labels": {
+        "ask": [
+          {
+            "name": "catalyst-ask",
+            "unscopedId": "label-ask-unscoped",
+            "teamScopedId": null,
+            "scope": "unscoped",
+            "preferredId": "label-ask-unscoped"
+          }
+        ],
+        "hold": [
+          {
+            "name": "hold:needs-remediation",
+            "unscopedId": null,
+            "teamScopedId": null,
+            "scope": "absent",
+            "preferredId": null
+          }
+        ],
+        "release": [
+          {
+            "name": "catalyst-not-an-ask",
+            "unscopedId": null,
+            "teamScopedId": null,
+            "scope": "absent",
+            "preferredId": null
+          }
+        ]
+      },
+      "readiness": {
+        "status": "unchecked",
+        "checks": [],
+        "checkedAt": null,
+        "expiresAt": null,
+        "workflowRev": null
+      },
+      "repositories": {
+        "default": null,
+        "registered": [],
+        "declared": [],
+        "notConnected": [],
+        "declaration": null,
+        "selection": {
+          "unit": "one_primary_per_ticket",
+          "precedence": [
+            "label",
+            "intake",
+            "team_default"
+          ]
+        }
+      }
+    }
+  ],
+  "vocabulary": {
+    "askLabelPrefix": "ask/",
+    "askPhaseLabelPrefix": "ask/phase:",
+    "askMarkerLabel": "catalyst-ask",
+    "releaseLabel": "catalyst-not-an-ask",
+    "bookkeeping": {
+      "marker": "[bookkeeping]",
+      "prefixOnly": true,
+      "asciiCaseInsensitive": true,
+      "leadingWhitespaceTrimmed": true
+    },
+    "units": {
+      "project": "A Catalyst project is one Linear team and the GitHub repositories registered to it. The contract serves one entry per project in `projects` (also served as `teams`, its legacy name).",
+      "repository": "A repository is one GitHub repository, named `owner/name`. A project may register several. A repository is meant to belong to one project, but registration does not enforce it: the same repository can be registered to more than one project, so never infer a repository's project from its name alone. `projects[].repositories` is a project's registered set and the rule picking the one a ticket's phases check out."
+    },
+    "askHumanDecisionLabel": "ask/decided-by-human"
+  },
+  "askTemplate": {
+    "headings": {
+      "ask": "**Ask:**",
+      "options": "**Options:**",
+      "defaultIfSilent": "**Default if silent:**",
+      "howToAnswer": "**How to answer:**"
+    },
+    "howToAnswer": {
+      "withOptions": "**How to answer:** reply in this thread with the option letter on its own (`A`), `(A)`, `option A`, or the option's own text pasted back. For an answer that is not on the list, reply `DECIDED: <your answer>`.",
+      "withoutOptions": "**How to answer:** reply in this thread with `DECIDED: <your answer>` to record your decision."
+    },
+    "optionBulletFormat": "- **A** — <label>",
+    "maxLetteredOptions": 26,
+    "maxAskGenerations": 25,
+    "example": "**Ask:** Should we adopt approach A or approach B?\n\nContext for the decision goes here.\n\n**Options:**\n- **A** — Option A\n- **B** — Option B\n\n**Default if silent:** Option A\n\n**How to answer:** reply in this thread with the option letter on its own (`A`), `(A)`, `option A`, or the option's own text pasted back. For an answer that is not on the list, reply `DECIDED: <your answer>`."
+  },
+  "ladder": {
+    "phases": [
+      "intake",
+      "research",
+      "plan",
+      "implement",
+      "validate",
+      "pr",
+      "remediate",
+      "merge"
+    ],
+    "keying": "trailing",
+    "keyingScope": "fleet",
+    "intakeEnabled": true,
+    "advance": [
+      {
+        "phase": "intake",
+        "result": "ok",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "CTC-1530 — intake's board moves (Todo→Intake at claim, Intake→Research on completion) are a PARALLEL mechanism (apps/mirror/src/do/intake-state-move.ts), never this table, for the same reason ADR-0069 gives for remediate: a move this table does not own must not desynchronize fromSlots matching here."
+      },
+      {
+        "phase": "intake",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "research",
+        "result": "ok",
+        "fromSlots": [
+          "dispatch"
+        ],
+        "toSlot": "research",
+        "because": "the ticket leaves Todo the moment research lands"
+      },
+      {
+        "phase": "research",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "plan",
+        "result": "ok",
+        "fromSlots": [
+          "research"
+        ],
+        "toSlot": "plan",
+        "because": "the plan artifact exists — the ticket moves into Plan"
+      },
+      {
+        "phase": "plan",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "implement",
+        "result": "ok",
+        "fromSlots": [
+          "plan"
+        ],
+        "toSlot": "implement",
+        "because": "implementation commits landed — the ticket moves into Implement"
+      },
+      {
+        "phase": "implement",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "validate",
+        "result": "ok",
+        "fromSlots": [
+          "implement"
+        ],
+        "toSlot": "review",
+        "because": "review and verify both collapse onto the tenant's Validate stage"
+      },
+      {
+        "phase": "validate",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "pr",
+        "result": "ok",
+        "fromSlots": [
+          "review"
+        ],
+        "toSlot": "pr",
+        "because": "this row is what unblocks evaluateTicket's not_at_pr_stage gate"
+      },
+      {
+        "phase": "pr",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "remediate",
+        "result": "ok",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a remediate round fixes findings and resolves threads on an already-PR'd ticket — it is an interrupt, not a ladder step, and never advances workflow state; only merge moves the ticket past pr"
+      },
+      {
+        "phase": "remediate",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      },
+      {
+        "phase": "merge",
+        "result": "ok",
+        "fromSlots": [
+          "pr"
+        ],
+        "toSlot": null,
+        "because": "CTC-1187 — the merge PHASE succeeding means `queue:ready` was applied (apps/runner/src/executors/merge.ts: \"never 'PR merged'\"), not that the PR merged. Mergify can still dequeue it on a red Check (full). The terminal Done write is keyed to the real merge webhook instead — see resolveMergedPrAdvance below and ADR-20260902T031406."
+      },
+      {
+        "phase": "merge",
+        "result": "failed",
+        "fromSlots": null,
+        "toSlot": null,
+        "because": "a failed phase leaves the ticket retryable at its current stage — see CTC-955's failure comment"
+      }
+    ]
+  },
+  "thresholds": {
+    "scope": "fleet",
+    "parkAfterConsecutiveFailures": 3,
+    "remediateRoundCap": 3,
+    "remediateEscalatedRoundBudget": 1,
+    "remediateRewindBudget": 1,
+    "retryBackoffMs": [
+      120000,
+      300000,
+      900000
+    ],
+    "hostDailyWriteBudget": 3000,
+    "localPhaseStandingCap": 1
+  },
+  "merge": {
+    "policies": [
+      "codex-attestation",
+      "codex-attestation-strict",
+      "checks-and-threads"
+    ],
+    "defaultPolicy": "codex-attestation",
+    "repositories": [
+      {
+        "repoId": "repo-api",
+        "owner": "acme",
+        "name": "api",
+        "reviewers": [
+          {
+            "agentKey": "claude",
+            "responderLogin": "claude[bot]",
+            "evidenceSources": [
+              {
+                "kind": "reaction"
+              },
+              {
+                "kind": "issue-comment"
+              },
+              {
+                "kind": "native-review"
+              }
+            ]
+          }
+        ],
+        "policy": "codex-attestation-strict",
+        "policySource": "repo",
+        "queue": "mergify",
+        "remediateRequiredChecks": [
+          "Check",
+          "Check (full)"
+        ],
+        "remediateRequiredChecksSource": "mergify",
+        "queueSource": "catalyst-toml",
+        "handMergePaths": [
+          "migrations/**"
+        ],
+        "reviewRequest": {
+          "request": "every-push",
+          "maxRequests": 2,
+          "source": "catalyst-toml"
+        },
+        "pullRequests": {
+          "draftUntilValidated": true,
+          "branchPattern": "{ticket}",
+          "branchPatternHonored": true,
+          "titleFormat": "{type}({scope}): {ticket} — {summary}",
+          "commitConvention": "conventional",
+          "source": "catalyst-toml"
+        },
+        "unconfiguredReviewers": [
+          "codex"
+        ],
+        "settingsRevision": {
+          "revision": 3,
+          "commitSha": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
+        }
+      },
+      {
+        "repoId": "repo-web",
+        "owner": "acme",
+        "name": "web",
+        "reviewers": [],
+        "policy": "checks-and-threads",
+        "policySource": "tenant",
+        "queue": "none",
+        "remediateRequiredChecks": [
+          "ci"
+        ],
+        "remediateRequiredChecksSource": "github-required-checks",
+        "queueSource": "observed",
+        "handMergePaths": [],
+        "reviewRequest": {
+          "request": "on-open",
+          "maxRequests": 1,
+          "source": "default"
+        },
+        "pullRequests": {
+          "draftUntilValidated": true,
+          "branchPattern": "{ticket}",
+          "branchPatternHonored": true,
+          "titleFormat": null,
+          "commitConvention": "conventional",
+          "source": "default"
+        },
+        "unconfiguredReviewers": [],
+        "settingsRevision": null
+      }
+    ],
+    "reviewerLogin": "chatgpt-codex-connector[bot]",
+    "cleanPassShapes": [
+      {
+        "kind": "reaction:+1",
+        "description": "a 👍 reaction from chatgpt-codex-connector[bot], posted at or after the head commit's own timestamp",
+        "honoured": true,
+        "ticket": null
+      },
+      {
+        "kind": "comment:no-major-issues",
+        "description": "a terse \"no major issues\" issue comment from chatgpt-codex-connector[bot] in place of opening review threads, posted at or after the head commit's own timestamp — equivalent to the 👍, not weaker than it",
+        "honoured": true,
+        "ticket": null
+      }
+    ],
+    "prLabels": {
+      "queueReady": "queue:ready",
+      "handStepsHold": "hold:hand-steps",
+      "hold": "hold",
+      "preview": "hold:preview"
+    }
+  },
+  "readinessChecks": [
+    {
+      "id": "oauth_scope",
+      "severity": "blocking",
+      "needsAnswer": true,
+      "fixedBy": "owner_or_admin",
+      "fixedByLine": "A tenant owner or admin, in Catalyst settings.",
+      "settingsPath": "/settings/connections",
+      "fixedWhere": null
+    },
+    {
+      "id": "token_live",
+      "severity": "blocking",
+      "needsAnswer": true,
+      "fixedBy": "owner_or_admin",
+      "fixedByLine": "A tenant owner or admin, in Catalyst settings.",
+      "settingsPath": "/settings/connections",
+      "fixedWhere": null
+    },
+    {
+      "id": "team_visible",
+      "severity": "blocking",
+      "needsAnswer": true,
+      "fixedBy": "owner_or_admin_in_linear",
+      "fixedByLine": "A tenant owner or admin, in Linear’s own settings.",
+      "settingsPath": "/settings/linear-teams",
+      "fixedWhere": null
+    },
+    {
+      "id": "mapped_states_exist",
+      "severity": "blocking",
+      "needsAnswer": true,
+      "fixedBy": "owner_or_admin",
+      "fixedByLine": "A tenant owner or admin, in Catalyst settings.",
+      "settingsPath": "/settings/linear-teams",
+      "fixedWhere": null
+    },
+    {
+      "id": "mapping_total",
+      "severity": "blocking",
+      "needsAnswer": true,
+      "fixedBy": "owner_or_admin",
+      "fixedByLine": "A tenant owner or admin, in Catalyst settings.",
+      "settingsPath": "/settings/linear-teams",
+      "fixedWhere": null
+    },
+    {
+      "id": "types_compatible",
+      "severity": "blocking",
+      "needsAnswer": true,
+      "fixedBy": "owner_or_admin",
+      "fixedByLine": "A tenant owner or admin, in Catalyst settings.",
+      "settingsPath": "/settings/linear-teams",
+      "fixedWhere": null
+    },
+    {
+      "id": "labels_present",
+      "severity": "degrading",
+      "needsAnswer": false,
+      "fixedBy": "nobody",
+      "fixedByLine": "Nobody — this check clears on its own, or reports a configuration that is already valid.",
+      "settingsPath": "/settings/linear-teams",
+      "fixedWhere": null
+    },
+    {
+      "id": "writes_land",
+      "severity": "blocking",
+      "needsAnswer": false,
+      "fixedBy": "owner_or_admin",
+      "fixedByLine": "A tenant owner or admin, in Catalyst settings.",
+      "settingsPath": "/settings/linear-teams",
+      "fixedWhere": null
+    },
+    {
+      "id": "webhook_covers_team",
+      "severity": "degrading",
+      "needsAnswer": false,
+      "fixedBy": "owner_or_admin",
+      "fixedByLine": "A tenant owner or admin, in Catalyst settings.",
+      "settingsPath": "/settings/projects",
+      "fixedWhere": null
+    },
+    {
+      "id": "hosts_current",
+      "severity": "degrading",
+      "needsAnswer": false,
+      "fixedBy": "host_operator",
+      "fixedByLine": "With no host connected, a tenant owner or admin arranges one; there is no self-serve host setup yet. With a host behind, whoever runs that host restarts it, so it reconnects and reports the current mapping.",
+      "settingsPath": "/settings/projects",
+      "fixedWhere": null
+    },
+    {
+      "id": "environment_declared",
+      "severity": "degrading",
+      "needsAnswer": false,
+      "fixedBy": "owner_or_admin",
+      "fixedByLine": "A tenant owner or admin, in Catalyst settings.",
+      "settingsPath": "/settings/projects",
+      "fixedWhere": null
+    },
+    {
+      "id": "tools_resolvable",
+      "severity": "degrading",
+      "needsAnswer": false,
+      "fixedBy": "owner_or_admin",
+      "fixedByLine": "A tenant owner or admin, in Catalyst settings.",
+      "settingsPath": "/settings/environment",
+      "fixedWhere": null
+    },
+    {
+      "id": "required_values",
+      "severity": "degrading",
+      "needsAnswer": true,
+      "fixedBy": "owner_or_admin",
+      "fixedByLine": "A tenant owner or admin, in Catalyst settings.",
+      "settingsPath": "/settings/environment",
+      "fixedWhere": null
+    },
+    {
+      "id": "reviewer_required",
+      "severity": "blocking",
+      "needsAnswer": false,
+      "fixedBy": "owner_or_admin",
+      "fixedByLine": "A tenant owner or admin, in Catalyst settings.",
+      "settingsPath": "/settings/projects",
+      "fixedWhere": null
+    },
+    {
+      "id": "reviewer_configured",
+      "severity": "informational",
+      "needsAnswer": false,
+      "fixedBy": "nobody",
+      "fixedByLine": "Nobody — this check clears on its own, or reports a configuration that is already valid.",
+      "settingsPath": "/settings/projects",
+      "fixedWhere": null
+    },
+    {
+      "id": "reviewer_answering",
+      "severity": "degrading",
+      "needsAnswer": false,
+      "fixedBy": "repository_admin",
+      "fixedByLine": "Whoever administers this team’s GitHub repository.",
+      "settingsPath": "/settings/projects",
+      "fixedWhere": null
+    },
+    {
+      "id": "linear_automation_pr_open",
+      "severity": "blocking",
+      "needsAnswer": true,
+      "fixedBy": "owner_or_admin_in_linear",
+      "fixedByLine": "A tenant owner or admin, in Linear’s own settings.",
+      "settingsPath": "/settings/linear-teams",
+      "fixedWhere": null
+    },
+    {
+      "id": "linear_automation_pr_review",
+      "severity": "blocking",
+      "needsAnswer": true,
+      "fixedBy": "owner_or_admin_in_linear",
+      "fixedByLine": "A tenant owner or admin, in Linear’s own settings.",
+      "settingsPath": "/settings/linear-teams",
+      "fixedWhere": null
+    },
+    {
+      "id": "linear_automation_pr_ready",
+      "severity": "blocking",
+      "needsAnswer": true,
+      "fixedBy": "owner_or_admin_in_linear",
+      "fixedByLine": "A tenant owner or admin, in Linear’s own settings.",
+      "settingsPath": "/settings/linear-teams",
+      "fixedWhere": null
+    },
+    {
+      "id": "linear_automation_pr_merge",
+      "severity": "blocking",
+      "needsAnswer": true,
+      "fixedBy": "owner_or_admin_in_linear",
+      "fixedByLine": "A tenant owner or admin, in Linear’s own settings.",
+      "settingsPath": "/settings/linear-teams",
+      "fixedWhere": null
+    },
+    {
+      "id": "merge_queue_configured",
+      "severity": "degrading",
+      "needsAnswer": false,
+      "fixedBy": "repository_admin",
+      "fixedByLine": "Whoever administers this team’s GitHub repository.",
+      "settingsPath": "/settings/projects",
+      "fixedWhere": null
+    },
+    {
+      "id": "coding_account_enrolled",
+      "severity": "blocking",
+      "needsAnswer": true,
+      "fixedBy": "owner_or_admin",
+      "fixedByLine": "A tenant owner or admin, in Catalyst settings.",
+      "settingsPath": "/settings/coding-accounts",
+      "fixedWhere": null
+    },
+    {
+      "id": "github_app_installed",
+      "severity": "degrading",
+      "needsAnswer": false,
+      "fixedBy": "repository_admin",
+      "fixedByLine": "Whoever administers this team’s GitHub repository.",
+      "settingsPath": "/settings/projects",
+      "fixedWhere": null
+    },
+    {
+      "id": "thoughts_reachable",
+      "severity": "degrading",
+      "needsAnswer": false,
+      "fixedBy": "repository_admin",
+      "fixedByLine": "Whoever administers this team’s GitHub repository.",
+      "settingsPath": "/settings/projects",
+      "fixedWhere": {
+        "page": "/settings/projects",
+        "command": null,
+        "externalUrl": "https://github.com/settings/installations",
+        "instructions": "Create <org>/thoughts or add it to the App's repositories."
+      }
+    }
+  ],
+  "codingAccounts": {
+    "state": "none_enrolled",
+    "activeCount": 0,
+    "line": "No coding account is enrolled for this tenant. A tenant owner or admin enrolls one at Settings → AI accounts.",
+    "enrolledBy": "owner_or_admin",
+    "enrolledByLine": "A tenant owner or admin, in Catalyst settings.",
+    "page": "/settings/coding-accounts"
+  },
+  "humans": [
+    {
+      "linearUserId": "u-fixture-owner",
+      "role": "owner"
+    },
+    {
+      "linearUserId": "u-fixture-admin",
+      "role": "admin"
+    }
+  ],
+  "asks": {
+    "approvalsTeamId": "team-eng"
+  },
+  "portal": {
+    "url": "https://fixture.catalystcloud.dev/mcp/acme-fixture",
+    "unavailable": null,
+    "servers": [
+      {
+        "name": "context7",
+        "status": "ready",
+        "auth": "key"
+      },
+      {
+        "name": "workos",
+        "status": "pending_egress_guard",
+        "auth": "grant"
+      }
+    ]
+  }
+}
