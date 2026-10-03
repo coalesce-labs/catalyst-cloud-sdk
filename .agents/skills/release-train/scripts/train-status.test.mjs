@@ -70,10 +70,10 @@ test("run through a symlinked skill directory, the script still runs (no silent 
   assert.equal(r.status, 0);
 });
 
-test("an internal member that is not published yet is reported, and does not block the verdict", async () => {
+test("before its first line, an internal member that is not published yet is reported and does not block the verdict", async () => {
   const { UNPUBLISHED } = await import("./train-status.mjs");
-  const versions = { ...all("0.16.0"), design: UNPUBLISHED };
-  const v = verdict("0.16", versions);
+  const versions = { ...all("0.15.3"), design: UNPUBLISHED };
+  const v = verdict("0.15", versions);
   assert.equal(v.state, "on-line");
   assert.deepEqual(v.unpublished, ["design"]);
 });
@@ -105,4 +105,15 @@ test("githubPackageLatest: newest version; not published only when the org listi
   assert.throws(() => githubPackageLatest("catalyst-design", gh({ "orgs/coalesce-labs/packages/npm/": notFound(), "orgs/coalesce-labs/packages?": new Error("HTTP 401") })));
   assert.throws(() => githubPackageLatest("catalyst-design", gh({ "orgs/coalesce-labs/packages/npm/": notFound(), "orgs/coalesce-labs/packages?": [{ name: "catalyst-design" }] })));
   assert.throws(() => githubPackageLatest("catalyst-design", gh({ "orgs/coalesce-labs/packages/npm/": new Error("HTTP 500") })));
+});
+
+test("control: once the declared line reaches the design package's first line, an unpublished package is unread, never exempt", async () => {
+  const { UNPUBLISHED } = await import("./train-status.mjs");
+  for (const line of ["0.16", "0.17", "1.0"]) {
+    const v = verdict(line, { ...all(`${line}.0`), design: UNPUBLISHED });
+    assert.equal(v.state, "unknown", line);
+    assert.deepEqual(v.unread, ["design"], line);
+    assert.deepEqual(v.unpublished, [], line);
+  }
+  assert.equal(verdict("0.15", { ...all("0.15.3"), design: UNPUBLISHED }).state, "on-line");
 });

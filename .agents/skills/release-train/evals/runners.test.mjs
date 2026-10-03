@@ -153,3 +153,21 @@ test("firstCheck: nothing may change by default; patch_only allows exactly that 
   assert.equal(firstCheck({ patch_only: "0.15.3" }, [], []).passed, false);
   assert.equal(firstCheck({ patch_only: "0.15.3" }, patch, ["skills-bundle-v0.15.3"]).passed, false);
 });
+
+test("worktreeChanged sees a file written by any means, and ignores a clean tree", async () => {
+  const { worktreeChanged } = await import("./run-trigger.mjs");
+  const { execFileSync } = await import("node:child_process");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "worktree-changed-"));
+  const g = (...a) => execFileSync("git", ["-C", dir, "-c", "user.email=t@t", "-c", "user.name=t", ...a]);
+  g("init", "-q");
+  writeFileSync(join(dir, "package.json"), '{"version":"0.15.2"}\n');
+  g("add", "-A");
+  g("commit", "-qm", "start");
+  assert.equal(worktreeChanged(dir), false);
+  // As if `node -e "fs.writeFileSync(...)"` had run: no regex on the command could see it.
+  writeFileSync(join(dir, "package.json"), '{"version":"0.16.0"}\n');
+  assert.equal(worktreeChanged(dir), true);
+});

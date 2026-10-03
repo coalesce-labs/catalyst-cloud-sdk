@@ -29,8 +29,9 @@ export const MEMBERS = [
   { id: "read-model", label: "read-model (@catalyst-cloud/read-model)", npm: "@catalyst-cloud/read-model", repo: "catalyst-cloud" },
   { id: "installer", label: "installer (install.sh revision)", repo: "catalyst-cloud" },
   // Internal: private GitHub Packages, published from catalyst-cloud main on a version bump. Its first
-  // publish is 0.16.0, at the coordinated release; until then it reads as not published.
-  { id: "design", label: "design package (@coalesce-labs/catalyst-design, private)", githubPackage: "catalyst-design", internal: true, repo: "catalyst-cloud" },
+  // publish is 0.16.0, at the coordinated release. Before the declared line reaches its firstLine it may
+// be unpublished; from that line on it is a required member like any other.
+  { id: "design", label: "design package (@coalesce-labs/catalyst-design, private)", githubPackage: "catalyst-design", internal: true, firstLine: "0.16", repo: "catalyst-cloud" },
 ];
 
 /** The version recorded for an internal member that has never been published. */
@@ -54,7 +55,8 @@ export function parseReleaseLine(source) {
  * state is "on-line" only when the declared line is known and every member was read and sits on it.
  */
 export function verdict(declared, versions) {
-  const isUnpublished = (m) => m.internal === true && versions[m.id] === UNPUBLISHED;
+  const beforeFirstLine = (m) => Boolean(declared && m.firstLine) && declared.localeCompare(m.firstLine, undefined, { numeric: true }) < 0;
+  const isUnpublished = (m) => m.internal === true && versions[m.id] === UNPUBLISHED && beforeFirstLine(m);
   const counted = MEMBERS.filter((m) => !isUnpublished(m));
   const unpublished = MEMBERS.filter(isUnpublished).map((m) => m.id);
   const unread = counted.filter((m) => lineOf(versions[m.id]) === null).map((m) => m.id);
