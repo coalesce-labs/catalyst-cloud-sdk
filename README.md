@@ -1,10 +1,12 @@
 # @catalyst-cloud/sdk
 
-Read Catalyst's cloud mirror through the typed HTTP client. Subscribe to live updates without starting SQLite or downloading a tenant replica. Catalyst ingests Linear and GitHub once for the tenant; clients read the mirror rather than each polling the providers.
+Build apps that read and update your Catalyst Cloud data.
 
-```sh
-npm install @catalyst-cloud/sdk
-```
+Get live updates for your Linear tickets and GitHub pull requests.
+
+Install: `npm install @catalyst-cloud/sdk`
+
+[SDK documentation](https://github.com/coalesce-labs/catalyst-cloud-sdk#readme)
 
 ```ts
 import { createTenantClient } from "@catalyst-cloud/sdk";

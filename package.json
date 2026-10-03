@@ -1,7 +1,7 @@
 {
   "name": "@catalyst-cloud/sdk",
   "version": "0.14.1",
-  "description": "Typed cloud reads, writes and live updates for Catalyst. Local replicas are optional.",
+  "description": "Read and update your Catalyst Cloud data, and receive live changes in your apps.",
   "license": "MIT",
   "author": "Coalesce Labs",
   "homepage": "https://github.com/coalesce-labs/catalyst-cloud-sdk#readme",
