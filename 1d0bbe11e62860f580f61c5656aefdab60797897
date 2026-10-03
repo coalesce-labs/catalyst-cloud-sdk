@@ -1,6 +1,1 @@
-Revision history for #147:
-
-rev 2 (content) 2026-10-03 19:51 UTC — copy the source's recorded final trigger run; the lock names the updated source commit
-rev 1 (initial) 2026-10-03 19:51 UTC
-
-<!-- mergify-revision-data: {"schema_version":1,"pull_number":147,"entries":[{"number":1,"change_type":"initial","old_sha":null,"new_sha":"9b3ee9bdd37e26fe9afb4a5b8d32d596831cc475","timestamp_iso":"2026-10-03T19:51:07Z","reason":"","replay_sha":null,"compare_url":null},{"number":2,"change_type":"content","old_sha":"9b3ee9bdd37e26fe9afb4a5b8d32d596831cc475","new_sha":"8c4960f2744d68f50760084849837a5157ef4ce2","timestamp_iso":"2026-10-03T19:51:07Z","reason":"copy the source's recorded final trigger run; the lock names the updated source commit","replay_sha":null,"compare_url":"https://github.com/coalesce-labs/catalyst-cloud-sdk/compare/9b3ee9bdd37e26fe9afb4a5b8d32d596831cc475...8c4960f2744d68f50760084849837a5157ef4ce2"}]} -->
+the lock names catalyst-cloud-skills main 5fa65e9, where the source merged (#272); files unchanged
