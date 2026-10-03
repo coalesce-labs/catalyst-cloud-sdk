@@ -17,7 +17,7 @@ Every customer-facing Catalyst release shares one MAJOR.MINOR line, the train, s
 | SDK `@catalyst-cloud/sdk` and `sdk-replica-node`, `sdk-replica-browser` | catalyst-cloud-sdk | `package.json` plus `modules/*/package.json` (versions and `^X.Y.Z` peers) | GitHub Release `vX.Y.Z` |
 | `@catalyst-cloud/schema`, `replicate`, `read-model` | catalyst-cloud | `packages/<name>/package.json` | `npm publish` by hand, schema first |
 | Installer | catalyst-cloud | `INSTALL_SCRIPT_REVISION` in `apps/mirror/src/skills/install-script.ts` | the cloud deploy |
-| Design package `@coalesce-labs/catalyst-design` (internal: private GitHub Packages, for Coalesce's own app and website) | catalyst-cloud | `packages/design/package.json` (workspace name `@catalyst-cloud/design`) | merge to main with a version bump; the release workflow publishes it |
+| Design package `@coalesce-labs/catalyst-design` (internal: private GitHub Packages, for Coalesce's own app and website) | catalyst-cloud | `packages/design/package.json` (workspace name `@catalyst-cloud/design`) | merge to main with a version bump, once catalyst-cloud has its design release workflow; until that workflow exists in `.github/workflows`, nothing publishes it, so never report it released |
 | Agent contract `releaseLine` | catalyst-cloud | `RELEASE_LINE` in `packages/types/src/install-block.ts` | the cloud deploy |
 
 The design package's first publish is 0.16.0, at the coordinated release that realigns the train; until then train-status reports it as not published.

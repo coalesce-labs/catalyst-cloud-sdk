@@ -1,11 +1,11 @@
 {
   "comment": "The release-train skill's carried files. Written by scripts/release-train-skill.mjs; never edit by hand. The source is coalesce-labs/catalyst-cloud-skills.",
   "source": "coalesce-labs/catalyst-cloud-skills",
-  "commit": "5fa65e9e19655230b8e562b780cde089a22bab42",
+  "commit": "038c73431c4eae075edef3a4c70aff2a2a82a0a3",
   "files": [
     {
       "path": ".agents/skills/release-train/SKILL.md",
-      "sha256": "42d9836be45845a2993f0ada89bbbe929c1d20404d3b9636dcda279df050d6ea"
+      "sha256": "e1c1e0827c654b0e3e806c1f4d4f847d1c2e3c7c5a4e2f58cdb1e2ffa68319a0"
     },
     {
       "path": ".agents/skills/release-train/evals/README.md",
@@ -25,11 +25,11 @@
     },
     {
       "path": ".agents/skills/release-train/evals/run-trigger.mjs",
-      "sha256": "5dbe6672426f3c2af44e64e091bcb27094d2e8009a7d29027e3f6a8ccb746c29"
+      "sha256": "bd376e270f71db63a9dac2ec9b1a51580ed507b301f3d3c6bc9f5d356c718be5"
     },
     {
       "path": ".agents/skills/release-train/evals/runners.test.mjs",
-      "sha256": "719f32a230248a54ef202733a8d54440ed9b347eb72d88b82061e460be778784"
+      "sha256": "3fed4a4d23439c5714a297270d1995798536fd6b496731f33d34e16bda9b74ee"
     },
     {
       "path": ".agents/skills/release-train/evals/sandbox.mjs",
@@ -41,15 +41,15 @@
     },
     {
       "path": ".agents/skills/release-train/references/coordinated-release.md",
-      "sha256": "209a4214578e8f2f2ad2e4612656946c516e1e630b4ab0706a95c4472189e915"
+      "sha256": "bf4eb08a91763f85b4c1d5faaf22bbc4e5d3045266c37f61ffa4b30ca30197a7"
     },
     {
       "path": ".agents/skills/release-train/scripts/train-status.mjs",
-      "sha256": "aa761bcdb644d3b359569193af22d137f411c0b5486e35073242f2fb49e85d19"
+      "sha256": "7149af98676b0b76bbaa53a8950dba7d152726b58d946376ea4e4f36f4aed150"
     },
     {
       "path": ".agents/skills/release-train/scripts/train-status.test.mjs",
-      "sha256": "2e5095dd774be557bc017a4fa821192cabdd21ca9ea674cb7d9adcc98c0bee23"
+      "sha256": "ab6e90078ea8b6f54351fc900bb329cf5606dd742149da5514630d3a74b1adae"
     },
     {
       "path": "scripts/release-train-skill.mjs",
