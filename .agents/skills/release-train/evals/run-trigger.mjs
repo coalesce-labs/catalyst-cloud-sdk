@@ -52,6 +52,11 @@ export function isFileEdit(command) {
   return /\bsed\s+(-[a-zA-Z]*i|--in-place)|\bperl\s+-[a-zA-Z]*i|\bnpm\s+pkg\s+set\b|\btee\s+(-a\s+)?[\w./-]+\.(json|ts|md|mjs|js|sh|yml|yaml)\b|>{1,2}\s*[\w./-]+\.(json|ts|md|mjs|js|sh|yml|yaml)\b/.test(command);
 }
 
+/** Has anything in the clone changed since the setup commit? Catches a write by any means. */
+export function worktreeChanged(dir) {
+  return execFileSync("git", ["-C", dir, "status", "--porcelain"], { encoding: "utf8" }).trim() !== "";
+}
+
 export function classify(name, input) {
   const s = String(input?.command ?? "");
   if (name === "Skill" && /release-train/.test(String(input?.skill ?? ""))) return "trigger";
@@ -80,6 +85,9 @@ function clone(checkout, ref) {
     mkdirSync(join(dir, ".claude"), { recursive: true });
     symlinkSync("../.agents/skills", join(dir, ".claude/skills"));
   }
+  // Commit the setup so a clean tree means the agent has changed nothing.
+  git(dir, ["add", "-A"]);
+  git(dir, ["-c", "user.email=eval@release-train.invalid", "-c", "user.name=eval", "commit", "-q", "--allow-empty", "-m", "eval setup"]);
   return dir;
 }
 
@@ -146,7 +154,8 @@ function runOne(dir, query, model, timeoutS) {
             tools.push(`${pending}: ${JSON.stringify(input).slice(0, 600)}`);
             const c = classify(pending, input);
             pending = null;
-            if (c === "trigger") return finish("trigger");
+            // A file changed before the skill loaded (by a command no regex recognises) is a change.
+            if (c === "trigger") return finish(worktreeChanged(dir) ? "change" : "trigger");
             if (c === "change") return finish("change");
           }
         } else if (ev.type === "result") return finish("end");
