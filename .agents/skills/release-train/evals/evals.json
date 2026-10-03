@@ -1,0 +1,66 @@
+{
+  "skill_name": "release-train",
+  "//": "Outcome evals in the skill-creator format. run-outcome.mjs runs each prompt in a scratch clone of the named repository, with and without the skill, and grades the reply and the diff. README.md says how.",
+  "evals": [
+    {
+      "id": 1,
+      "name": "cli-minor-alone",
+      "repo": "catalyst-cloud-skills",
+      "prompt": "The `catalyst setup --resume` feature just merged. Bump the CLI to 0.16.0 and get it ready to publish.",
+      "expected_output": "A 0.16 CLI-only bump is not covered by the 0.15.x patch exception. No version is bumped: the agent explains that a 0.16 MINOR moves every member together, proposes the coordinated release or a 0.15.x patch instead, and stops for a decision.",
+      "files": [],
+      "assertions": [
+        "no released version was changed in the repository and no release tag was created",
+        "the reply proposes moving every train member to the same new line, or says the change should ship as a patch, rather than moving the CLI alone",
+        "the reply names at least three other members by name (for example the SDK, schema, replicate, read-model, the installer or releaseLine)",
+        "the reply stops and asks a person to decide before any version moves"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "cli-patch-0153-proceeds",
+      "repo": "catalyst-cloud-skills",
+      "check": {
+        "patch_only": "0.15.3"
+      },
+      "prompt": "Prepare the CLI 0.15.3 patch release of what is on main now: the version bump and a changelog entry written from what changed since 0.15.2. Don't tag or publish.",
+      "expected_output": "Under the standing exception a 0.15.x CLI patch proceeds without stopping. The agent bumps the CLI to 0.15.3 with the repository's steps (version, version:sync for the forwarder, plugin and skill stamps, a changelog entry), moves no MINOR, touches nothing outside the CLI side, and says it rides the exception.",
+      "files": [],
+      "assertions": [
+        "every changed version is exactly 0.15.3, no MINOR moved, and no release tag was created",
+        "the reply goes ahead with the 0.15.3 patch instead of stopping for a decision",
+        "the reply changes nothing outside the CLI side (no SDK, schema, installer or releaseLine change)",
+        "the reply says the patch is allowed because it is a 0.15.x CLI patch while 0.16 has not shipped, or names that exception"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "sdk-additive-change",
+      "repo": "catalyst-cloud-sdk",
+      "prompt": "We added an optional `waitingSince` field to the ticket summary type in the SDK. What version should the next SDK release be? Prepare it if it's straightforward, but don't publish.",
+      "expected_output": "The agent classifies the change as additive, so a PATCH within the SDK's current line. It checks where the train stands: if the SDK sits on the declared line it prepares the patch; if the train is split, as it is while members disagree, it reports that and stops instead of releasing on top of the split.",
+      "files": [],
+      "assertions": [
+        "no released version was changed in the repository and no release tag was created",
+        "the reply classifies the change as additive and therefore a patch, not a minor",
+        "the reply checks the SDK's MAJOR.MINOR against the declared train line and says whether it matches",
+        "if the SDK is off the declared line, the reply stops and asks a person before releasing; if it is on the line, it proposes the patch version within that line"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "breaking-contract-change",
+      "repo": "catalyst-cloud",
+      "prompt": "We're removing the legacyHosts field from the agent contract. Which versions have to move, and what has to ship with it?",
+      "expected_output": "The contract's own contractVersion moves its MAJOR (3.0.0), and because it is a breaking change the shared train MINOR moves for every member at once, including releaseLine and the installer revision. The agent lays out the coordinated release and asks before changing anything.",
+      "files": [],
+      "assertions": [
+        "no released version was changed in the repository and no release tag was created",
+        "the reply says the contract's own version moves its MAJOR",
+        "the reply says the shared train MINOR moves for every member together",
+        "the reply mentions releaseLine or RELEASE_LINE moving to the new line",
+        "the reply asks a person to approve before anything is bumped"
+      ]
+    }
+  ]
+}
