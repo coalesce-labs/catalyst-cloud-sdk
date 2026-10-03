@@ -37,3 +37,8 @@ replica-read rule below is absolute).
   shared fleet quota — don't reach for it even as a fallback; the skill's helper owns the loud
   stale/absent path. Writes and list/search go through `linearis`.
 <!-- catalyst-house-rules:end -->
+
+## Releases
+
+The SDK is one member of Catalyst's shared release train: every member (the CLI, the SDK, the installer, the schema packages) shares one MAJOR.MINOR, and a MINOR moves only in a coordinated release. Before you bump a version or create a release, load the `release-train` skill (`.agents/skills/release-train/SKILL.md`).
+
