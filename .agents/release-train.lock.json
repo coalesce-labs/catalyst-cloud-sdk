@@ -1,0 +1,59 @@
+{
+  "comment": "The release-train skill's carried files. Written by scripts/release-train-skill.mjs; never edit by hand. The source is coalesce-labs/catalyst-cloud-skills.",
+  "source": "coalesce-labs/catalyst-cloud-skills",
+  "commit": "5fa65e9e19655230b8e562b780cde089a22bab42",
+  "files": [
+    {
+      "path": ".agents/skills/release-train/SKILL.md",
+      "sha256": "42d9836be45845a2993f0ada89bbbe929c1d20404d3b9636dcda279df050d6ea"
+    },
+    {
+      "path": ".agents/skills/release-train/evals/README.md",
+      "sha256": "0ef60bd2a97263aacce70df62b03d33db674e12617755d603655fe241652c93f"
+    },
+    {
+      "path": ".agents/skills/release-train/evals/evals.json",
+      "sha256": "9d1560cc7d583226392606baa425b5f5b4b5df6170686b13dc7c82b1ae13a2dd"
+    },
+    {
+      "path": ".agents/skills/release-train/evals/results/2026-10-03.md",
+      "sha256": "8785f66be2009d50bd1f65ae251f060e2dcade717b57fde6d4953d43a6dd7cf0"
+    },
+    {
+      "path": ".agents/skills/release-train/evals/run-outcome.mjs",
+      "sha256": "5bad890f5640da29ba2f8b669aaedf7118622a1d84a2a77dfc3a4f65801f2936"
+    },
+    {
+      "path": ".agents/skills/release-train/evals/run-trigger.mjs",
+      "sha256": "5dbe6672426f3c2af44e64e091bcb27094d2e8009a7d29027e3f6a8ccb746c29"
+    },
+    {
+      "path": ".agents/skills/release-train/evals/runners.test.mjs",
+      "sha256": "719f32a230248a54ef202733a8d54440ed9b347eb72d88b82061e460be778784"
+    },
+    {
+      "path": ".agents/skills/release-train/evals/sandbox.mjs",
+      "sha256": "a625742c5758f1e6e210cf9ea44f1064aea5a09db9f090110b7e1127bbbc25b1"
+    },
+    {
+      "path": ".agents/skills/release-train/evals/trigger-eval.json",
+      "sha256": "185e61a5570e8c8faa5457cb06dcf8ec6f54424f8e2f53ea1dde6e19ce1d4628"
+    },
+    {
+      "path": ".agents/skills/release-train/references/coordinated-release.md",
+      "sha256": "209a4214578e8f2f2ad2e4612656946c516e1e630b4ab0706a95c4472189e915"
+    },
+    {
+      "path": ".agents/skills/release-train/scripts/train-status.mjs",
+      "sha256": "aa761bcdb644d3b359569193af22d137f411c0b5486e35073242f2fb49e85d19"
+    },
+    {
+      "path": ".agents/skills/release-train/scripts/train-status.test.mjs",
+      "sha256": "2e5095dd774be557bc017a4fa821192cabdd21ca9ea674cb7d9adcc98c0bee23"
+    },
+    {
+      "path": "scripts/release-train-skill.mjs",
+      "sha256": "161cb6ed9d08087843a2953aeb3f377bb8e82389d8caf34e6a8c62f5233d2fc2"
+    }
+  ]
+}
