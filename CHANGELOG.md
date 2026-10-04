@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.2
+
+The replica modules use schema and replication packages 0.13.2. This includes setup observation events and the corrected issue search index. Update the SDK and replica modules together.
+
 ## Unreleased — CTC-4549
 
 `issues.get` and `issues.execution` take an optional `{ fields, projection }` and send `?fields=a,b` and `?projection=<name>`. A selected issue is typed partial with `identifier` kept, and a name outside the server's catalog comes back as `select-refused` with the allowed names. A call without options sends exactly the request it sent before.
