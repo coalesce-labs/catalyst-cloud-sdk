@@ -1,4 +1,5 @@
 // Publish one tested SDK release, core first. Recover safely after a partial publication.
+import { checkRelease } from './release-train-check.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -42,6 +43,7 @@ export async function waitForPublication(entry, integrity, options = {}) {
   throw new Error(`Registry visibility timed out after 300 seconds for ${entry.name}@${entry.version}; rerun this release`);
 }
 export async function release(root = process.cwd()) {
+  await checkRelease({root, publish: 'sdk'});
   const catalog = releaseCatalog(root);
   if (process.env.GITHUB_EVENT_NAME === 'release' && process.env.GITHUB_REF_NAME !== `v${catalog[0].version}`) throw new Error('Release tag does not match the package version');
   const scratch = mkdtempSync(join(tmpdir(), 'catalyst-sdk-release-'));
