@@ -1,1 +1,6 @@
-Protect the parent release ticket from PR auto-linking; point approval and release-owner references to their GitHub records.
+Revision history for #153:
+
+rev 2 (rebase) 2026-10-06 20:50 UTC — Protect the parent release ticket from PR auto-linking; point approval and release-owner references to their GitHub records.
+rev 1 (initial) 2026-10-06 20:50 UTC
+
+<!-- mergify-revision-data: {"schema_version":1,"pull_number":153,"entries":[{"number":1,"change_type":"initial","old_sha":null,"new_sha":"780efac315a1f63d8ef47e92312400cc597bb0e1","timestamp_iso":"2026-10-06T20:50:19Z","reason":"","replay_sha":null,"compare_url":null},{"number":2,"change_type":"rebase","old_sha":"780efac315a1f63d8ef47e92312400cc597bb0e1","new_sha":"b979e95df967d4ae6c9fa01c3d011798a8b0930c","timestamp_iso":"2026-10-06T20:50:19Z","reason":"Protect the parent release ticket from PR auto-linking; point approval and release-owner references to their GitHub records.","replay_sha":null,"compare_url":"https://github.com/coalesce-labs/catalyst-cloud-sdk/compare/780efac315a1f63d8ef47e92312400cc597bb0e1...b979e95df967d4ae6c9fa01c3d011798a8b0930c"}]} -->
