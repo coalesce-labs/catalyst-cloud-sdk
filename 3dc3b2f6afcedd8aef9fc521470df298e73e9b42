@@ -1,0 +1,1 @@
+Correct the private-repository canonical fetch: compare the local declaration with reviewed cloud deployment metadata, retaining stale/unreadable and undeployed-line refusals.
