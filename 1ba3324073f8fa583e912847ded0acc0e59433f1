@@ -1,0 +1,1 @@
+Address independent review: validate both replicas direct library pins and add pinned and old-line refusal controls. Actual SDK publication still requires its approved release tag.
