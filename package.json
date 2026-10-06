@@ -86,7 +86,8 @@
     "test": "vitest run",
     "prepublishOnly": "npm run build",
     "typecheck:scripts": "tsc --noEmit -p tsconfig.scripts.json",
-    "test:pack": "node scripts/verify-pack.mjs"
+    "test:pack": "node scripts/verify-pack.mjs",
+    "release:check": "node scripts/release-train-check.mjs && node --test scripts/release-train-check.test.mjs"
   },
   "keywords": [
     "catalyst",
