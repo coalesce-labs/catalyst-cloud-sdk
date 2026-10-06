@@ -1,0 +1,101 @@
+{
+  "releaseLine": "0.16",
+  "state": "coordinated",
+  "approval": {
+    "decision": "CTC-5137",
+    "url": "https://linear.app/coalesce-labs/issue/CTC-5137",
+    "answeredBy": "Ryan Rozich",
+    "answeredAt": "2026-10-06T20:23:03.482Z",
+    "option": "A"
+  },
+  "members": {
+    "cli": {
+      "repository": "catalyst-cloud-skills",
+      "path": "package.json",
+      "sourceVersion": "0.15.6",
+      "version": "0.16.0",
+      "tag": "skills-bundle-v{version}",
+      "publish": true
+    },
+    "forwarder": {
+      "repository": "catalyst-cloud-skills",
+      "path": "packages/catalyst-skills/package.json",
+      "sourceVersion": "0.15.6",
+      "version": "0.16.0",
+      "tag": "skills-bundle-v{version}",
+      "publish": true
+    },
+    "plugin": {
+      "repository": "catalyst-cloud-skills",
+      "path": ".claude-plugin/plugin.json",
+      "sourceVersion": "0.15.6",
+      "version": "0.16.0",
+      "tag": "skills-bundle-v{version}",
+      "publish": true
+    },
+    "sdk": {
+      "repository": "catalyst-cloud-sdk",
+      "path": "package.json",
+      "sourceVersion": "0.14.2",
+      "version": "0.16.0",
+      "tag": "v{version}",
+      "publish": true
+    },
+    "sdk-replica-node": {
+      "repository": "catalyst-cloud-sdk",
+      "path": "modules/replica-node/package.json",
+      "sourceVersion": "0.14.2",
+      "version": "0.16.0",
+      "tag": "v{version}",
+      "publish": true
+    },
+    "sdk-replica-browser": {
+      "repository": "catalyst-cloud-sdk",
+      "path": "modules/replica-browser/package.json",
+      "sourceVersion": "0.14.2",
+      "version": "0.16.0",
+      "tag": "v{version}",
+      "publish": true
+    },
+    "schema": {
+      "repository": "catalyst-cloud",
+      "path": "packages/schema/package.json",
+      "sourceVersion": "0.13.0",
+      "version": "0.16.0",
+      "tag": null,
+      "publish": true
+    },
+    "replicate": {
+      "repository": "catalyst-cloud",
+      "path": "packages/replicate/package.json",
+      "sourceVersion": "0.13.0",
+      "version": "0.16.0",
+      "tag": null,
+      "publish": true
+    },
+    "read-model": {
+      "repository": "catalyst-cloud",
+      "path": "packages/read-model/package.json",
+      "sourceVersion": "0.13.1",
+      "version": "0.16.0",
+      "tag": null,
+      "publish": true
+    },
+    "design": {
+      "repository": "catalyst-cloud",
+      "path": "packages/design/package.json",
+      "sourceVersion": "0.16.4",
+      "version": "0.16.4",
+      "tag": null,
+      "publish": false
+    },
+    "installer": {
+      "repository": "catalyst-cloud",
+      "path": "apps/mirror/src/skills/install-script.ts",
+      "sourceVersion": "0.13.19",
+      "version": "0.16.0",
+      "tag": null,
+      "publish": true
+    }
+  }
+}
