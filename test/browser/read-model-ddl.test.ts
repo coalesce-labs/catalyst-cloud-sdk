@@ -9,13 +9,13 @@ import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import type { Database } from "@sqlite.org/sqlite-wasm";
 import {
   buildPullsView,
-  READ_INDEXES,
   SEARCH_FTS_TABLES,
   type SqlExecutor,
 } from "@catalyst-cloud/read-model";
 import { createWorkerCore } from "../../src/replica/browser/worker-core.js";
 import { buildOpenedReplica } from "../../src/replica/browser/ports.js";
 import {
+  REPLICA_READ_INDEX_NAMES,
   fullScans,
   ftsMarkers,
   planDetails,
@@ -42,7 +42,8 @@ describe("CTC-4324 — the browser replica builds the read-model DDL on open", (
     const opened = buildOpenedReplica(memoryDb());
 
     const { indexes, ftsTables } = readModelObjects(opened.read);
-    expect(indexes).toEqual(READ_INDEXES.map((i) => i.name));
+    expect(opened.read.exec("SELECT name FROM sqlite_master WHERE name = 'ask_tap_receipts'").toArray()).toEqual([]);
+    expect(indexes).toEqual(REPLICA_READ_INDEX_NAMES);
     expect(ftsTables).toEqual([...SEARCH_FTS_TABLES]);
     opened.close();
   });

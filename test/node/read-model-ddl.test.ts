@@ -19,6 +19,7 @@ import {
   type WebSocketLike,
 } from "../../src/node";
 import {
+  REPLICA_READ_INDEX_NAMES,
   fullScans,
   ftsMarkers,
   planDetails,
@@ -137,7 +138,8 @@ describe("CTC-4324 — the node replica builds the read-model DDL on open", () =
     const { replica } = await openReplica(tmpDbPath());
 
     const { indexes, ftsTables } = readModelObjects(replica.sql);
-    expect(indexes).toEqual(READ_INDEXES.map((i) => i.name));
+    expect(replica.sql.exec("SELECT name FROM sqlite_master WHERE name = 'ask_tap_receipts'").toArray()).toEqual([]);
+    expect(indexes).toEqual(REPLICA_READ_INDEX_NAMES);
     expect(ftsTables).toEqual([...SEARCH_FTS_TABLES]);
     expect(ftsMarkers(replica.sql).map((m) => m.name)).toEqual([...SEARCH_FTS_TABLES].sort());
   });
@@ -172,7 +174,7 @@ describe("CTC-4324 — the node replica builds the read-model DDL on open", () =
     raw.close();
 
     const reopened = await openReplica(dbPath);
-    expect(readModelObjects(reopened.replica.sql).indexes).toHaveLength(READ_INDEXES.length);
+    expect(readModelObjects(reopened.replica.sql).indexes).toEqual(REPLICA_READ_INDEX_NAMES);
     const hits = reopened.replica.sql
       .exec("SELECT rowid FROM issues_fts WHERE issues_fts MATCH ?", "search")
       .toArray();
