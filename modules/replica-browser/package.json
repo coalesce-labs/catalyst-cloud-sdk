@@ -1,6 +1,6 @@
 {
   "name": "@catalyst-cloud/sdk-replica-browser",
-  "version": "0.14.2",
+  "version": "0.16.0",
   "type": "module",
   "license": "MIT",
   "description": "Optional browser replica for the Catalyst SDK.",
@@ -31,13 +31,13 @@
     "db-worker.d.ts"
   ],
   "peerDependencies": {
-    "@catalyst-cloud/sdk": "^0.14.2",
+    "@catalyst-cloud/sdk": "^0.16.0",
     "@sqlite.org/sqlite-wasm": "^3.53.0-build1"
   },
   "dependencies": {
-    "@catalyst-cloud/read-model": "^0.13.0",
-    "@catalyst-cloud/replicate": "0.13.2",
-    "@catalyst-cloud/schema": "0.13.2"
+    "@catalyst-cloud/read-model": "^0.16.0",
+    "@catalyst-cloud/replicate": "0.16.0",
+    "@catalyst-cloud/schema": "0.16.0"
   },
   "sideEffects": [
     "./db-worker.js"
