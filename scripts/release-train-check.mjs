@@ -15,7 +15,7 @@ const members = {
   replicate: ["catalyst-cloud", "packages/replicate/package.json"],
   "read-model": ["catalyst-cloud", "packages/read-model/package.json"],
   design: ["catalyst-cloud", "packages/design/package.json"],
-  installer: ["catalyst-cloud", "apps/mirror/src/skills/install-script.ts"],
+  installer: ["catalyst-cloud", "packages/install-script/src/install-script.ts"],
 };
 const versionPattern = /^\d+\.\d+\.\d+$/;
 const lineOf = (version) => version.split(".").slice(0, 2).join(".");

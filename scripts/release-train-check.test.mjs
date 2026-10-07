@@ -37,6 +37,7 @@ test("source identities, tag prefixes and answered approvals fail closed", () =>
   for (const corrupt of [
     (p) => delete p.approval,
     (p) => (p.members.sdk.path = "other.json"),
+    (p) => (p.members.installer.path = "apps/mirror/src/skills/install-script.ts"),
     (p) => (p.members.sdk.version = "0.14.0"),
   ]) {
     const changed = structuredClone(plan);
