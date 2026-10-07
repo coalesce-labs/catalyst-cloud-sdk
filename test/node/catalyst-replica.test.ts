@@ -458,10 +458,9 @@ describe("CatalystReplica read-model over the replica (ADR-0002)", () => {
     expect(view.map((v) => v.id)).toEqual(["i2", "i1"]); // i3 soft-removed, newest-first
     const i1 = view.find((v) => v.id === "i1")!;
     expect(i1.labels).toEqual([{ id: "l1", name: "bug", color: null }]);
-    // read-model 0.1.2 returns each relation's own id and the related issue's state (null when that
-    // issue is not in the replica), both additive.
+    // Relations include the related issue's title and state from the current replica rows.
     expect(i1.relations).toEqual([
-      { id: "r1", type: "blocks", issue_identifier: "CTL-1", related_identifier: "CTL-2", related_state: null },
+      { id: "r1", type: "blocks", issue_identifier: "CTL-1", related_identifier: "CTL-2", related_state: null, related_title: "newer" },
     ]);
   });
 

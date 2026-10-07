@@ -7,6 +7,12 @@ import {
   type SqlValue,
 } from "@catalyst-cloud/read-model";
 
+// ask_tap_receipts belongs to the hub, not the replicated schema bundle.
+// Every other declared read-model index must exist in a fresh or reopened replica.
+export const REPLICA_READ_INDEX_NAMES = READ_INDEXES
+  .filter(({ table }) => table !== "ask_tap_receipts")
+  .map(({ name }) => name);
+
 export interface RecordedStatement {
   query: string;
   bindings: SqlValue[];
