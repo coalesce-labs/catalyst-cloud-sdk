@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.0
+
+The SDK and optional Node and browser replicas now use the 0.16 schema, replication and read-model packages. Update the SDK and any replica modules together to keep your workspace on the same release line. Existing transport-only clients retain their optional replica dependencies.
+
 ## 0.14.2
 
 The replica modules use schema and replication packages 0.13.2. This includes setup observation events and the corrected issue search index. Update the SDK and replica modules together.
