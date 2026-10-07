@@ -91,7 +91,7 @@
     },
     "installer": {
       "repository": "catalyst-cloud",
-      "path": "apps/mirror/src/skills/install-script.ts",
+      "path": "packages/install-script/src/install-script.ts",
       "sourceVersion": "0.13.19",
       "version": "0.16.0",
       "tag": null,
