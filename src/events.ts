@@ -25,7 +25,7 @@ export type { CatalystEvent } from "@catalyst-cloud/schema";
 const HEAD_HEADER = "x-catalyst-event-backbone-head-seq";
 const MAX_EVENT_LINE_BYTES = 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
-const DEFAULT_IDLE_MIN_MS = 1_000;
+const DEFAULT_IDLE_MIN_MS = 5_000;
 const DEFAULT_IDLE_MAX_MS = 30_000;
 const DEFAULT_RETAIN_DAYS = 7;
 const DEFAULT_MAX_CACHE_BYTES = 256 * 1024 * 1024;
