@@ -172,6 +172,7 @@ describe("CatalystEventSync", () => {
       directory: root,
       fetch,
       now: () => new Date("2026-09-16T20:00:00.000Z"),
+      push: false,
       sleep: async (ms) => {
         sleeps.push(ms);
         if (sleeps.length === 6) void sync.stop();

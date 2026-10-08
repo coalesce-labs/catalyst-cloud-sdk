@@ -13,7 +13,13 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { CatalystEvent } from "@catalyst-cloud/schema";
-import type { AuthStrategy } from "./live-sync-client.js";
+import type { AuthStrategy, WebSocketFactory } from "./live-sync-client.js";
+import {
+  EventsChannelClient,
+  globalWebSocketFactory,
+  type EventsFrame,
+  type EventsSocketOptions,
+} from "./events-socket.js";
 import {
   claimWriterLock,
   type WriterGuardOptions,
@@ -21,6 +27,14 @@ import {
 } from "./replica/writer-lock.js";
 
 export type { CatalystEvent } from "@catalyst-cloud/schema";
+export {
+  EventsChannelClient,
+  eventsSocketUrl,
+  type EventsFrame,
+  type EventsSocketBatch,
+  type EventsSocketOptions,
+  type EventsSocketState,
+} from "./events-socket.js";
 
 const HEAD_HEADER = "x-catalyst-event-backbone-head-seq";
 const MAX_EVENT_LINE_BYTES = 1024 * 1024;
@@ -30,6 +44,8 @@ const DEFAULT_IDLE_MAX_MS = 30_000;
 const DEFAULT_RETAIN_DAYS = 7;
 const DEFAULT_MAX_CACHE_BYTES = 256 * 1024 * 1024;
 const SEGMENT_PATTERN = /^\d{4}-\d{2}-\d{2}(?:-\d{3})?\.jsonl$/;
+/** Backbone pages one catch-up may read before handing back to the loop. */
+const MAX_CATCH_UP_PAGES = 20;
 
 export interface EventCachePaths {
   directory: string;
@@ -51,6 +67,24 @@ export interface EventSyncOptions {
   writerGuard?: WriterGuardOptions;
   now?: () => Date;
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  /**
+   * Take events from the tenant's events socket instead of polling (CTC-5295). Default true when the
+   * runtime has a global `WebSocket` or `wsFactory` is given. The socket opens on `start()` or
+   * `waitForChange()`, never on a bare `syncOnce()`, and closes on `stop()`.
+   */
+  push?: boolean;
+  /** Opens the events socket. Defaults to the runtime's global `WebSocket`. */
+  wsFactory?: WebSocketFactory;
+  /** Events socket timing and buffer bounds; the defaults suit a long-running follower. */
+  socket?: Pick<
+    EventsSocketOptions,
+    | "pingAfterMs"
+    | "pongTimeoutMs"
+    | "reconnectMinMs"
+    | "reconnectMaxMs"
+    | "maxBufferedFrames"
+    | "maxBufferedBytes"
+  >;
 }
 
 export interface EventSyncStatus {
@@ -59,6 +93,8 @@ export interface EventSyncStatus {
   head: number | null;
   lastSyncAt: string | null;
   error: string | null;
+  /** How new events arrive: `push` while the events socket is live, else `poll`. */
+  transport?: "push" | "poll";
 }
 
 export interface EventSyncResult {
@@ -338,6 +374,10 @@ export class CatalystEventSync {
   private running: Promise<void> | null = null;
   private recoveredCursor: number | null = null;
   private floor = -1;
+  private socket: EventsChannelClient | null = null;
+  /** The socket generation the cache last caught up under; a new one needs a backbone catch-up. */
+  private syncedGeneration = -1;
+  private catchUpPending = false;
   private current: EventSyncStatus = {
     state: "stopped",
     cursor: null,
@@ -380,7 +420,10 @@ export class CatalystEventSync {
       cursor = await this.readCurrentHead(signal);
       this.floor = cursor;
     }
-    const result = await this.readPage(cursor, signal);
+    const live = this.socket?.state === "live";
+    const result = live
+      ? await this.readPushed(cursor, signal)
+      : { ...(await this.readPage(cursor, signal)), through: null };
     const now = this.now();
     const maxCacheBytes = this.options.maxCacheBytes ?? DEFAULT_MAX_CACHE_BYTES;
     let segment = segmentName(now);
@@ -394,6 +437,8 @@ export class CatalystEventSync {
       cursor = result.rows[result.rows.length - 1]!.event.sequence;
       this.recoveredCursor = cursor;
     }
+    // Every sequence through a pushed frame's `through` was scanned, events or not.
+    if (result.through !== null && result.through > cursor) cursor = result.through;
     this.floor = await retainBoundedSegments(
       this.paths.directory,
       now,
@@ -413,6 +458,7 @@ export class CatalystEventSync {
       head: result.head,
       lastSyncAt: this.now().toISOString(),
       error: null,
+      transport: live ? "push" : "poll",
     };
     return { appended: result.rows.length, cursor, head: result.head };
   }
@@ -421,6 +467,7 @@ export class CatalystEventSync {
     if (this.running) return this.running;
     this.controller = new AbortController();
     this.running = this.loop(this.controller.signal).finally(() => {
+      this.closeSocket();
       if (this.current.state !== "failed")
         this.current = { ...this.current, state: "stopped" };
       this.lock?.release();
@@ -435,6 +482,7 @@ export class CatalystEventSync {
   async stop(): Promise<void> {
     const controller = this.controller;
     if (!this.running) {
+      this.closeSocket();
       this.lock?.release();
       this.lock = null;
       this.current = { ...this.current, state: "stopped" };
@@ -453,12 +501,16 @@ export class CatalystEventSync {
     const maxIdle = this.options.idleMaxMs ?? DEFAULT_IDLE_MAX_MS;
     try {
       while (!signal.aborted) {
+        let failed = false;
         try {
+          const live = this.socket?.state === "live";
           const result = await this.syncOnce(signal);
           idle =
             result.appended > 0
               ? (this.options.idleMinMs ?? DEFAULT_IDLE_MIN_MS)
               : Math.min(maxIdle, idle * 2);
+          // A partial catch-up goes straight on to the next page.
+          if (live && this.catchUpPending) continue;
         } catch (error) {
           if (
             error instanceof EventHistoryGapError ||
@@ -471,8 +523,17 @@ export class CatalystEventSync {
             error: error instanceof Error ? error.message : String(error),
           };
           idle = Math.min(maxIdle, idle * 2);
+          failed = true;
         }
-        await this.sleeper(idle, signal);
+        if (failed) {
+          // A failed read backs off whatever the socket says: a pending catch-up would otherwise
+          // end every wait at once and retry the backbone with no pause.
+          this.ensureSocket();
+          await this.sleeper(idle, signal);
+        } else {
+          // While the socket is live a wait costs no request, so wait the longest; a frame ends it early.
+          await this.waitForChange(this.socket?.state === "live" ? maxIdle : idle, signal);
+        }
       }
     } catch (error) {
       if (signal.aborted) return;
@@ -483,6 +544,150 @@ export class CatalystEventSync {
       };
       throw error;
     }
+  }
+
+  /**
+   * Wait up to `maxMs` for something to sync: a pushed frame, or the events socket going live (which
+   * needs a catch-up). Opens the events socket on first call when push is on. Resolves true when a
+   * change ended the wait, false on timeout; rejects only when `signal` aborts. Without a socket it
+   * is a plain sleep, so a caller's own loop can use it either way.
+   */
+  async waitForChange(maxMs: number, signal: AbortSignal): Promise<boolean> {
+    const socket = this.ensureSocket();
+    if (!socket) {
+      await this.sleeper(maxMs, signal);
+      return false;
+    }
+    if (socket.hasPending() || this.needsCatchUp(socket)) return true;
+    const waker = new AbortController();
+    const woke = socket.changed(waker.signal).then(() => true);
+    const slept = this.sleeper(maxMs, AbortSignal.any([signal, waker.signal])).then(
+      () => false,
+      (error: unknown) => {
+        if (signal.aborted) throw error;
+        return true;
+      },
+    );
+    try {
+      return await Promise.race([woke, slept]);
+    } finally {
+      waker.abort();
+    }
+  }
+
+  private ensureSocket(): EventsChannelClient | null {
+    if (this.socket) return this.socket;
+    if (this.options.push === false) return null;
+    const wsFactory = this.options.wsFactory ?? globalWebSocketFactory();
+    if (!wsFactory) return null;
+    this.socket = new EventsChannelClient({
+      baseUrl: this.options.baseUrl.replace(/\/$/, ""),
+      auth: this.options.auth,
+      tenantId: this.options.tenantId,
+      wsFactory,
+      ...this.options.socket,
+    });
+    this.socket.start();
+    return this.socket;
+  }
+
+  private closeSocket(): void {
+    this.socket?.stop();
+    this.socket = null;
+    this.syncedGeneration = -1;
+    this.catchUpPending = false;
+  }
+
+  private needsCatchUp(socket: EventsChannelClient): boolean {
+    return socket.state === "live" && (socket.generation !== this.syncedGeneration || this.catchUpPending);
+  }
+
+  /**
+   * The push path. Apply buffered frames that chain from the cursor with no request. Read the backbone
+   * from the cursor instead when this socket generation has not caught up yet (subscribe first: the
+   * frames buffered meanwhile are deduped by sequence after), when a frame starts past the cursor, is
+   * flagged `gap`, or carries an event without its payload, or when the buffer overflowed.
+   */
+  private async readPushed(
+    cursor: number,
+    signal: AbortSignal,
+  ): Promise<{
+    head: number;
+    through: number;
+    rows: Array<{ event: CatalystEvent; line: string }>;
+  }> {
+    const socket = this.socket!;
+    const batch = socket.take();
+    let catchUp = batch.overflowed || this.needsCatchUp(socket);
+    // Until this read succeeds, the next one must catch up: the frames taken here are gone.
+    this.catchUpPending = true;
+    const rows: Array<{ event: CatalystEvent; line: string }> = [];
+    let head = this.current.head ?? cursor;
+    let pending: EventsFrame[] = batch.frames;
+    let pages = 0;
+    for (;;) {
+      const applied = this.applyFrames(cursor, pending);
+      rows.push(...applied.rows);
+      cursor = applied.cursor;
+      head = Math.max(head, cursor);
+      pending = applied.rest;
+      if (!catchUp && !applied.broken) break;
+      catchUp = false;
+      // Everything a frame carried is already in the backbone, so reading from the cursor covers the
+      // frame that broke the chain too; the frames after it are then deduped by sequence.
+      for (;;) {
+        const page = await this.readPage(cursor, signal);
+        pages++;
+        rows.push(...page.rows);
+        if (page.rows.length > 0) cursor = page.rows[page.rows.length - 1]!.event.sequence;
+        head = Math.max(head, page.head);
+        if (page.rows.length === 0 || cursor >= page.head) break;
+        if (pages >= MAX_CATCH_UP_PAGES) {
+          // Leave the rest to the next sync; the loop runs it at once.
+          return { head, through: cursor, rows };
+        }
+      }
+    }
+    this.syncedGeneration = batch.generation;
+    this.catchUpPending = false;
+    return { head, through: cursor, rows };
+  }
+
+  /** Apply frames that chain from `cursor`; stop at the first one that does not. */
+  private applyFrames(
+    cursor: number,
+    frames: EventsFrame[],
+  ): {
+    cursor: number;
+    rows: Array<{ event: CatalystEvent; line: string }>;
+    broken: boolean;
+    rest: EventsFrame[];
+  } {
+    const rows: Array<{ event: CatalystEvent; line: string }> = [];
+    for (let index = 0; index < frames.length; index++) {
+      const frame = frames[index]!;
+      if (frame.through <= cursor) continue;
+      const fresh = frame.events.filter(
+        (value) => ((value as { sequence?: unknown } | null)?.sequence as number) > cursor,
+      );
+      if (
+        frame.gap ||
+        frame.after > cursor ||
+        fresh.some((value) => (value as { payloadOmitted?: unknown }).payloadOmitted === true)
+      )
+        return { cursor, rows, broken: true, rest: frames.slice(index + 1) };
+      for (const value of fresh) {
+        const event = parseEvent(value);
+        if (event.tenantId !== this.options.tenantId)
+          throw new Error("event sync: tenant mismatch");
+        if (event.sequence <= cursor || event.sequence > frame.through)
+          throw new Error("event sync: non-monotonic sequence");
+        rows.push({ event, line: JSON.stringify(event) });
+        cursor = event.sequence;
+      }
+      cursor = frame.through;
+    }
+    return { cursor, rows, broken: false, rest: [] };
   }
 
   private async request(since: number, signal: AbortSignal): Promise<Response> {
