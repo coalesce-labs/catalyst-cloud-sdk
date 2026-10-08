@@ -11,6 +11,8 @@ import {
 } from "./release-train-check.mjs";
 
 const plan = JSON.parse(await readFile(new URL("../release-train.json", import.meta.url), "utf8"));
+const coordinated = { ...structuredClone(plan), state: "coordinated" };
+const sdkVersion = plan.members.sdk.version;
 
 test("the approved complete cohort is readable, but a missing member cannot authorize a release", () => {
   assert.equal(validateDeclaration(plan).releaseLine, "0.16");
@@ -20,13 +22,25 @@ test("the approved complete cohort is readable, but a missing member cannot auth
 });
 
 test("a coordinated transition allows its source and target, but only the exact target may publish", () => {
-  validateVersion(plan, "cli", "0.15.6");
-  validateVersion(plan, "cli", "0.16.0", true);
-  assert.throws(() => validateVersion(plan, "cli", "0.15.6", true), /exact approved/);
-  assert.throws(() => validateVersion(plan, "sdk", "0.16.1", true), /exact approved/);
-  assert.throws(() => validateVersion(plan, "design", "0.16.4", true), /No publication approved/);
-  validateVersion(plan, "design", "0.16.5");
-  assert.throws(() => validateVersion(plan, "design", "0.16.3"), /exact approved/);
+  validateVersion(coordinated, "cli", "0.15.6");
+  validateVersion(coordinated, "cli", "0.16.0", true);
+  assert.throws(() => validateVersion(coordinated, "cli", "0.15.6", true), /exact approved/);
+  assert.throws(() => validateVersion(coordinated, "sdk", "0.16.9", true), /exact approved/);
+  assert.throws(
+    () => validateVersion(coordinated, "design", "0.16.4", true),
+    /No publication approved/,
+  );
+  validateVersion(coordinated, "design", "0.16.5");
+  assert.throws(() => validateVersion(coordinated, "design", "0.16.3"), /exact approved/);
+});
+
+test("an aligned train accepts any patch on its line and refuses every other line", () => {
+  const aligned = { ...structuredClone(plan), state: "aligned" };
+  validateVersion(aligned, "sdk", sdkVersion, true);
+  validateVersion(aligned, "sdk-replica-node", sdkVersion, true);
+  assert.throws(() => validateVersion(aligned, "sdk", "0.17.0", true), /off release line/);
+  assert.throws(() => validateVersion(aligned, "cli", "0.15.6"), /off release line/);
+  assert.throws(() => validateVersion(aligned, "design", "0.16.6", true), /No publication approved/);
 });
 
 test("source identities, tag prefixes and answered approvals fail closed", () => {
@@ -40,7 +54,7 @@ test("source identities, tag prefixes and answered approvals fail closed", () =>
     (p) => (p.members.installer.path = "apps/mirror/src/skills/install-script.ts"),
     (p) => (p.members.sdk.version = "0.14.0"),
   ]) {
-    const changed = structuredClone(plan);
+    const changed = structuredClone(coordinated);
     corrupt(changed);
     assert.throws(() => validateDeclaration(changed));
   }
@@ -55,7 +69,7 @@ test("publication requires a readable matching cloud declaration before a pack i
       JSON.stringify({
         name: "@catalyst-cloud/cli",
         version: "0.16.0",
-        dependencies: { "@catalyst-cloud/sdk": "0.16.0" },
+        dependencies: { "@catalyst-cloud/sdk": sdkVersion },
       }),
     );
     await mkdir(join(root, "packages/catalyst-skills"), { recursive: true });
@@ -118,7 +132,7 @@ test("both published replicas need the approved direct library pins", async () =
       join(root, "package.json"),
       JSON.stringify({
         name: "@catalyst-cloud/sdk",
-        version: "0.16.0",
+        version: sdkVersion,
         devDependencies: pins,
         peerDependencies: pins,
       }),
@@ -128,8 +142,8 @@ test("both published replicas need the approved direct library pins", async () =
       await writeFile(
         join(root, "modules", module, "package.json"),
         JSON.stringify({
-          version: "0.16.0",
-          peerDependencies: { "@catalyst-cloud/sdk": "^0.16.0" },
+          version: sdkVersion,
+          peerDependencies: { "@catalyst-cloud/sdk": `^${sdkVersion}` },
           dependencies: pins,
         }),
       );
@@ -137,7 +151,7 @@ test("both published replicas need the approved direct library pins", async () =
     const options = {
       root,
       publish: "sdk",
-      tag: "v0.16.0",
+      tag: `v${sdkVersion}`,
       fetcher: async (url) =>
         url.endsWith("/install.sh")
           ? new Response("", { headers: { "x-catalyst-install-script-revision": "0.16.0" } })
