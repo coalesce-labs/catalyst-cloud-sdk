@@ -154,6 +154,34 @@ describe("CatalystEventSync", () => {
     ).toEqual([event(5)]);
   });
 
+  it("polls an idle backbone no more than once every 5 seconds, backing off to 30", async () => {
+    const root = await directory();
+    await writeFile(
+      join(root, "cursor.json"),
+      '{"version":1,"cursor":0,"floor":0}\n',
+    );
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(response(`${JSON.stringify(event(1))}\n`, 200, 1))
+      .mockImplementation(async () => response("", 200, 1));
+    const sleeps: number[] = [];
+    const sync: CatalystEventSync = new CatalystEventSync({
+      baseUrl: "https://cloud.invalid",
+      auth: { kind: "token", token: "secret" },
+      tenantId: "tenant-1",
+      directory: root,
+      fetch,
+      now: () => new Date("2026-09-16T20:00:00.000Z"),
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        if (sleeps.length === 6) void sync.stop();
+      },
+    });
+
+    await sync.start();
+    expect(sleeps).toEqual([5_000, 10_000, 20_000, 30_000, 30_000, 30_000]);
+  });
+
   it("keeps an explicit durable-history gap and a second live writer loud", async () => {
     const root = await directory();
     const first = new CatalystEventSync({
