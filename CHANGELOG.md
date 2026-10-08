@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — CTC-5295
+
+An idle `CatalystEventSync` now waits 5 seconds before its next poll of `GET /api/v1/events/backbone`, up from 1 second, and still backs off to 30 seconds while nothing new arrives. A poll that returns events resets the wait to 5 seconds. This cuts the requests an idle follower makes by about 5x. To keep the old pace, pass `idleMinMs: 1000`.
+
+Additive, so a patch release.
+
 ## 0.16.0
 
 The SDK and optional Node and browser replicas now use the 0.16 schema, replication and read-model packages. Update the SDK and any replica modules together to keep your workspace on the same release line. Existing transport-only clients retain their optional replica dependencies.
