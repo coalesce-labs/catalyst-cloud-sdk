@@ -1,3 +1,4 @@
+import { isMachineInventory, isMachineMutation, type MachineInventory, type MachineMutation } from "./machine-inventory.js";
 import { parseLinearIdentityView, type LinearIdentityResult } from "./linear-identity.js";
 // tenant-client.ts — CTC-2004. ONE typed client for every tenant read and write, so the CLI, the
 // skill scripts, MCP tools and the cloud repo's own scripts share one implementation instead of six.
@@ -2376,7 +2377,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     },
   };
 
-  async function teamCall<T extends object>(method: "GET" | "POST", path: string, body: unknown, guard: (value: unknown) => value is T): Promise<TeamWorkflowResult<T>> {
+  async function teamCall<T extends object>(method: "GET" | "POST" | "DELETE", path: string, body: unknown, guard: (value: unknown) => value is T): Promise<TeamWorkflowResult<T>> {
     const sent = await send(method, url(path), {}, body);
     if (!sent.ok) return sent.failure;
     const answer = sent.answer;
@@ -2434,6 +2435,29 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
   };
 
   return {
+    hosts: {
+      list: (params = {}) =>
+        teamCall(
+          "GET",
+          `/api/v1/hosts/machines${params.account === undefined ? "" : `?account=${encodeURIComponent(params.account)}`}`,
+          undefined,
+          isMachineInventory,
+        ),
+      remove: (hostId, params = {}) =>
+        teamCall(
+          "DELETE",
+          `/api/v1/hosts/${encodeURIComponent(hostId)}${params.account === undefined ? "" : `?account=${encodeURIComponent(params.account)}`}`,
+          undefined,
+          isMachineMutation,
+        ),
+      rename: (hostId, name, params = {}) =>
+        teamCall(
+          "POST",
+          `/api/v1/hosts/${encodeURIComponent(hostId)}/name${params.account === undefined ? "" : `?account=${encodeURIComponent(params.account)}`}`,
+          { name },
+          isMachineMutation,
+        ),
+    },
     contract,
     me,
     request,
@@ -2469,6 +2493,20 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
 
 /** The client. See {@link createTenantClient}. */
 export interface TenantClient {
+  hosts: {
+    list(params?: {
+      account?: string;
+    }): Promise<TeamWorkflowResult<MachineInventory>>;
+    remove(
+      hostId: string,
+      params?: { account?: string },
+    ): Promise<TeamWorkflowResult<MachineMutation>>;
+    rename(
+      hostId: string,
+      name: string,
+      params?: { account?: string },
+    ): Promise<TeamWorkflowResult<MachineMutation>>;
+  };
   /** Personal bearer team setup. The key's tenant and admin role are enforced by the cloud. */
   teamWorkflow: {
     teams(): Promise<TeamWorkflowResult<TeamList>>;

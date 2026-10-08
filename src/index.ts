@@ -226,3 +226,6 @@ export {
 } from "./tenant-contract.js";
 
 export type { MemberLinearIdentity, LinearIdentityOption, LinearIdentityView, LinearIdentityResult } from "./linear-identity.js";
+
+export { isMachineInventory } from "./machine-inventory.js";
+export type { Machine, MachineInventory, MachineMutation } from "./machine-inventory.js";
