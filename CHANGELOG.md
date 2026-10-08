@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — CTC-5295 (push)
+## 0.16.1
 
 `CatalystEventSync` now takes events from your workspace's events socket instead of polling `GET /api/v1/events/backbone`. While the socket is open, each event arrives when it is recorded and the follower makes no backbone request. It reads the backbone only to catch up: once after each connect, and when a pushed frame says it is incomplete. While the socket is down, it polls at 5 to 30 seconds, as before.
 
@@ -10,13 +10,11 @@
 - `status().transport` says `push` or `poll`.
 - After 90 seconds of silence the client pings. A ping unanswered for 15 seconds reconnects the socket. A reauthentication close (4401) reconnects at once.
 
-Additive, so a patch release. Needs a cloud that serves the events socket (catalyst-cloud CTC-4562).
-
-## Unreleased — CTC-5295
+Push needs the events socket on your workspace.
 
 An idle `CatalystEventSync` now waits 5 seconds before its next poll of `GET /api/v1/events/backbone`, up from 1 second, and still backs off to 30 seconds while nothing new arrives. A poll that returns events resets the wait to 5 seconds. This cuts the requests an idle follower makes by about 5x. To keep the old pace, pass `idleMinMs: 1000`.
 
-Additive, so a patch release.
+Update the SDK and any replica modules together.
 
 ## 0.16.0
 

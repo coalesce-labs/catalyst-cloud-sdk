@@ -1,6 +1,6 @@
 {
   "releaseLine": "0.16",
-  "state": "coordinated",
+  "state": "aligned",
   "approval": {
     "decision": "CTC-5137",
     "url": "https://linear.app/coalesce-labs/issue/CTC-5137",
@@ -37,7 +37,7 @@
       "repository": "catalyst-cloud-sdk",
       "path": "package.json",
       "sourceVersion": "0.14.2",
-      "version": "0.16.0",
+      "version": "0.16.1",
       "tag": "v{version}",
       "publish": true
     },
@@ -45,7 +45,7 @@
       "repository": "catalyst-cloud-sdk",
       "path": "modules/replica-node/package.json",
       "sourceVersion": "0.14.2",
-      "version": "0.16.0",
+      "version": "0.16.1",
       "tag": "v{version}",
       "publish": true
     },
@@ -53,7 +53,7 @@
       "repository": "catalyst-cloud-sdk",
       "path": "modules/replica-browser/package.json",
       "sourceVersion": "0.14.2",
-      "version": "0.16.0",
+      "version": "0.16.1",
       "tag": "v{version}",
       "publish": true
     },
