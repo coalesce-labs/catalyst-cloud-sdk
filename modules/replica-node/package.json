@@ -1,6 +1,6 @@
 {
   "name": "@catalyst-cloud/sdk-replica-node",
-  "version": "0.16.1",
+  "version": "0.16.2",
   "type": "module",
   "license": "MIT",
   "description": "Optional node replica for the Catalyst SDK.",
@@ -24,13 +24,13 @@
     "README.md"
   ],
   "peerDependencies": {
-    "@catalyst-cloud/sdk": "^0.16.1",
+    "@catalyst-cloud/sdk": "^0.16.2",
     "better-sqlite3": "*"
   },
   "dependencies": {
     "@catalyst-cloud/read-model": "^0.16.0",
-    "@catalyst-cloud/replicate": "0.16.0",
-    "@catalyst-cloud/schema": "0.16.0"
+    "@catalyst-cloud/replicate": "0.16.1",
+    "@catalyst-cloud/schema": "0.16.1"
   },
   "engines": {
     "node": ">=22"
