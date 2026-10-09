@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.16.2
+
+The SDK and the Node and browser replicas now use schema and replication packages 0.16.1. The replica's record of processed webhook deliveries is rebuilt as a smaller table the first time a replica opens after the update, keeping the last 7 days of deliveries.
+
+`hosts.list()`, `hosts.rename(hostId, name)` and `hosts.remove(hostId)` read and manage the machines connected to your workspace. Each takes an optional `{ account }`. `isMachineInventory` and the `Machine`, `MachineInventory` and `MachineMutation` types are exported.
+
+Update the SDK and any replica modules together.
+
 ## 0.16.1
 
 `CatalystEventSync` now takes events from your workspace's events socket instead of polling `GET /api/v1/events/backbone`. While the socket is open, each event arrives when it is recorded and the follower makes no backbone request. It reads the backbone only to catch up: once after each connect, and when a pushed frame says it is incomplete. While the socket is down, it polls at 5 to 30 seconds, as before.
