@@ -124,9 +124,9 @@ test("both published replicas need the approved direct library pins", async () =
   try {
     await writeFile(join(root, "release-train.json"), JSON.stringify(plan));
     const pins = {
-      "@catalyst-cloud/schema": "0.16.0",
-      "@catalyst-cloud/replicate": "0.16.0",
-      "@catalyst-cloud/read-model": "^0.16.0",
+      "@catalyst-cloud/schema": plan.members.schema.version,
+      "@catalyst-cloud/replicate": plan.members.replicate.version,
+      "@catalyst-cloud/read-model": `^${plan.members["read-model"].version}`,
     };
     await writeFile(
       join(root, "package.json"),

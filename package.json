@@ -1,6 +1,6 @@
 {
   "name": "@catalyst-cloud/sdk",
-  "version": "0.16.1",
+  "version": "0.16.2",
   "description": "Read and update your Catalyst Cloud data, and receive live changes in your apps.",
   "license": "MIT",
   "author": "Coalesce Labs",
@@ -100,8 +100,8 @@
   ],
   "devDependencies": {
     "@catalyst-cloud/read-model": "^0.16.0",
-    "@catalyst-cloud/replicate": "0.16.0",
-    "@catalyst-cloud/schema": "0.16.0",
+    "@catalyst-cloud/replicate": "0.16.1",
+    "@catalyst-cloud/schema": "0.16.1",
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/context-async-hooks": "^2.8.0",
     "@opentelemetry/resources": "^2.8.0",
@@ -119,8 +119,8 @@
     "@sqlite.org/sqlite-wasm": "*",
     "better-sqlite3": "*",
     "@catalyst-cloud/read-model": "^0.16.0",
-    "@catalyst-cloud/replicate": "0.16.0",
-    "@catalyst-cloud/schema": "0.16.0"
+    "@catalyst-cloud/replicate": "0.16.1",
+    "@catalyst-cloud/schema": "0.16.1"
   },
   "peerDependenciesMeta": {
     "@opentelemetry/api": {
