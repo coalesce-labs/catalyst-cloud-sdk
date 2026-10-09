@@ -3,3 +3,37 @@
 
 [project]
 linear_team = "CTC"
+
+# The same install and checks the ci.yml pull request gate runs.
+[environment]
+toolchains = [{ name = "node", version = "22" }]
+
+[[environment.setup]]
+name = "install-dependencies"
+run = ["sh", "-lc", "bun install --frozen-lockfile"]
+timeout_seconds = 900
+cache_key_files = ["bun.lock"]
+
+[environment.container]
+git = { submodules = false, lfs = false }
+
+[[environment.verify]]
+name = "release-check"
+run = ["sh", "-lc", "bun run release:check"]
+
+[[environment.verify]]
+name = "build"
+run = ["sh", "-lc", "bun run build"]
+
+[[environment.verify]]
+name = "typecheck"
+run = ["sh", "-lc", "bun run typecheck && bun run typecheck:scripts"]
+
+[[environment.verify]]
+name = "test"
+run = ["sh", "-lc", "bunx vitest run"]
+timeout_seconds = 1800
+
+[[environment.verify]]
+name = "pack"
+run = ["sh", "-lc", "bun run test:pack"]
