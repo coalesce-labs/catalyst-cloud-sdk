@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.16.3
+
+The SDK and the Node and browser replicas now use schema and replication packages 0.16.2. Schema 0.16.2 adds three events about the pull request an agent is working on: `branch.moved` when its branch moves to a new commit, `pr.conflict.detected` when it starts to conflict with its base, and `pr.mergeability.changed` when it moves into or out of conflict. Only Catalyst Cloud records these events; they cannot be published to your workspace.
+
+Update the SDK and any replica modules together.
+
 ## 0.16.2
 
 The SDK and the Node and browser replicas now use schema and replication packages 0.16.1. The replica's record of processed webhook deliveries is rebuilt as a smaller table the first time a replica opens after the update, keeping the last 7 days of deliveries.
