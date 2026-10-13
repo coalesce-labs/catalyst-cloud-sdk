@@ -13,7 +13,7 @@
       "repository": "catalyst-cloud-skills",
       "path": "package.json",
       "sourceVersion": "0.15.6",
-      "version": "0.16.0",
+      "version": "0.16.15",
       "tag": "skills-bundle-v{version}",
       "publish": true
     },
@@ -21,7 +21,7 @@
       "repository": "catalyst-cloud-skills",
       "path": "packages/catalyst-skills/package.json",
       "sourceVersion": "0.15.6",
-      "version": "0.16.0",
+      "version": "0.16.15",
       "tag": "skills-bundle-v{version}",
       "publish": true
     },
@@ -29,7 +29,7 @@
       "repository": "catalyst-cloud-skills",
       "path": ".claude-plugin/plugin.json",
       "sourceVersion": "0.15.6",
-      "version": "0.16.0",
+      "version": "0.16.15",
       "tag": "skills-bundle-v{version}",
       "publish": true
     },
