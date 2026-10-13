@@ -13,6 +13,7 @@ import {
 const plan = JSON.parse(await readFile(new URL("../release-train.json", import.meta.url), "utf8"));
 const coordinated = { ...structuredClone(plan), state: "coordinated" };
 const sdkVersion = plan.members.sdk.version;
+const cliVersion = plan.members.cli.version;
 
 test("the approved complete cohort is readable, but a missing member cannot authorize a release", () => {
   assert.equal(validateDeclaration(plan).releaseLine, "0.16");
@@ -23,7 +24,7 @@ test("the approved complete cohort is readable, but a missing member cannot auth
 
 test("a coordinated transition allows its source and target, but only the exact target may publish", () => {
   validateVersion(coordinated, "cli", "0.15.6");
-  validateVersion(coordinated, "cli", "0.16.0", true);
+  validateVersion(coordinated, "cli", cliVersion, true);
   assert.throws(() => validateVersion(coordinated, "cli", "0.15.6", true), /exact approved/);
   assert.throws(() => validateVersion(coordinated, "sdk", "0.16.9", true), /exact approved/);
   assert.throws(
@@ -68,21 +69,21 @@ test("publication requires a readable matching cloud declaration before a pack i
       join(root, "package.json"),
       JSON.stringify({
         name: "@catalyst-cloud/cli",
-        version: "0.16.0",
+        version: cliVersion,
         dependencies: { "@catalyst-cloud/sdk": sdkVersion },
       }),
     );
     await mkdir(join(root, "packages/catalyst-skills"), { recursive: true });
     await writeFile(
       join(root, "packages/catalyst-skills/package.json"),
-      JSON.stringify({ version: "0.16.0", dependencies: { "@catalyst-cloud/cli": "0.16.0" } }),
+      JSON.stringify({ version: cliVersion, dependencies: { "@catalyst-cloud/cli": cliVersion } }),
     );
     await mkdir(join(root, ".claude-plugin"));
     await writeFile(
       join(root, ".claude-plugin/plugin.json"),
-      JSON.stringify({ version: "0.16.0" }),
+      JSON.stringify({ version: cliVersion }),
     );
-    const options = { root, publish: "cli", tag: "skills-bundle-v0.16.0" };
+    const options = { root, publish: "cli", tag: `skills-bundle-v${cliVersion}` };
     const fetcher = async (url) =>
       url.endsWith("/install.sh")
         ? new Response("", { headers: { "x-catalyst-install-script-revision": "0.16.0" } })

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.5
+
+The SDK and the Node and browser replicas now use schema and replication packages 0.16.4. The schema adds `phase.<stage>.started` events so a workflow can report when each stage begins. Update the SDK and any replica modules together.
+
 ## 0.16.4
 
 The SDK and the Node and browser replicas now use schema and replication packages 0.16.3. Schema 0.16.3 adds one event type, `mirror.webhook.ci-skipped`, which Catalyst Cloud records when it sets aside a GitHub CI notification that nothing reads. You do not need to handle it.
