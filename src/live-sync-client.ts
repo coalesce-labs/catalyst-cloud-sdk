@@ -1243,8 +1243,13 @@ export class LiveSyncClient {
       const healthy = this.resetBackoffIfHealthy();
       const code = closeCode(ev);
       const reason = closeReason(ev);
-      if (code !== undefined || reason !== undefined)
-        this.log("warn", "ws closed", { code, reason });
+      if (code !== undefined || reason !== undefined) {
+        try {
+          this.log("warn", "ws closed", { code, reason });
+        } catch {
+          // A diagnostic logger must not interrupt reconnect or bearer reauthorization.
+        }
+      }
       const reauthenticate = this.auth.kind === "bearer" && code === CLOSE_REAUTHENTICATE;
       this.quickCloseStreak = opened && !healthy && !reauthenticate
         ? this.quickCloseStreak + 1

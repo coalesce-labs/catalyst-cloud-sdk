@@ -1424,6 +1424,29 @@ describe("LiveSyncClient", () => {
     client.stop();
   });
 
+  it("keeps reconnecting when the close diagnostic logger throws", () => {
+    vi.useFakeTimers();
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(0),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      log: () => { throw new Error("logger unavailable"); },
+    });
+
+    void client.start();
+    sockets[0]!.fireOpen();
+    expect(() => sockets[0]!.fireServerClose(1011, "upstream unavailable")).not.toThrow();
+    vi.advanceTimersByTime(1000);
+    expect(sockets).toHaveLength(2);
+    client.stop();
+  });
+
   it("caps the backoff at maxBackoffMs (30s) after enough failures", () => {
     vi.useFakeTimers();
     const store = makeStore(7);
