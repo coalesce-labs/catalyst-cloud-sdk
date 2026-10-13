@@ -1380,6 +1380,50 @@ describe("LiveSyncClient", () => {
     expect(sockets[3]!.closed).toBe(true);
   });
 
+  it("backs off three accepted quick closes to 30s, retains close diagnostics, then resets after a sustained live connection", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const log = vi.fn();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(0),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      backoffMs: 1000,
+      maxBackoffMs: 30_000,
+      wsFactory: factory,
+      log,
+    });
+
+    void client.start();
+    for (const [index, delay] of [1000, 2000, 30_000].entries()) {
+      const socket = sockets[sockets.length - 1]!;
+      socket.fireOpen(); // accepted by the server, then closed before it is healthy
+      socket.fireServerClose(1011, "upstream unavailable");
+      vi.advanceTimersByTime(delay - 1);
+      expect(sockets).toHaveLength(index + 1);
+      vi.advanceTimersByTime(1);
+      expect(sockets).toHaveLength(index + 2);
+    }
+    expect(log).toHaveBeenCalledWith("warn", "ws closed", {
+      code: 1011,
+      reason: "upstream unavailable",
+    });
+
+    sockets[3]!.fireOpen();
+    vi.advanceTimersByTime(30_000); // this connection has remained live long enough to reset
+    sockets[3]!.fireServerClose(1001, "server restart");
+    vi.advanceTimersByTime(999);
+    expect(sockets).toHaveLength(4);
+    vi.advanceTimersByTime(1);
+    expect(sockets).toHaveLength(5);
+    client.stop();
+  });
+
   it("caps the backoff at maxBackoffMs (30s) after enough failures", () => {
     vi.useFakeTimers();
     const store = makeStore(7);
@@ -1648,9 +1692,10 @@ describe("LiveSyncClient liveness watchdog (CTC-135)", () => {
     expect(lastSent(sockets[2]!)).toBe(PING_FRAME);
     sockets[2]!.deliver({ type: "pong" });
 
-    // A server-initiated close moves us to conn4 without a probe failure.
+    // A server-initiated close moves us to conn4 without a probe failure. The short-lived
+    // connection still retains its retry backoff even though it answered a probe.
     sockets[2]!.fireServerClose();
-    vi.advanceTimersByTime(1000);
+    vi.advanceTimersByTime(2000);
     sockets[3]!.fireOpen();
     expect(sockets).toHaveLength(4);
 
