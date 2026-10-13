@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.6
+
+The SDK and the Node and browser replicas now use schema and replication packages 0.16.5. The schema adds events for questions raised during a workflow stage and for the resulting human decision request. Update the SDK and any replica modules together.
+
 ## 0.16.5
 
 The SDK and the Node and browser replicas now use schema and replication packages 0.16.4. The schema adds `phase.<stage>.started` events so a workflow can report when each stage begins. Update the SDK and any replica modules together.
