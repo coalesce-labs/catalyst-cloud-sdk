@@ -969,6 +969,10 @@ export class LiveSyncClient {
     if (this.hasInFlightRun()) return;
     this.pendingRecovery = false;
     this.authRequired = false;
+    // A deliberate resume starts a fresh retry ramp: the parked run's quick-close backoff must not
+    // delay the resumed run's first reconnect.
+    this.backoff = this.backoffMs;
+    this.quickCloseStreak = 0;
     if (this.resyncNeededAfterAuth) {
       // A resync was interrupted by auth before it rebuilt the store: the cursor is stale, so re-open
       // alone would return to `live` with the original inconsistency. Re-seed (handleResync re-seeds

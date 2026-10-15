@@ -3157,6 +3157,66 @@ describe("bearer auth round 2 (CTC-2111 — Codex r1 fixes)", () => {
     client.stop();
     await startP; // the ORIGINAL start() promise settled — never stranded
   });
+
+  it("resume() after quick closes and a 4401 retries a pre-open close at the initial backoff", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      const store = makeStore(7);
+      const { sockets, factory } = recordingFactory();
+      const statuses: LiveSyncStatus[] = [];
+      const client = new LiveSyncClient({
+        baseUrl: BASE,
+        accountId: "tenant-0",
+        auth: { kind: "bearer", getToken: async () => "tok" },
+        reseed: store.reseedTo(12),
+        getCursor: store.getCursor,
+        onChange: store.onChange,
+        wsFactory: factory,
+        onStatus: (s) => statuses.push(s),
+        backoffMs: 1000,
+        maxBackoffMs: 30_000,
+      });
+
+      void client.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sockets).toHaveLength(1);
+      for (const [index, delay] of [1000, 2000, 30_000].entries()) {
+        const socket = sockets[sockets.length - 1]!;
+        socket.fireOpen();
+        socket.fireServerClose(1011, "upstream unavailable");
+        await vi.advanceTimersByTimeAsync(delay - 1);
+        expect(sockets).toHaveLength(index + 1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(sockets).toHaveLength(index + 2);
+      }
+
+      sockets[3]!.fireOpen();
+      sockets[3]!.fireServerClose(4401, "reauthenticate");
+      expect(statuses[statuses.length - 1]).toBe("auth-required");
+      expect(vi.getTimerCount()).toBe(0); // parked: no reconnect pending
+
+      client.resume(); // the consumer deliberately resumes after re-authorizing
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sockets).toHaveLength(5);
+      sockets[4]!.fireServerClose(1006, "connect failed"); // closes before it ever opens
+      expect(vi.getTimerCount()).toBe(1); // exactly one pending reconnect
+      await vi.advanceTimersByTimeAsync(999);
+      expect(sockets).toHaveLength(5);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sockets).toHaveLength(6); // the resumed run's first retry uses the initial backoffMs
+
+      sockets[5]!.fireServerClose(1006, "connect failed"); // the resumed run still ramps on failures
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(sockets).toHaveLength(6);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sockets).toHaveLength(7);
+      client.stop();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // ── CTC-2111 — the /snapshot 401/403 → auth-required narrowing is BEARER-ONLY. A token/cookie
