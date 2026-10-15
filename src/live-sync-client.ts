@@ -1526,7 +1526,7 @@ export class LiveSyncClient {
 
   /** Send (or re-send) the gap re-request from the current baseline and arm the heal deadline. */
   private sendGapRequest(): void {
-    const req: SyncFrame = { type: "sync", after: this.deliveredSeq };
+    const req: SyncFrame = { type: "sync", after: this.deliveredSeq, reason: "gap" };
     try {
       this.ws?.send(JSON.stringify(req));
     } catch (err) {
