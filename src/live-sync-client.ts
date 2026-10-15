@@ -286,7 +286,8 @@ export interface LiveSyncClientOptions {
    * the transport reusing the original run, whereas a second `start()` would strand the first promise.
    */
   onAuthError?: (err: AuthError) => void;
-  /** Base reconnect backoff in ms; doubles each failed attempt up to maxBackoffMs. Default 1000. */
+  /** Base reconnect backoff in ms; doubles after failures, while three consecutive accepted quick
+   * closes jump to maxBackoffMs. A sustained live connection resets it. Default 1000. */
   backoffMs?: number;
   /** Reconnect backoff ceiling in ms. Default 30_000. */
   maxBackoffMs?: number;
@@ -493,6 +494,11 @@ const DEGRADED_PROBE_MULTIPLIER = 10;
  */
 const ERROR_CLOSE_GRACE_MS = 5_000;
 
+/** An open socket must survive this long before it earns a fresh reconnect backoff. */
+const BACKOFF_RESET_AFTER_MS = 30_000;
+/** Three consecutive accepted quick closes reach the configured retry ceiling. */
+const QUICK_CLOSE_LIMIT = 3;
+
 export class LiveSyncClient {
   private readonly baseUrl: string;
   private readonly accountId: string | undefined;
@@ -585,6 +591,8 @@ export class LiveSyncClient {
    */
   private connectAttempt = 0;
   private backoff: number;
+  private socketOpenedAt: number | null = null;
+  private quickCloseStreak = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private resolveDone: (() => void) | null = null;
   /** Resolved once in start(); the no-op until then so any early call is safe. */
@@ -867,6 +875,9 @@ export class LiveSyncClient {
       this.bearerTokenTimer = null;
     }
     this.closeSocket();
+    // A stopped run's retry delay must not leak into the next start(): closeSocket only restores it
+    // when a socket is still open, but a quick close already cleared socketOpenedAt before this stop.
+    this.backoff = this.backoffMs;
     this.setStatus("stopped");
     const done = this.resolveDone;
     this.resolveDone = null;
@@ -958,6 +969,10 @@ export class LiveSyncClient {
     if (this.hasInFlightRun()) return;
     this.pendingRecovery = false;
     this.authRequired = false;
+    // A deliberate resume starts a fresh retry ramp: the parked run's quick-close backoff must not
+    // delay the resumed run's first reconnect.
+    this.backoff = this.backoffMs;
+    this.quickCloseStreak = 0;
     if (this.resyncNeededAfterAuth) {
       // A resync was interrupted by auth before it rebuilt the store: the cursor is stale, so re-open
       // alone would return to `live` with the original inconsistency. Re-seed (handleResync re-seeds
@@ -1208,8 +1223,8 @@ export class LiveSyncClient {
     }
     ws.onopen = () => {
       this.socketOpened = true;
+      this.socketOpenedAt = Date.now();
       this.clearConnectTimers(); // the attempt succeeded — the open deadline + error fallback die here
-      this.backoff = this.backoffMs; // a successful open resets the backoff ramp
       this.setStatus("live");
       this.endConnectSpan();
       // Fresh connection: reset per-connection watchdog state, then start the idle-ping countdown.
@@ -1231,6 +1246,22 @@ export class LiveSyncClient {
     ws.onclose = (ev) => {
       if (this.ws === ws) this.ws = null;
       this.clearLivenessTimers(); // this connection's ping/deadline die with its socket
+      const opened = this.socketOpenedAt !== null;
+      const healthy = this.resetBackoffIfHealthy();
+      const code = closeCode(ev);
+      const reason = closeReason(ev);
+      if (code !== undefined || reason !== undefined) {
+        try {
+          this.log("warn", "ws closed", { code, reason });
+        } catch {
+          // A diagnostic logger must not interrupt reconnect or bearer reauthorization.
+        }
+      }
+      const reauthenticate = this.auth.kind === "bearer" && code === CLOSE_REAUTHENTICATE;
+      this.quickCloseStreak = opened && !healthy && !reauthenticate
+        ? this.quickCloseStreak + 1
+        : 0;
+      if (this.quickCloseStreak >= QUICK_CLOSE_LIMIT) this.backoff = this.maxBackoffMs;
       // CTC-2111 — a BEARER socket closed 4401 is the mirror saying "reauthenticate": the access
       // token was revoked or the session went inactive (a routine 15-minute expiry refreshes silently
       // through getToken on the next connect, and never reaches here). This is NOT a transient drop,
@@ -1238,8 +1269,7 @@ export class LiveSyncClient {
       // token. A {kind:"token"} client is UNCHANGED: it ignores the code and reconnects as it always
       // has (regression pin). The next deliberate start() resolves a fresh token via getToken().
       if (
-        this.auth.kind === "bearer" &&
-        closeCode(ev) === CLOSE_REAUTHENTICATE &&
+        reauthenticate &&
         !this.stopped
       ) {
         this.endConnectSpan(new Error("socket closed 4401 (reauthenticate)"));
@@ -1300,6 +1330,9 @@ export class LiveSyncClient {
     // The single choke point for liveness-timer teardown — covers stop/resync/forceReconnect. (The
     // server-close path clears them in onclose; both routes null this.ws, so no timer outlives a socket.)
     this.clearLivenessTimers();
+    if (this.socketOpenedAt !== null) this.backoff = this.backoffMs;
+    this.socketOpenedAt = null;
+    this.quickCloseStreak = 0;
     const ws = this.ws;
     this.ws = null;
     if (!ws) return;
@@ -1328,6 +1361,15 @@ export class LiveSyncClient {
         // best-effort — already destroyed
       }
     }
+  }
+
+  /** A sustained live connection restores the initial delay; a brief open does not. */
+  private resetBackoffIfHealthy(): boolean {
+    const openedAt = this.socketOpenedAt;
+    this.socketOpenedAt = null;
+    if (openedAt === null || Date.now() - openedAt < BACKOFF_RESET_AFTER_MS) return false;
+    this.backoff = this.backoffMs;
+    return true;
   }
 
   private scheduleReconnect(): void {

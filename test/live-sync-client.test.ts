@@ -1380,6 +1380,120 @@ describe("LiveSyncClient", () => {
     expect(sockets[3]!.closed).toBe(true);
   });
 
+  it("backs off three accepted quick closes to 30s, retains close diagnostics, then resets after a sustained live connection", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const log = vi.fn();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(0),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      backoffMs: 1000,
+      maxBackoffMs: 30_000,
+      wsFactory: factory,
+      log,
+    });
+
+    void client.start();
+    for (const [index, delay] of [1000, 2000, 30_000].entries()) {
+      const socket = sockets[sockets.length - 1]!;
+      socket.fireOpen(); // accepted by the server, then closed before it is healthy
+      socket.fireServerClose(1011, "upstream unavailable");
+      vi.advanceTimersByTime(delay - 1);
+      expect(sockets).toHaveLength(index + 1);
+      vi.advanceTimersByTime(1);
+      expect(sockets).toHaveLength(index + 2);
+    }
+    expect(log).toHaveBeenCalledWith("warn", "ws closed", {
+      code: 1011,
+      reason: "upstream unavailable",
+    });
+
+    sockets[3]!.fireOpen();
+    vi.advanceTimersByTime(30_000); // this connection has remained live long enough to reset
+    sockets[3]!.fireServerClose(1001, "server restart");
+    vi.advanceTimersByTime(999);
+    expect(sockets).toHaveLength(4);
+    vi.advanceTimersByTime(1);
+    expect(sockets).toHaveLength(5);
+    client.stop();
+  });
+
+  it("keeps reconnecting when the close diagnostic logger throws", () => {
+    vi.useFakeTimers();
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(0),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      wsFactory: factory,
+      log: () => { throw new Error("logger unavailable"); },
+    });
+
+    void client.start();
+    sockets[0]!.fireOpen();
+    expect(() => sockets[0]!.fireServerClose(1011, "upstream unavailable")).not.toThrow();
+    vi.advanceTimersByTime(1000);
+    expect(sockets).toHaveLength(2);
+    client.stop();
+  });
+
+  it("starts a fresh run at the initial backoff after stop() cancels an elevated quick-close reconnect", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const store = makeStore(7);
+    const { sockets, factory } = recordingFactory();
+    const client = new LiveSyncClient({
+      baseUrl: BASE,
+      accountId: "tenant-0",
+      auth: { kind: "cookie" },
+      reseed: store.reseedTo(0),
+      getCursor: store.getCursor,
+      onChange: store.onChange,
+      backoffMs: 1000,
+      maxBackoffMs: 30_000,
+      wsFactory: factory,
+    });
+
+    void client.start();
+    for (const delay of [1000, 2000]) {
+      const socket = sockets[sockets.length - 1]!;
+      socket.fireOpen();
+      socket.fireServerClose(1011, "upstream unavailable");
+      vi.advanceTimersByTime(delay);
+    }
+    expect(sockets).toHaveLength(3);
+    sockets[2]!.fireOpen();
+    sockets[2]!.fireServerClose(1011, "upstream unavailable"); // third quick close: 30s reconnect pending
+    expect(vi.getTimerCount()).toBe(1);
+
+    client.stop();
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(60_000);
+    expect(sockets).toHaveLength(3); // the cancelled reconnect never opens a socket
+
+    void client.start();
+    expect(sockets).toHaveLength(4);
+    sockets[3]!.fireOpen();
+    sockets[3]!.fireServerClose(1011, "upstream unavailable");
+    expect(vi.getTimerCount()).toBe(1); // exactly one pending reconnect
+    vi.advanceTimersByTime(999);
+    expect(sockets).toHaveLength(4);
+    vi.advanceTimersByTime(1);
+    expect(sockets).toHaveLength(5); // the fresh run's first retry uses the initial backoffMs
+    client.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("caps the backoff at maxBackoffMs (30s) after enough failures", () => {
     vi.useFakeTimers();
     const store = makeStore(7);
@@ -1648,9 +1762,10 @@ describe("LiveSyncClient liveness watchdog (CTC-135)", () => {
     expect(lastSent(sockets[2]!)).toBe(PING_FRAME);
     sockets[2]!.deliver({ type: "pong" });
 
-    // A server-initiated close moves us to conn4 without a probe failure.
+    // A server-initiated close moves us to conn4 without a probe failure. The short-lived
+    // connection still retains its retry backoff even though it answered a probe.
     sockets[2]!.fireServerClose();
-    vi.advanceTimersByTime(1000);
+    vi.advanceTimersByTime(2000);
     sockets[3]!.fireOpen();
     expect(sockets).toHaveLength(4);
 
@@ -3041,6 +3156,66 @@ describe("bearer auth round 2 (CTC-2111 — Codex r1 fixes)", () => {
 
     client.stop();
     await startP; // the ORIGINAL start() promise settled — never stranded
+  });
+
+  it("resume() after quick closes and a 4401 retries a pre-open close at the initial backoff", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      const store = makeStore(7);
+      const { sockets, factory } = recordingFactory();
+      const statuses: LiveSyncStatus[] = [];
+      const client = new LiveSyncClient({
+        baseUrl: BASE,
+        accountId: "tenant-0",
+        auth: { kind: "bearer", getToken: async () => "tok" },
+        reseed: store.reseedTo(12),
+        getCursor: store.getCursor,
+        onChange: store.onChange,
+        wsFactory: factory,
+        onStatus: (s) => statuses.push(s),
+        backoffMs: 1000,
+        maxBackoffMs: 30_000,
+      });
+
+      void client.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sockets).toHaveLength(1);
+      for (const [index, delay] of [1000, 2000, 30_000].entries()) {
+        const socket = sockets[sockets.length - 1]!;
+        socket.fireOpen();
+        socket.fireServerClose(1011, "upstream unavailable");
+        await vi.advanceTimersByTimeAsync(delay - 1);
+        expect(sockets).toHaveLength(index + 1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(sockets).toHaveLength(index + 2);
+      }
+
+      sockets[3]!.fireOpen();
+      sockets[3]!.fireServerClose(4401, "reauthenticate");
+      expect(statuses[statuses.length - 1]).toBe("auth-required");
+      expect(vi.getTimerCount()).toBe(0); // parked: no reconnect pending
+
+      client.resume(); // the consumer deliberately resumes after re-authorizing
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sockets).toHaveLength(5);
+      sockets[4]!.fireServerClose(1006, "connect failed"); // closes before it ever opens
+      expect(vi.getTimerCount()).toBe(1); // exactly one pending reconnect
+      await vi.advanceTimersByTimeAsync(999);
+      expect(sockets).toHaveLength(5);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sockets).toHaveLength(6); // the resumed run's first retry uses the initial backoffMs
+
+      sockets[5]!.fireServerClose(1006, "connect failed"); // the resumed run still ramps on failures
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(sockets).toHaveLength(6);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sockets).toHaveLength(7);
+      client.stop();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
