@@ -875,6 +875,9 @@ export class LiveSyncClient {
       this.bearerTokenTimer = null;
     }
     this.closeSocket();
+    // A stopped run's retry delay must not leak into the next start(): closeSocket only restores it
+    // when a socket is still open, but a quick close already cleared socketOpenedAt before this stop.
+    this.backoff = this.backoffMs;
     this.setStatus("stopped");
     const done = this.resolveDone;
     this.resolveDone = null;
