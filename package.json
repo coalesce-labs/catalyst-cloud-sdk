@@ -1,6 +1,6 @@
 {
   "name": "@catalyst-cloud/sdk",
-  "version": "0.16.6",
+  "version": "0.16.7",
   "description": "Read and update your Catalyst Cloud data, and receive live changes in your apps.",
   "license": "MIT",
   "author": "Coalesce Labs",

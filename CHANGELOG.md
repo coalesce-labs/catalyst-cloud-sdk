@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.16.7
+
+Live sync retries more slowly when a connection repeatedly closes soon after opening. A connection that stays open resets the retry delay, and resuming after authentication starts at the initial delay.
+
+When live replica updates arrive out of order, the SDK now marks its gap request so Catalyst Cloud can replay the missing updates. Update the SDK and any Node or browser replica modules together. Gap replay requires a Catalyst Cloud server that supports marked requests.
+
 ## 0.16.6
 
 The SDK and the Node and browser replicas now use schema and replication packages 0.16.5. The schema adds events for questions raised during a workflow stage and for the resulting human decision request. Update the SDK and any replica modules together.
