@@ -167,6 +167,9 @@ export interface SyncFrame {
   type: "sync";
   /** The durable cursor: the last feed seq the consumer has applied (-1 if none). */
   after: number;
+  /** Set only on a gap re-request (CTC-5749): the service must replay `(after, head]` in full, even
+   *  frames this socket was already sent. The initial on-open sync carries no reason. */
+  reason?: "gap";
 }
 
 /**

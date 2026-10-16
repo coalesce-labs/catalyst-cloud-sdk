@@ -1115,6 +1115,10 @@ describe("parseFrame", () => {
   it("rejects a bare payload (no type), unknown type, non-JSON, and non-string/buffer", () => {
     expect(parseFrame(JSON.stringify({ hello: "world" }))).toBeNull();
     expect(parseFrame(JSON.stringify({ type: "bogus" }))).toBeNull();
+    // CTC-5749: browser-only hints are read by the web app's own sockets, never by this client.
+    const indexRun = { type: "index-run", accountId: "t", runId: "r", repo: "o/r", kind: "index", status: "running" };
+    expect(parseFrame(JSON.stringify({ ...indexRun, finishedAt: null }))).toBeNull();
+    expect(parseFrame(JSON.stringify({ type: "subscription-accounts", accountId: "t" }))).toBeNull();
     expect(parseFrame("not json at all")).toBeNull();
     expect(parseFrame(JSON.stringify(42))).toBeNull();
     expect(parseFrame(null)).toBeNull();
@@ -1906,8 +1910,10 @@ describe("LiveSyncClient gap detection + self-healing re-request (CTL-1402)", ()
     row: { id: `i${seq}`, updated_at: seq },
   });
   /** All {type:"sync"} control frames this socket has sent, parsed. */
-  const syncsSent = (ws: FakeWebSocket): Array<{ type: string; after: number }> =>
-    ws.sent.map((s) => JSON.parse(s) as { type: string; after: number }).filter((f) => f.type === "sync");
+  const syncsSent = (ws: FakeWebSocket): Array<{ type: string; after: number; reason?: string }> =>
+    ws.sent
+      .map((s) => JSON.parse(s) as { type: string; after: number; reason?: string })
+      .filter((f) => f.type === "sync");
   /** All catalyst.replica.gap log lines, flattened. */
   const gapLines = (logs: LogLine[]): Record<string, unknown>[] =>
     logs
@@ -1944,7 +1950,7 @@ describe("LiveSyncClient gap detection + self-healing re-request (CTL-1402)", ()
     // Exactly one re-request, from the last delivered seq.
     expect(syncsSent(sockets[0]!)).toEqual([
       { type: "sync", after: 7 },
-      { type: "sync", after: 8 },
+      { type: "sync", after: 8, reason: "gap" },
     ]);
     expect(gapLines(logs)).toContainEqual(
       expect.objectContaining({ level: "info", event: "detected", seq_from: 9, seq_to: 10, size: 2 }),
@@ -2039,9 +2045,9 @@ describe("LiveSyncClient gap detection + self-healing re-request (CTL-1402)", ()
     await vi.advanceTimersByTimeAsync(1000); // deadline → re-request #3
     expect(syncsSent(sockets[0]!)).toEqual([
       { type: "sync", after: 7 },
-      { type: "sync", after: 8 },
-      { type: "sync", after: 8 },
-      { type: "sync", after: 8 },
+      { type: "sync", after: 8, reason: "gap" },
+      { type: "sync", after: 8, reason: "gap" },
+      { type: "sync", after: 8, reason: "gap" },
     ]);
     expect(store.reseedCalls.count).toBe(0); // still trying replay
 
@@ -2177,7 +2183,7 @@ describe("LiveSyncClient gap detection + self-healing re-request (CTL-1402)", ()
     sockets[0]!.deliver(change(30)); // seqs 9..29 missing → GAP, one re-request (after 8)
     expect(syncsSent(sockets[0]!)).toEqual([
       { type: "sync", after: 7 },
-      { type: "sync", after: 8 },
+      { type: "sync", after: 8, reason: "gap" },
     ]);
 
     // The replay lands the hole frame-by-frame, each 800ms apart (< the 1000ms deadline). The whole
@@ -2223,9 +2229,9 @@ describe("LiveSyncClient gap detection + self-healing re-request (CTL-1402)", ()
     await vi.advanceTimersByTimeAsync(1000); // retry #2
     expect(syncsSent(sockets[0]!)).toEqual([
       { type: "sync", after: 7 },
-      { type: "sync", after: 8 }, // initial gap re-request
-      { type: "sync", after: 10 }, // retry from the baseline the progress advanced to
-      { type: "sync", after: 10 },
+      { type: "sync", after: 8, reason: "gap" }, // initial gap re-request
+      { type: "sync", after: 10, reason: "gap" }, // retry from the baseline the progress advanced to
+      { type: "sync", after: 10, reason: "gap" },
     ]);
     expect(store.reseedCalls.count).toBe(0); // budget not yet spent
 
@@ -2292,7 +2298,7 @@ describe("LiveSyncClient gap detection + self-healing re-request (CTL-1402)", ()
     expect(store.getCursor()).toBe(8);
     expect(syncsSent(sockets[0]!)).toEqual([
       { type: "sync", after: 7 },
-      { type: "sync", after: 8 },
+      { type: "sync", after: 8, reason: "gap" },
     ]);
     // The hole spans up to AND INCLUDING the head seq — 10 is itself a real, un-broadcast row.
     expect(gapLines(logs)).toContainEqual(
@@ -2376,6 +2382,90 @@ describe("LiveSyncClient gap detection + self-healing re-request (CTL-1402)", ()
 
     expect(store.applied.map((f) => f.seq)).toEqual([8]);
     expect(syncsSent(sockets[0]!)).toEqual([{ type: "sync", after: 7 }]); // nothing re-requested
+    expect(gapLines(logs)).toEqual([]);
+    client.stop();
+  });
+
+  // ── CTC-5749: a gap re-request is marked so the service force-replays the hole ──
+  // The initial on-open sync stays unmarked; only an actual sequence gap sends reason:"gap", always
+  // from the last DELIVERED seq, and the forced replay applies each change exactly once.
+
+  it("CTC-5749 — a skipped response sends a gap-marked re-request from deliveredSeq and the forced replay applies each change once", () => {
+    const { client, store, sockets } = makeGapClient({ initialCursor: 7 });
+    void client.start();
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver(change(8));
+    sockets[0]!.deliver(change(9));
+    sockets[0]!.deliver(change(12)); // the response skipped 10,11 → GAP
+
+    const syncs = syncsSent(sockets[0]!);
+    expect(syncs).toStrictEqual([
+      { type: "sync", after: 7 }, // on-open sync: no reason key at all
+      { type: "sync", after: 9, reason: "gap" },
+    ]);
+
+    // Forced replay of (9, head] — including 12, which the socket already attempted once.
+    for (const seq of [10, 11, 12, 13]) sockets[0]!.deliver(change(seq));
+
+    expect(store.applied.map((f) => f.seq)).toEqual([8, 9, 10, 11, 12, 13]);
+    expect(store.getCursor()).toBe(13);
+    expect(syncsSent(sockets[0]!)).toHaveLength(2);
+    client.stop();
+  });
+
+  it("CTC-5749 — a stalled gap retries gap-marked from the advanced deliveredSeq; a reconnect re-syncs unmarked from the cursor", async () => {
+    vi.useFakeTimers();
+    const { client, store, sockets } = makeGapClient({
+      initialCursor: 7,
+      gapTimeoutMs: 1000,
+      gapRetryLimit: 5,
+    });
+    void client.start();
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver(change(8));
+    sockets[0]!.deliver(change(12)); // gap 9..11
+    sockets[0]!.deliver(change(9)); // partial replay, then stall
+    await vi.advanceTimersByTimeAsync(1000); // retry from the advanced baseline
+    expect(syncsSent(sockets[0]!)).toStrictEqual([
+      { type: "sync", after: 7 },
+      { type: "sync", after: 8, reason: "gap" },
+      { type: "sync", after: 9, reason: "gap" },
+    ]);
+
+    sockets[0]!.fireServerClose(1006);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(sockets).toHaveLength(2);
+    sockets[1]!.fireOpen();
+    // A fresh connection is a plain resume from the durable cursor — never gap-marked.
+    expect(syncsSent(sockets[1]!)).toStrictEqual([{ type: "sync", after: 9 }]);
+    for (const seq of [10, 11, 12]) sockets[1]!.deliver(change(seq));
+    expect(store.applied.map((f) => f.seq)).toEqual([8, 9, 10, 11, 12]);
+    expect(store.getCursor()).toBe(12);
+    client.stop();
+  });
+
+  it("CTC-5749 — unknown and malformed frames are dropped without delivery, cursor movement or a gap re-request", () => {
+    const { client, store, sockets, logs } = makeGapClient({ initialCursor: 7 });
+    void client.start();
+    sockets[0]!.fireOpen();
+    sockets[0]!.deliver(change(8));
+    sockets[0]!.deliver({
+      type: "index-run",
+      accountId: "tenant-0",
+      runId: "r",
+      repo: "o/r",
+      kind: "index",
+      status: "running",
+      finishedAt: null,
+    });
+    sockets[0]!.deliver({ type: "subscription-accounts", accountId: "tenant-0" });
+    sockets[0]!.deliver({ type: "skip", accountId: "tenant-0", seq: "50" });
+    sockets[0]!.deliverRaw("{not json");
+    sockets[0]!.deliver(change(9));
+
+    expect(store.applied.map((f) => f.seq)).toEqual([8, 9]);
+    expect(store.getCursor()).toBe(9);
+    expect(syncsSent(sockets[0]!)).toStrictEqual([{ type: "sync", after: 7 }]);
     expect(gapLines(logs)).toEqual([]);
     client.stop();
   });

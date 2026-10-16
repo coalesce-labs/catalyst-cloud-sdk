@@ -893,7 +893,7 @@ describe("CatalystReplica gap detection + self-healing (CTL-1402)", () => {
     // sealing seqs 7-8 permanently), the gapped row was NOT applied, and a re-request went out.
     expect(replica.cursor).toBe(6);
     expect(replica.issues().map((v) => v.id).sort()).toEqual(["i6"]);
-    expect(sockets[0]!.sent).toContain(JSON.stringify({ type: "sync", after: 6 }));
+    expect(sockets[0]!.sent).toContain(JSON.stringify({ type: "sync", after: 6, reason: "gap" }));
     expect(gapLines(logs)).toContainEqual(
       expect.objectContaining({ event: "detected", seq_from: 7, seq_to: 8, size: 2 }),
     );
