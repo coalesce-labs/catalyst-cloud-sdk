@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.8
+
+The SDK and the Node and browser replicas now use schema and replication packages 0.16.6. The schema adds one diagnostic event type that records the cost and freshness of each screen read. Update the SDK and any replica modules together.
+
 ## 0.16.7
 
 Live sync retries more slowly when a connection repeatedly closes soon after opening. A connection that stays open resets the retry delay, and resuming after authentication starts at the initial delay.
