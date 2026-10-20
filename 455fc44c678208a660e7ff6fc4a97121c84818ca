@@ -1,0 +1,6 @@
+Revision history for #189:
+
+rev 2 (content) 2026-10-20 03:01 UTC
+rev 1 (initial) 2026-10-20 03:01 UTC
+
+<!-- mergify-revision-data: {"schema_version":1,"pull_number":189,"entries":[{"number":1,"change_type":"initial","old_sha":null,"new_sha":"97645d26be37e0ac197cada5416ee335f61f3f16","timestamp_iso":"2026-10-20T03:01:46Z","reason":"","replay_sha":null,"compare_url":null},{"number":2,"change_type":"content","old_sha":"97645d26be37e0ac197cada5416ee335f61f3f16","new_sha":"455fc44c678208a660e7ff6fc4a97121c84818ca","timestamp_iso":"2026-10-20T03:01:46Z","reason":"","replay_sha":"d5e0768888ca2e780fecb14adf971e202f907285","compare_url":"https://github.com/coalesce-labs/catalyst-cloud-sdk/compare/97645d26be37e0ac197cada5416ee335f61f3f16...d5e0768888ca2e780fecb14adf971e202f907285"}]} -->
