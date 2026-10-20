@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.9
+
+The SDK and the Node and browser replicas now use schema and replication packages 0.16.7. The description of the screen-read diagnostic event no longer names an internal address. Update the SDK and any replica modules together; 0.16.8 is replaced by this release.
+
 ## 0.16.8
 
 The SDK and the Node and browser replicas now use schema and replication packages 0.16.6. The schema adds one diagnostic event type that records the cost and freshness of each screen read. Update the SDK and any replica modules together.

@@ -13,6 +13,8 @@ import {
 const plan = JSON.parse(await readFile(new URL("../release-train.json", import.meta.url), "utf8"));
 const coordinated = { ...structuredClone(plan), state: "coordinated" };
 const sdkVersion = plan.members.sdk.version;
+// One patch past the declared target, so the check below never names the target itself.
+const sdkPastTarget = sdkVersion.replace(/\d+$/, (patch) => String(Number(patch) + 1));
 const cliVersion = plan.members.cli.version;
 
 test("the approved complete cohort is readable, but a missing member cannot authorize a release", () => {
@@ -26,7 +28,7 @@ test("a coordinated transition allows its source and target, but only the exact 
   validateVersion(coordinated, "cli", "0.15.6");
   validateVersion(coordinated, "cli", cliVersion, true);
   assert.throws(() => validateVersion(coordinated, "cli", "0.15.6", true), /exact approved/);
-  assert.throws(() => validateVersion(coordinated, "sdk", "0.16.9", true), /exact approved/);
+  assert.throws(() => validateVersion(coordinated, "sdk", sdkPastTarget, true), /exact approved/);
   assert.throws(
     () => validateVersion(coordinated, "design", "0.16.4", true),
     /No publication approved/,
