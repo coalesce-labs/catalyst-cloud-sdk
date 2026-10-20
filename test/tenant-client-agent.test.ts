@@ -243,6 +243,48 @@ describe("the per-route bodies", () => {
     expect(await c.agent.askAccept(input)).toEqual({ outcome: "record-failed", status: 502, reason: "write failed" });
   });
 
+  it("recordProxyAskAnswer ⭐ POSTs to the contract's ask-answer-proxy path with exactly the given body", async () => {
+    const { net, c } = client([
+      () => json(200, { outcome: "recorded", askIdentifier: "ENG-50", decisionSummary: "A", failedBlockedComments: [], resume: [] }),
+    ]);
+    const input = { askIssueId: "a1", ownerQuote: "Go with A.", optionIndex: 0, saidIn: "chat-123", saidAtMs: 1_700_000_000_000, acceptedByRole: "steward" };
+    expect(await c.agent.recordProxyAskAnswer(input)).toEqual({
+      outcome: "recorded", status: 200, askIdentifier: "ENG-50", decisionSummary: "A", failedBlockedComments: [], resume: [],
+    });
+    expect(net.calls[1]!.method).toBe("POST");
+    expect(net.calls[1]!.url).toBe(`${BASE}${pathOf(fixture, "ask-answer-proxy")}`);
+    expect(net.calls[1]!.body).toEqual(input);
+  });
+
+  it("recordProxyAskAnswer sends a free-text answer without an optionIndex, and maps refused/record-failed with their statuses", async () => {
+    const { net, c } = client([
+      () => json(409, { outcome: "refused", reason: "proxy-answering-off" }),
+      () => json(409, { outcome: "refused", reason: "option-out-of-range", optionCount: 2 }),
+      () => json(502, { outcome: "record-failed", reason: "linear-read-failed" }),
+      () => json(400, { error: "invalid_body", reason: "saidIn must be a single line of 1 to 200 characters" }),
+    ]);
+    const input = { askIssueId: "a1", ownerQuote: "Neither, ship B tomorrow.", saidIn: "chat-123", saidAtMs: 1_700_000_000_000 };
+    expect(await c.agent.recordProxyAskAnswer(input)).toEqual({ outcome: "refused", status: 409, reason: "proxy-answering-off" });
+    expect(net.calls[1]!.body).toEqual(input);
+    expect(await c.agent.recordProxyAskAnswer({ ...input, optionIndex: 5 })).toEqual({
+      outcome: "refused", status: 409, reason: "option-out-of-range", optionCount: 2,
+    });
+    expect(await c.agent.recordProxyAskAnswer(input)).toEqual({ outcome: "record-failed", status: 502, reason: "linear-read-failed" });
+    expect(await c.agent.recordProxyAskAnswer({ ...input, saidIn: "a\nb" })).toMatchObject({ outcome: "rejected", status: 400 });
+  });
+
+  it("recordProxyAskAnswer is route-unknown, with no POST, on a contract that does not list it", async () => {
+    const without: TenantContract = {
+      ...(JSON.parse(JSON.stringify(fixture)) as TenantContract),
+      routes: fixture.routes.filter((r) => !r.path.endsWith("/ask-answer-proxy")).map((r) => ({ ...r, method: r.method === "GET" ? "GET" : "POST" })),
+    };
+    const net = scriptedFetch([() => json(200, without, { etag: ETAG }), () => new Error("must not be called")]);
+    const c = createTenantClient({ key: KEY, baseUrl: BASE, fetch: net.fetch });
+    const res = await c.agent.recordProxyAskAnswer({ askIssueId: "a1", ownerQuote: "A", saidIn: "chat", saidAtMs: 1 });
+    expect(res).toMatchObject({ outcome: "route-unknown", route: "ask-answer-proxy" });
+    expect(net.calls).toHaveLength(1);
+  });
+
   it("projectRepositoryRegister ⭐ POSTs to the contract's project-repositories path with exactly the given body, and passes {registered,created,linked} through with outcome stamped on", async () => {
     const registered = { repoId: "tenant-0:coalesce-labs__dev-skills", owner: "coalesce-labs", name: "dev-skills" };
     const { net, c } = client([() => json(200, { registered, created: true, linked: true })]);

@@ -12,7 +12,8 @@ import { parseLinearIdentityView, type LinearIdentityResult } from "./linear-ide
 //     `X-Mirror-Next-Cursor` header, absent on the last page), /issues/:identifier, /pulls/:id,
 //     /projects, /me.
 //   • Every tenant write on the /api/v1/agent/* proxy — issue-state, issue-label, issue-comment,
-//     issue-create, reaction, attachment, session, ask, ask-accept — plus the attachments read-back.
+//     issue-create, reaction, attachment, session, ask, ask-accept, ask-answer-proxy — plus the
+//     attachments read-back.
 //     ⭐ THE PATH IS NEVER A LITERAL: each is resolved from the contract's `routes[]` by its last
 //     segment, and a route the tenant's contract does not list is a typed `route-unknown` result.
 //   • CTC-2132 — the routes the bundle's own `src/http.ts` transport used to hand-roll: GET
@@ -717,6 +718,34 @@ export type PersonalConnectionStatusResult =
   | { outcome: "unavailable"; status: 503; provider: PersonalConnectionProvider }
   | TenantClientFailure;
 
+// ── An ask owner's own proxy-answering controls (CTC-5663) ──────────────────────────────────────
+
+/** `GET`/`PUT /me/ask-proxy-answering` — whether an agent may record this member's chat answer on
+ *  their asks. Off by default. Personal key or CLI login only: an account key is `forbidden`. A
+ *  member with no resolved Linear identity is `no-linear-identity`, never a silent `false`. */
+export type AskProxyAnsweringResult =
+  | { outcome: "ok"; status: 200; enabled: boolean }
+  | { outcome: "no-linear-identity"; status: 409 }
+  | TenantClientFailure;
+
+export type AskDisownRefusal = "not-owner" | "not-proxy-answered" | "already-disowned" | "already-in-flight";
+/** What disowning did to one ticket the proxy answer had released. `status` is one of
+ *  `held-again`, `shared-release-retained`, `already-consumed`, or (for an `unblock`/`threshold`
+ *  phase) `reversed`, `superseded`, `changed-since-decision`, `unverifiable-history`, `failed`. */
+export interface AskDisownTicketEffect {
+  ticket: string;
+  phase: string;
+  status: string;
+}
+/** `POST /me/ask-disown` — the owner takes back an answer an agent recorded for them, reopening the
+ *  ask. `disown-failed` (502) is retryable. */
+export type AskDisownResult =
+  | { outcome: "disowned"; status: number; askIdentifier: string; tickets: AskDisownTicketEffect[] }
+  | { outcome: "refused"; status: number; reason: AskDisownRefusal }
+  | { outcome: "disown-failed"; status: number; askIdentifier: string; reason: string }
+  | { outcome: "no-linear-identity"; status: 409 }
+  | TenantClientFailure;
+
 // ── The agent proxy — every tenant write, plus the attachments read-back ────────────────────────
 
 /** The routes this client wraps, by the last segment of their contract path. `delegate` (operator
@@ -733,6 +762,7 @@ export type AgentRouteName =
   | "session"
   | "ask"
   | "ask-accept"
+  | "ask-answer-proxy"
   | "project-repositories"
   | "project-repositories/remove"
   | "portal-servers"
@@ -744,7 +774,7 @@ export type AgentRouteName =
  *  Kept in lockstep with the union by a compile-time equality in test/tenant-client-agent.test.ts. */
 export const AGENT_ROUTE_NAMES = [
   "issue-state", "issue-label", "issue-comment", "issue-create", "reaction",
-  "attachment", "attachments", "session", "ask", "ask-accept",
+  "attachment", "attachments", "session", "ask", "ask-accept", "ask-answer-proxy",
   "project-repositories", "project-repositories/remove",
   "portal-servers", "portal-servers/register", "portal-servers/remove",
   "messages",
@@ -950,6 +980,41 @@ export type AskAcceptResult =
   | { outcome: "recorded"; status: number; askIdentifier: string; decisionSummary: string; failedBlockedComments: string[]; resume: unknown[]; unblock?: unknown }
   | { outcome: "refused"; status: number; reason: AskAcceptRefusal }
   | { outcome: "record-failed"; status: number; reason: string; resume?: unknown[] }
+  | AgentCallFailure;
+
+/** `POST …/ask-answer-proxy` (CTC-5663) — an agent records the answer its owner gave in chat. The
+ *  cloud refuses with `proxy-answering-off` unless the ask's owner opted in, and a personal key must
+ *  belong to the owner. The answer is recorded as a proxy answer, never as the owner's own. */
+export interface ProxyAskAnswerInput {
+  askIssueId: string;
+  /** The owner's words, quoted exactly: 1 to 4000 characters. */
+  ownerQuote: string;
+  /** The option the owner chose, 0 to 25. Absent records `ownerQuote` as a free-text answer. */
+  optionIndex?: number;
+  /** Where the owner said it (the chat session or channel id): a single line of 1 to 200 characters. */
+  saidIn: string;
+  /** When the owner said it, in integer epoch milliseconds; at most 5 minutes in the future. */
+  saidAtMs: number;
+  /** A single line of at most 64 characters. */
+  acceptedByRole?: string;
+}
+export type ProxyAskAnswerRefusal =
+  | "not-an-ask"
+  | "issue-not-mirrored"
+  | "already-resolved"
+  | "proxy-answer-already-recorded"
+  | "readiness-needs-tap"
+  | "ask-has-no-team"
+  | "ask-has-no-owner"
+  | "proxy-caller-not-owner"
+  | "proxy-answering-off"
+  | "option-out-of-range"
+  | "already-in-flight";
+export type ProxyAskAnswerResult =
+  | { outcome: "recorded"; status: number; askIdentifier: string; decisionSummary: string; failedBlockedComments: string[]; resume: unknown[]; holdAnswer?: unknown; unblock?: unknown }
+  /** `optionCount` rides only on `option-out-of-range`. */
+  | { outcome: "refused"; status: number; reason: ProxyAskAnswerRefusal; optionCount?: number }
+  | { outcome: "record-failed"; status: number; reason: string; resume?: unknown[]; holdAnswer?: unknown }
   | AgentCallFailure;
 
 /** Both project-repository routes take the same address: a repository plus ONE of project /
@@ -2143,6 +2208,45 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     return view ? { outcome: "ok", ...view } : { outcome: "shape", status: 200, reason: "personal Linear identity returned an unexpected shape" };
   }
 
+  // ── An ask owner's own proxy-answering controls (CTC-5663) ────────────────────────────────────
+
+  /** Both routes resolve the caller's own Linear identity first, and answer 409 `{error}` when it
+   *  is unresolved. Lift that to its own arm: it is a precondition the caller can fix. */
+  function noLinearIdentity(answer: Answer): { outcome: "no-linear-identity"; status: 409 } | null {
+    return answer.status === 409 && isRecord(answer.json) && answer.json["error"] === "no_linear_identity"
+      ? { outcome: "no-linear-identity", status: 409 }
+      : null;
+  }
+
+  async function askProxyAnsweringCall(enabled?: boolean): Promise<AskProxyAnsweringResult> {
+    const sent = await send(enabled === undefined ? "GET" : "PUT", url("/me/ask-proxy-answering"), {},
+      enabled === undefined ? undefined : { enabled });
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    const lifted = noLinearIdentity(answer);
+    if (lifted) return lifted;
+    if (answer.status !== 200) return classify(answer);
+    const body = answer.json;
+    if (!isRecord(body) || typeof body["enabled"] !== "boolean") {
+      return { outcome: "shape", status: 200, reason: "ask proxy answering returned an unexpected shape" };
+    }
+    return { outcome: "ok", status: 200, enabled: body["enabled"] };
+  }
+
+  async function askDisown(issueId: string): Promise<AskDisownResult> {
+    const sent = await send("POST", url("/me/ask-disown"), {}, { issueId });
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    const lifted = noLinearIdentity(answer);
+    if (lifted) return lifted;
+    // The tenant answers `disowned` 200, `refused` 409, `disown-failed` 502, each with its outcome in
+    // the body — the same success-table discipline as the agent verbs below.
+    if (isRecord(answer.json) && outcomes("disowned", "refused", "disown-failed")(answer.json)) {
+      return stamped<Extract<AskDisownResult, { outcome: "disowned" | "refused" | "disown-failed" }>>(answer.json, answer.status);
+    }
+    return classify(answer);
+  }
+
   // ── Personal provider consent ────────────────────────────────────────────────────────────────
 
   async function personalConnectionStart(provider: PersonalConnectionProvider): Promise<PersonalConnectionStartResult> {
@@ -2335,6 +2439,10 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
       const r = await callAgentRoute("ask-accept", { ...input }, outcomes("recorded", "refused", "record-failed"));
       return r.ok ? stamped<Extract<AskAcceptResult, { outcome: "recorded" | "refused" | "record-failed" }>>(r.body, r.status) : r.failure;
     },
+    async recordProxyAskAnswer(input) {
+      const r = await callAgentRoute("ask-answer-proxy", { ...input }, outcomes("recorded", "refused", "record-failed"));
+      return r.ok ? stamped<Extract<ProxyAskAnswerResult, { outcome: "recorded" | "refused" | "record-failed" }>>(r.body, r.status) : r.failure;
+    },
     async portalServerRegister(input) {
       const r = await callAgentRoute("portal-servers/register", { ...input },
         (body) => body["outcome"] === "registered" && isPortalServer(body["server"]));
@@ -2463,6 +2571,11 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     request,
     linearIdentity: { get: () => linearIdentityCall(), set: (linearUserId) => linearIdentityCall(linearUserId) },
     personalConnections: { start: personalConnectionStart, status: personalConnectionStatus },
+    askProxyAnswering: {
+      get: () => askProxyAnsweringCall(),
+      set: (enabled) => askProxyAnsweringCall(enabled),
+      disown: askDisown,
+    },
     teamWorkflow,
     getProjectWipLimit: (team) =>
       teamCall("GET", `/api/v1/agent/team-wip-limit?team=${encodeURIComponent(team)}`, undefined, projectWipLimit),
@@ -2531,6 +2644,17 @@ export interface TenantClient {
     get(): Promise<LinearIdentityResult>;
     /** Records only the authenticated member's choice. Automatically resolved identities refuse. */
     set(linearUserId: string): Promise<LinearIdentityResult>;
+  };
+  /** An ask owner's own control over agents answering for them (CTC-5663). Personal key or CLI login
+   *  only; each call acts for the authenticated member and accepts no member selector. */
+  askProxyAnswering: {
+    /** Whether agents may record this member's chat answers on their asks. Off by default. */
+    get(): Promise<AskProxyAnsweringResult>;
+    /** Turns it on or off. Answers the value after the write. */
+    set(enabled: boolean): Promise<AskProxyAnsweringResult>;
+    /** Takes back an answer an agent recorded for this member, and reopens the ask. `issueId` is the
+     *  ask's id or identifier. */
+    disown(issueId: string): Promise<AskDisownResult>;
   };
   /** The tenant's fact document, cached per its own `cache` policy. */
   contract(opts?: ContractOptions): Promise<ContractResult>;
@@ -2616,6 +2740,8 @@ export interface TenantClient {
     session(input: SessionInput): Promise<SessionResult>;
     ask(input: AskInput): Promise<AskResult>;
     askAccept(input: AskAcceptInput): Promise<AskAcceptResult>;
+    /** `POST …/agent/ask-answer-proxy` — record the answer the ask's owner gave in chat, as their proxy. */
+    recordProxyAskAnswer(input: ProxyAskAnswerInput): Promise<ProxyAskAnswerResult>;
     portalServerRegister(input: PortalServerRegisterInput): Promise<PortalServerRegisterResult>;
     portalServers(): Promise<PortalServersResult>;
     portalServerRemove(input: { name: string }): Promise<PortalServerRemoveResult>;

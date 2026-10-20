@@ -140,6 +140,12 @@
       "path": "/api/v1/agent/messages",
       "takesWriteBudgetUnit": true,
       "since": "1.19.0"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent/ask-answer-proxy",
+      "takesWriteBudgetUnit": true,
+      "since": "2.39.0"
     }
   ],
   "teams": [
