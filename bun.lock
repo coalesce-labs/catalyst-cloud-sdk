@@ -6,8 +6,8 @@
       "name": "@catalyst-cloud/sdk",
       "devDependencies": {
         "@catalyst-cloud/read-model": "^0.16.0",
-        "@catalyst-cloud/replicate": "0.16.7",
-        "@catalyst-cloud/schema": "0.16.7",
+        "@catalyst-cloud/replicate": "0.16.8",
+        "@catalyst-cloud/schema": "0.16.8",
         "@opentelemetry/api": "^1.9.0",
         "@opentelemetry/context-async-hooks": "^2.8.0",
         "@opentelemetry/resources": "^2.8.0",
@@ -22,8 +22,8 @@
       },
       "peerDependencies": {
         "@catalyst-cloud/read-model": "^0.16.0",
-        "@catalyst-cloud/replicate": "0.16.7",
-        "@catalyst-cloud/schema": "0.16.7",
+        "@catalyst-cloud/replicate": "0.16.8",
+        "@catalyst-cloud/schema": "0.16.8",
         "@opentelemetry/api": ">=1.3.0 <2",
         "@sqlite.org/sqlite-wasm": "*",
         "better-sqlite3": "*",
@@ -41,9 +41,9 @@
   "packages": {
     "@catalyst-cloud/read-model": ["@catalyst-cloud/read-model@0.16.0", "", {}, "sha512-sKYeS5+BAxYIeWezeLaKmjRkUO0BHh5SwAD9zPB5Zv2G2iXHR73deQF5gMGTGspEb41bb8TIIHxKnRr9gsdtmA=="],
 
-    "@catalyst-cloud/replicate": ["@catalyst-cloud/replicate@0.16.7", "", { "dependencies": { "@catalyst-cloud/schema": "0.16.7" } }, "sha512-vzDXltp5asapl9QYdUICjOxVCpm0eDrIVFE4GB+Me+IRoMfzVeJiZ7QAW03bSEHQU0xg5peonWQE9Qb5F+f7HA=="],
+    "@catalyst-cloud/replicate": ["@catalyst-cloud/replicate@0.16.8", "", { "dependencies": { "@catalyst-cloud/schema": "0.16.8" } }, "sha512-230ISXHRlO0llNmWBaDSW/zUXl/Alb4RW7HAhxTPLPRQUB2t2aQcj2KAQxll51+AKXc4lhe7/47QsH0YlGE+yw=="],
 
-    "@catalyst-cloud/schema": ["@catalyst-cloud/schema@0.16.7", "", { "dependencies": { "drizzle-orm": "0.45.2" } }, "sha512-wBCNnSfGRo71pTApWYd/ao4NSllF1kMCnq765MEPxvJKdeuL3/ZMh1yJssymzJZzEpZCBmRbwce7Tt9rLb22/w=="],
+    "@catalyst-cloud/schema": ["@catalyst-cloud/schema@0.16.8", "", { "dependencies": { "drizzle-orm": "0.45.2" } }, "sha512-/R0lJ6T8HoIefAS/UcAcT8nQwfjzmQvFRj22qeFp4qC4iqQ+kVE8YScjYZDTk4TH+hmOnzaFSrU/8iSENjYerQ=="],
 
     "@esbuild/aix-ppc64": ["@esbuild/aix-ppc64@0.28.2", "", { "os": "aix", "cpu": "ppc64" }, "sha512-XExcO+dvLKvVtNTibSTBej1NCAbaGhWn9Ww1ZPx80qsahhPFe/8jgWP0IchNe0F3HwkU7n8ejhH8bjonqht8mQ=="],
 
