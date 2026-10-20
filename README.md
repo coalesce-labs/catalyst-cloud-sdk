@@ -331,6 +331,20 @@ const saved = await member.linearIdentity.set(selectedLinearUserId);
 if (saved.outcome === "ok") console.log(await member.linearIdentity.get());
 ```
 
+An agent can record an answer the ask's owner gave in chat with `agent.recordProxyAskAnswer({ askIssueId, ownerQuote, saidIn, saidAtMs, optionIndex?, acceptedByRole? })`. Quote the owner's words exactly. Leave out `optionIndex` for a free-text answer. `acceptedByRole` optionally names the recording agent's role (one line, at most 64 characters). The answer is recorded as given on the owner's behalf, never as the owner's own. It is refused with `proxy-answering-off` until the owner turns it on with `askProxyAnswering.set(true)`; it is off by default. The owner can take a recorded answer back with `askProxyAnswering.disown(askId)`, which reopens the ask. The `askProxyAnswering` calls require the owner's personal credential.
+
+```ts
+const opted = await member.askProxyAnswering.set(true);
+const recorded = await agentClient.agent.recordProxyAskAnswer({
+  askIssueId: "ENG-50",
+  ownerQuote: "Go with B.",
+  optionIndex: 1,
+  saidIn: chatSessionId,
+  saidAtMs: Date.now(),
+});
+if (recorded.outcome === "refused") console.log(recorded.reason);
+```
+
 ### Durable event cache for node and Bun
 
 `@catalyst-cloud/sdk/events` mirrors the tenant's exact durable Catalyst event backbone into an append-only local cache. It uses bounded HTTP replay with an idle backoff; local consumers tail files and never poll GitHub, Linear, or cloud tables. Start and stop it with the process that currently needs the tenant instead of installing another permanent daemon.
@@ -366,7 +380,7 @@ This API only reads the durable backbone. It does not publish events or treat ra
 | `AuthStrategy` | `{ kind: "token"; token }` (backend) or `{ kind: "cookie" }` (browser). |
 | `LiveSyncStatus` | `"connecting"` · `"live"` · `"reconnecting"` · `"resyncing"` · `"error"` · `"stopped"`. |
 | `ChangeFrame` · `EntityName` · `ChangeOp` | The change shape + the entity/op contract. |
-| `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `request()`, `issues.list/get/execution`, `pulls.list/get`, `projects.list`, `personalConnections.start/status`, `linearIdentity.get/set`, `cycles.list`, `search`, `workflowStages`, `changes.stream/list`, `snapshot.head`, `diagnostics.*` (workEligibility, dispatchQueue, fleetActivity, agentRoster, leaseAttributions, codingAccounts), `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept, projectRepositoryRegister, projectRepositoryRemove, message). Accepts either `key: string` or the CTC-2111 `auth: AuthStrategy`. |
+| `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `request()`, `issues.list/get/execution`, `pulls.list/get`, `projects.list`, `personalConnections.start/status`, `linearIdentity.get/set`, `askProxyAnswering.get/set/disown`, `cycles.list`, `search`, `workflowStages`, `changes.stream/list`, `snapshot.head`, `diagnostics.*` (workEligibility, dispatchQueue, fleetActivity, agentRoster, leaseAttributions, codingAccounts), `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept, recordProxyAskAnswer, projectRepositoryRegister, projectRepositoryRemove, message). Accepts either `key: string` or the CTC-2111 `auth: AuthStrategy`. |
 | `TenantContract` · `routeByName` · `teamByKey` · `teamForTicket` · `stageIdForSlot` · `labelIdFor` | The contract document's shape and the pure accessors over it, each returning a typed miss rather than throwing. |
 | `TenantClientFailure` · `PageCursor` · `pageCursor` · `memoryContractCache` | The shared failure arms, the opaque page token, and the default contract cache store. |
 | `CatalystEventSync` · `readCachedEvents` · `tailCachedEvents` · `EventHistoryGapError` | Node/Bun durable-backbone replay, local cache readers, and explicit history-gap handling from `@catalyst-cloud/sdk/events`. |

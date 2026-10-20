@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+An agent can now record the answer an ask's owner gave in chat, without making the owner answer again in the app. `agent.recordProxyAskAnswer(input)` takes the ask, the owner's words quoted exactly, the chat session or channel they were said in, when they were said, and the chosen option when there is one. The answer is recorded as given on the owner's behalf, never as the owner's own. A refusal names its reason, such as `proxy-answering-off` or `proxy-caller-not-owner`.
+
+Each owner decides whether agents may answer for them, and the setting is off by default. `askProxyAnswering.get()` and `askProxyAnswering.set(enabled)` read and change it. `askProxyAnswering.disown(askId)` takes back an answer recorded on the owner's behalf and reopens the ask. These three calls act only for the signed-in person, so use a personal key or a CLI login; a workspace key is refused.
+
+Requires a Catalyst Cloud server that offers answering on an owner's behalf.
+
 ## 0.16.9
 
 The SDK and the Node and browser replicas now use schema and replication packages 0.16.7. The description of the screen-read diagnostic event no longer names an internal address. Update the SDK and any replica modules together; 0.16.8 is replaced by this release.

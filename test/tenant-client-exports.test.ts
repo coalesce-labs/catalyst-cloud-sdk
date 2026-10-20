@@ -62,6 +62,10 @@ describe("⭐ every method on the TenantClient interface is present on a constru
       "agent.session",
       "agent.ask",
       "agent.askAccept",
+      "agent.recordProxyAskAnswer",
+      "askProxyAnswering.get",
+      "askProxyAnswering.set",
+      "askProxyAnswering.disown",
       "agent.projectRepositoryRegister",
       "agent.projectRepositoryRemove",
     ]) {
