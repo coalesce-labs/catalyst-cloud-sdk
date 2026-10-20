@@ -331,7 +331,7 @@ const saved = await member.linearIdentity.set(selectedLinearUserId);
 if (saved.outcome === "ok") console.log(await member.linearIdentity.get());
 ```
 
-An agent can record an answer the ask's owner gave in chat with `agent.recordProxyAskAnswer({ askIssueId, ownerQuote, saidIn, saidAtMs, optionIndex? })`. Quote the owner's words exactly. Leave out `optionIndex` for a free-text answer. The answer is recorded as given on the owner's behalf, never as the owner's own. It is refused with `proxy-answering-off` until the owner turns it on with `askProxyAnswering.set(true)`; it is off by default. The owner can take a recorded answer back with `askProxyAnswering.disown(askId)`, which reopens the ask. The `askProxyAnswering` calls require the owner's personal credential.
+An agent can record an answer the ask's owner gave in chat with `agent.recordProxyAskAnswer({ askIssueId, ownerQuote, saidIn, saidAtMs, optionIndex?, acceptedByRole? })`. Quote the owner's words exactly. Leave out `optionIndex` for a free-text answer. `acceptedByRole` optionally names the recording agent's role (one line, at most 64 characters). The answer is recorded as given on the owner's behalf, never as the owner's own. It is refused with `proxy-answering-off` until the owner turns it on with `askProxyAnswering.set(true)`; it is off by default. The owner can take a recorded answer back with `askProxyAnswering.disown(askId)`, which reopens the ask. The `askProxyAnswering` calls require the owner's personal credential.
 
 ```ts
 const opted = await member.askProxyAnswering.set(true);
