@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.11
+
+The SDK and the Node and browser replicas now use schema and replication packages 0.16.9, which add four event types to the event registry. Update the SDK and both replicas together.
+
 ## 0.16.10
 
 An agent can now record the answer an ask's owner gave in chat, without making the owner answer again in the app. `agent.recordProxyAskAnswer(input)` takes the ask, the owner's words quoted exactly, the chat session or channel they were said in, when they were said, and the chosen option when there is one. The answer is recorded as given on the owner's behalf, never as the owner's own. A refusal names its reason, such as `proxy-answering-off` or `proxy-caller-not-owner`.
