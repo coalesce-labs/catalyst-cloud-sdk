@@ -92,13 +92,25 @@ describe('release rerun (CTC-6552)', () => {
       expect(npmRefusedExistingVersion(stderr), String(stderr)).toBe(false);
     }
   });
-  it('treats a refused republish as already accepted and rethrows any other publish failure', () => {
-    const failing = stderr => () => { throw Object.assign(new Error('Command failed: npm publish'), {stderr}); };
-    const quiet = {log:() => {}};
-    expect(publishPacked('pkg.tgz', {...quiet, exec:() => ''})).toBe('published');
-    expect(publishPacked('pkg.tgz', {...quiet, exec:failing('npm error 403 403 Forbidden - You cannot publish over the previously published versions: 0.16.17.')})).toBe('already-accepted');
-    expect(() => publishPacked('pkg.tgz', {...quiet, exec:failing('npm error code E401')})).toThrow('Command failed: npm publish');
-    expect(() => publishPacked('pkg.tgz', {...quiet, exec:failing(undefined)})).toThrow('Command failed: npm publish');
+  it('treats a refused republish as already accepted and fails any other publish', () => {
+    const ran = result => () => ({status:1, signal:null, stderr:'', ...result});
+    const quiet = {writeErr:() => {}};
+    expect(publishPacked('pkg.tgz', {...quiet, spawn:ran({status:0})})).toBe('published');
+    expect(publishPacked('pkg.tgz', {...quiet, spawn:ran({stderr:'npm error 403 403 Forbidden - You cannot publish over the previously published versions: 0.16.17.'})})).toBe('already-accepted');
+    expect(() => publishPacked('pkg.tgz', {...quiet, spawn:ran({stderr:'npm error code E401'})})).toThrow('npm publish pkg.tgz failed with exit 1');
+    expect(() => publishPacked('pkg.tgz', {...quiet, spawn:ran({stderr:undefined})})).toThrow('failed with exit 1');
+    expect(() => publishPacked('pkg.tgz', {...quiet, spawn:ran({error:new Error('spawn npm ENOENT')})})).toThrow('spawn npm ENOENT');
+  });
+  // Review F1 on #219 — a green publish keeps npm's notices, the provenance link among them.
+  it('writes npm stderr to the log on success as well as on failure', () => {
+    const notice = 'npm notice publish Provenance statement published to transparency log: https://search.sigstore.dev/?logIndex=1\n';
+    for (const status of [0, 1]) {
+      const written = [];
+      try {
+        publishPacked('pkg.tgz', {spawn:() => ({status, signal:null, stderr:notice}), writeErr:text => written.push(text)});
+      } catch {}
+      expect(written, `status ${status}`).toEqual([notice]);
+    }
   });
   it('still refuses different bytes after a refused republish: the wait checks integrity', async () => {
     await expect(waitForPublication(entry, 'sha512-new', {now:() => 0, pause:async () => {}, lookup:async () => 'sha512-old', log:() => {}})).rejects.toThrow('integrity mismatch');

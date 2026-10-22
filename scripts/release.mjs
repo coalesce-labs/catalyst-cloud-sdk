@@ -1,6 +1,6 @@
 // Publish one tested SDK release, core first. Recover safely after a partial publication.
 import { checkRelease } from './release-train-check.mjs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -83,17 +83,17 @@ export async function readPublishedIntegrity(entry, options = {}) {
 export function npmRefusedExistingVersion(stderr) {
   return /cannot publish over the previously published versions|EPUBLISHCONFLICT/i.test(String(stderr ?? ''));
 }
+// Review F1 on #219: spawnSync, not execFileSync, so npm's stderr (its notices, the provenance
+// transparency-log link) reaches the job log on success as well as failure.
 export function publishPacked(tarball, options = {}) {
-  const exec = options.exec ?? execFileSync;
-  const log = options.log ?? console.error;
-  try {
-    exec('npm', ['publish', tarball, '--provenance', '--access', 'public'], {cwd:options.cwd, env:options.env, stdio:['inherit', 'inherit', 'pipe'], encoding:'utf8'});
-    return 'published';
-  } catch (error) {
-    if (error?.stderr) log(String(error.stderr));
-    if (npmRefusedExistingVersion(error?.stderr)) return 'already-accepted';
-    throw error;
-  }
+  const spawn = options.spawn ?? spawnSync;
+  const writeErr = options.writeErr ?? (text => process.stderr.write(text));
+  const result = spawn('npm', ['publish', tarball, '--provenance', '--access', 'public'], {cwd:options.cwd, env:options.env, stdio:['inherit', 'inherit', 'pipe'], encoding:'utf8'});
+  if (result.stderr) writeErr(String(result.stderr));
+  if (result.error) throw result.error;
+  if (result.status === 0) return 'published';
+  if (npmRefusedExistingVersion(result.stderr)) return 'already-accepted';
+  throw new Error(`npm publish ${tarball} failed with exit ${result.status ?? result.signal}`);
 }
 export async function release(root = process.cwd()) {
   await checkRelease({root, publish: 'sdk'});
@@ -121,14 +121,20 @@ export async function release(root = process.cwd()) {
       }
       const outcome = publishPacked(join(scratch, packed.filename), {cwd:root, env});
       if (outcome === 'already-accepted') console.log(`npm already holds ${entry.name}@${entry.version}; verifying its bytes once it is readable`);
-      published.push({entry, integrity:packed.integrity});
+      published.push({entry, integrity:packed.integrity, refused:outcome === 'already-accepted'});
     }
   } finally { rmSync(scratch, {recursive:true, force:true}); }
   // One window for every package published above, measured from the last publish, so a slow
   // read-back on one package does not spend the job's timeout three times over.
   const started = Date.now();
-  for (const {entry, integrity} of published) {
-    await waitForPublication(entry, integrity, {started});
+  for (const {entry, integrity, refused} of published) {
+    try {
+      await waitForPublication(entry, integrity, {started});
+    } catch (error) {
+      // A rerun cannot republish a version npm refused, so "rerun" alone is not a way out.
+      if (refused) error.message += `; npm refused to publish ${entry.name}@${entry.version} again because it already holds that version, so check the version on npm before rerunning`;
+      throw error;
+    }
     console.log(`Verified publication: ${entry.name}@${entry.version}`);
   }
 }
