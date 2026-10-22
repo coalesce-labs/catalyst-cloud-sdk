@@ -46,6 +46,7 @@ describe("⭐ every method on the TenantClient interface is present on a constru
       "changes.list",
       "events.query",
       "events.pages",
+      "messages.read",
       "snapshot.head",
       "diagnostics.workEligibility",
       "diagnostics.dispatchQueue",

@@ -21,6 +21,24 @@ function event(sequence: number) {
 }
 
 describe("events.query", () => {
+  it("sends repo, ref, pr, session, to and several tickets, each value as its own param", async () => {
+    const { net, c } = client([() => json(200, { events: [], next: null, coverage: COVERAGE })]);
+    await c.events.query({ ticket: ["CTC-1", "CTC-2"], type: "pr.*", repo: "o/r", ref: ["o/r:a", "o/r:b"], pr: "o/r#9", session: "CTC-1/implement#7", to: "me" });
+    const call = net.calls.at(0);
+    if (call === undefined) throw new Error("expected a query request");
+    const sent = new URL(call.url);
+    expect(Array.from(sent.searchParams)).toEqual([
+      ["ticket", "CTC-1"], ["ticket", "CTC-2"], ["type", "pr.*"], ["repo", "o/r"],
+      ["ref", "o/r:a"], ["ref", "o/r:b"], ["pr", "o/r#9"], ["session", "CTC-1/implement#7"], ["to", "me"],
+    ]);
+  });
+
+  it("keeps an existing ticket-only request byte-identical", async () => {
+    const { net, c } = client([() => json(200, { events: [], next: null, coverage: COVERAGE })]);
+    await c.events.query({ ticket: "ENG-1" });
+    expect(net.calls.at(0)?.url).toBe(`${BASE}/api/v1/events/query?ticket=ENG-1`);
+  });
+
   it("sends only the params given, with the server's own names", async () => {
     const { net, c } = client([() => json(200, { events: [], next: null, coverage: COVERAGE })]);
     await c.events.query({});
@@ -68,6 +86,24 @@ describe("events.query", () => {
 });
 
 describe("events.pages", () => {
+  it("retains every scope value while following the next cursor", async () => {
+    const { net, c } = client([
+      () => json(200, { events: [event(5)], next: { param: "afterSeq", value: 5 }, coverage: COVERAGE }),
+      () => json(200, { events: [event(9)], next: null, coverage: COVERAGE }),
+    ]);
+    const pages: EventQueryResult[] = [];
+    for await (const page of c.events.pages({ ticket: ["CTC-1", "CTC-2"], type: ["pr.*", "phase.*"],
+      repo: ["o/r", "o/s"], ref: ["o/r:a", "o/r:b"], pr: ["o/r#9", "o/s#10"],
+      session: ["CTC-1/implement#7", "CTC-2/plan#1"], to: "me", order: "asc", afterSeq: 0 })) pages.push(page);
+    expect(pages).toHaveLength(2);
+    const first = net.calls.at(0);
+    const second = net.calls.at(1);
+    if (first === undefined || second === undefined) throw new Error("expected two query requests");
+    const expected = new URL(first.url);
+    expected.searchParams.set("afterSeq", "5");
+    expect(second.url).toBe(expected.toString());
+  });
+
   it("follows next until it is null, keeping the other params", async () => {
     const { net, c } = client([
       () => json(200, { events: [event(9), event(8)], next: { param: "beforeSeq", value: 8 }, coverage: COVERAGE }),
