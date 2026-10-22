@@ -15,6 +15,7 @@
 // through the backbone once per generation, because nothing was pushed while the socket was down.
 import { buildConnectUrl, type AuthStrategy, type WebSocketFactory, type WebSocketLike } from "./live-sync-client.js";
 import { PING_FRAME, PONG_FRAME } from "./types.js";
+import { eventFilterSocketParams, type EventScopeFilter } from "./event-filter.js";
 
 /** One `events` frame as the cloud sent it. `events` is unparsed: the follower validates each one. */
 export interface EventsFrame {
@@ -31,6 +32,8 @@ export interface EventsSocketOptions {
   baseUrl: string;
   auth: Exclude<AuthStrategy, { kind: "cookie" }>;
   tenantId: string;
+  /** Optional flat scope filter; omitted for a complete replica subscription. */
+  filter?: EventScopeFilter;
   /** Opens the socket. Defaults to the runtime's global `WebSocket`. */
   wsFactory?: WebSocketFactory;
   /** Silence after which the client sends a ping. Default 90 s. */
@@ -71,14 +74,14 @@ export function globalWebSocketFactory(): WebSocketFactory | null {
 }
 
 /** The events socket URL. The token rides `?token=` because a WebSocket cannot set a header. */
-export function eventsSocketUrl(options: Pick<EventsSocketOptions, "baseUrl" | "auth" | "tenantId">, token?: string): string {
+export function eventsSocketUrl(options: Pick<EventsSocketOptions, "baseUrl" | "auth" | "tenantId" | "filter">, token?: string): string {
   return buildConnectUrl({
     baseUrl: options.baseUrl,
     connectPath: "/api/v1/connect",
     accountId: options.tenantId,
     auth: options.auth,
     ...(token !== undefined ? { bearerToken: token } : {}),
-    extraParams: { channels: "events", fields: "full" },
+    extraParams: { channels: "events", fields: "full", ...(options.filter ? eventFilterSocketParams(options.filter) : {}) },
   });
 }
 

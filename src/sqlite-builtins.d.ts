@@ -44,6 +44,18 @@ declare module "node:module" {
 // Declared here (not via `@types/node`) for the same reason as the sqlite builtins — a build-time-only
 // input that ships nothing into a consumer's type graph. `mkdtempSync`/`rmSync` are used only by tests.
 declare module "node:fs" {
+  export interface Stats {
+    size: number;
+    isDirectory(): boolean;
+  }
+  export interface FSWatcher {
+    close(): void;
+    on(event: "error", listener: (error: Error) => void): this;
+  }
+  export function watch(
+    path: string,
+    listener: (eventType: "rename" | "change", filename: string | null) => void,
+  ): FSWatcher;
   export function openSync(path: string, flags: string): number;
   export function writeSync(fd: number, data: string): number;
   export function closeSync(fd: number): void;
@@ -66,6 +78,13 @@ declare module "node:fs/promises" {
     toString(encoding?: string): string;
   }
   interface FileHandle {
+    read(
+      buffer: Uint8Array,
+      offset: number,
+      length: number,
+      position: number | null,
+    ): Promise<{ bytesRead: number; buffer: Uint8Array }>;
+    stat(): Promise<import("node:fs").Stats>;
     write(data: string): Promise<unknown>;
     sync(): Promise<void>;
     close(): Promise<void>;
@@ -78,7 +97,7 @@ declare module "node:fs/promises" {
   export function readdir(path: string): Promise<string[]>;
   export function rename(oldPath: string, newPath: string): Promise<void>;
   export function rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>;
-  export function stat(path: string): Promise<{ size: number }>;
+  export function stat(path: string): Promise<import("node:fs").Stats>;
   export function truncate(path: string, length?: number): Promise<void>;
   export function watch(path: string, options?: { signal?: AbortSignal }): AsyncIterable<unknown>;
   export function writeFile(path: string, data: string, options?: { mode?: number }): Promise<void>;
