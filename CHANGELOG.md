@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.17
+
+The SDK and the Node and browser replicas now use schema and replication packages 0.16.16, which add two telemetry point types for environment setup: one when a setup run completes or fails, with its duration, and one when a saved setup snapshot is restored or refused. Update the SDK and both replicas together.
+
 ## 0.16.16
 
 The SDK and the Node and browser replicas now use schema and replication packages 0.16.15, in which each durable event type states who may publish it. Update the SDK and both replicas together.
