@@ -74,6 +74,12 @@ function readLock(lockPath: string): LockRecord | null {
   }
 }
 
+/** The read-only freshness signal used by event cache subscribers. */
+export function readWriterLockHeartbeat(lockPath: string): number | null {
+  const heartbeat = readLock(lockPath)?.heartbeat;
+  return heartbeat !== undefined && Number.isFinite(heartbeat) ? heartbeat : null;
+}
+
 /** SAME-HOST liveness probe. Returns true when it cannot tell (assume the holder is alive — the
  *  heartbeat staleness check is the portable signal that ultimately reclaims a dead lock). */
 function pidAlive(pid: number): boolean {

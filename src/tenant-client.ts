@@ -1,3 +1,4 @@
+import { eventFilterQueryParams, type EventScopeFilter } from "./event-filter.js";
 import { isMachineInventory, isMachineMutation, type MachineInventory, type MachineMutation } from "./machine-inventory.js";
 import { parseLinearIdentityView, type LinearIdentityResult } from "./linear-identity.js";
 // tenant-client.ts — CTC-2004. ONE typed client for every tenant read and write, so the CLI, the
@@ -488,9 +489,14 @@ export type TicketExecutionProjectedResult = TicketExecutionResult | ReadSelectR
 //    type, served from the cloud's event index. A page is JSON, complete or absent.
 
 export interface EventQueryParams {
-  ticket?: string;
+  ticket?: string | readonly string[];
   /** One durable event type, or several (each sent as its own `type=`). */
   type?: string | readonly string[];
+  repo?: string | readonly string[];
+  ref?: string | readonly string[];
+  pr?: string | readonly string[];
+  session?: string | readonly string[];
+  to?: "me";
   /** The server's default is 50, its maximum 200. */
   limit?: number;
   /** The server's default is `desc`, newest first. */
@@ -554,6 +560,33 @@ export type EventQueryResult =
     }
   /** A `type` outside the cloud's durable registry (400). `types` lists every one it refused. */
   | { outcome: "event-type-refused"; status: 400; types: string[]; reason: string }
+  | TenantClientFailure;
+
+/** Read messages at or after the inclusive backbone sequence of a comms.message.posted event. */
+export interface MessagesReadParams {
+  ticket: string;
+  since?: number;
+}
+
+/** A message body, its sender and timestamp, preserving any fields added by the server. */
+export interface AgentMessageRecord {
+  readonly id: string;
+  readonly seq: number;
+  readonly kind: string;
+  readonly body: string;
+  readonly from: {
+    readonly kind: string;
+    readonly id: string;
+    readonly label: string;
+    readonly [key: string]: unknown;
+  };
+  readonly sentAt: string;
+  readonly [key: string]: unknown;
+}
+
+export type MessagesReadResult =
+  | { outcome: "ok"; status: 200; ticket: string; messages: AgentMessageRecord[]; next: number | null }
+  | { outcome: "unsupported"; status: 404; reason: string }
   | TenantClientFailure;
 
 // ── The diagnosis / telemetry reads — CTC-2132 (Ryan/M2: customer delegate agents diagnosing and
@@ -1343,6 +1376,15 @@ function isFlowColumn(value: unknown): boolean {
   return pr === null || (isRecord(pr) && ["open", "opened", "merged", "closedUnmerged", "net"].every((k) => Number.isSafeInteger(pr[k])));
 }
 
+function agentMessageRecord(value: unknown): value is AgentMessageRecord {
+  if (!isRecord(value)) return false;
+  const from = value["from"];
+  return typeof value["id"] === "string" && Number.isSafeInteger(value["seq"]) &&
+    typeof value["kind"] === "string" && typeof value["body"] === "string" &&
+    isRecord(from) && typeof from["kind"] === "string" && typeof from["id"] === "string" &&
+    typeof from["label"] === "string" && typeof value["sentAt"] === "string";
+}
+
 function eventQueryCursor(value: unknown): value is EventQueryCursor {
   return (
     isRecord(value) &&
@@ -1962,14 +2004,37 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     return { outcome: "ok", status: 200, report: answer.json as TicketExecutionReport };
   }
 
+  async function messagesRead(params: MessagesReadParams): Promise<MessagesReadResult> {
+    if (params.ticket.trim() === "") return { outcome: "rejected", status: 0, reason: "ticket must not be empty" };
+    if (params.since !== undefined && (!Number.isSafeInteger(params.since) || params.since < 0)) {
+      return { outcome: "rejected", status: 0, reason: "since must be a non-negative safe integer" };
+    }
+    const sent = await send("GET", url("/api/v1/agent/messages", { ticket: params.ticket, since: params.since }), {});
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    if (answer.status === 404) return { outcome: "unsupported", status: 404, reason: "this server has no GET /api/v1/agent/messages" };
+    if (answer.status !== 200) return classify(answer);
+    const body = answer.json;
+    if (!isRecord(body) || typeof body["ticket"] !== "string" ||
+        !Array.isArray(body["messages"]) || !body["messages"].every(agentMessageRecord) ||
+        !(body["next"] === null || (typeof body["next"] === "number" && Number.isSafeInteger(body["next"])))) {
+      return { outcome: "shape", status: 200, reason: "GET /api/v1/agent/messages did not answer the documented page" };
+    }
+    return { outcome: "ok", status: 200, ticket: body["ticket"], messages: body["messages"], next: body["next"] };
+  }
+
   // ── Event history (CTC-4549) ──────────────────────────────────────────────────────────────────
 
   async function eventsQuery(params: EventQueryParams = {}): Promise<EventQueryResult> {
-    const target = new URL(url("/api/v1/events/query", { ticket: params.ticket }));
-    // `type` repeats (`type=a&type=b`), which the one-value `url()` helper cannot say.
-    for (const type of typeof params.type === "string" ? [params.type] : params.type ?? []) {
-      target.searchParams.append("type", type);
+    const target = new URL(url("/api/v1/events/query"));
+    // Preserve the query API's server-side validation and the original order of ticket and type.
+    const filter: EventScopeFilter = {};
+    for (const key of ["ticket", "type", "repo", "ref", "pr", "session"] as const) {
+      const value = params[key];
+      if (value !== undefined) filter[key] = typeof value === "string" ? [value] : value;
     }
+    if (params.to !== undefined) filter.to = params.to;
+    for (const [key, value] of eventFilterQueryParams(filter)) target.searchParams.append(key, value);
     for (const [k, v] of Object.entries({ limit: params.limit, order: params.order, afterSeq: params.afterSeq, beforeSeq: params.beforeSeq })) {
       if (v !== undefined) target.searchParams.set(k, String(v));
     }
@@ -2711,6 +2776,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     workflowStages,
     changes: { stream: changesStream, list: changesListFn },
     events: { query: eventsQuery, pages: eventsPages },
+    messages: { read: messagesRead },
     snapshot: { head: snapshotHead },
     diagnostics: {
       workEligibility,
@@ -2832,9 +2898,14 @@ export interface TenantClient {
     /** The same feed, buffered — never throws; a mid-stream fault comes back as the `network` arm. */
     list(params: { since: number | "head"; signal?: AbortSignal }): Promise<ChangesListResult>;
   };
+  messages: {
+    /** `GET /api/v1/agent/messages`: the bodies of messages sent to a ticket on your teams,
+     * oldest first, at most 50 a page. A phase session's credential is refused; use your own key. */
+    read(params: MessagesReadParams): Promise<MessagesReadResult>;
+  };
   /** A tenant's event history from the cloud (CTC-4549). An older server answers `unsupported`. */
   events: {
-    /** `GET /api/v1/events/query` — one page, filtered by ticket and type. */
+    /** `GET /api/v1/events/query` — one page, filtered by event type and scope keys. */
     query(params?: EventQueryParams): Promise<EventQueryResult>;
     /** Every page, following `next`. Never throws; a failed page is yielded and ends the walk. */
     pages(params?: EventQueryParams): AsyncGenerator<EventQueryResult, void, undefined>;

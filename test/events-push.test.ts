@@ -12,49 +12,8 @@ import {
   type EventSyncOptions,
 } from "../src/events.js";
 import { EventsChannelClient, eventsSocketUrl } from "../src/events-socket.js";
-import type { WebSocketFactory, WebSocketLike } from "../src/live-sync-client.js";
+import { FakeWebSocket, recordingFactory } from "./helpers/fake-events-socket.js";
 import { PING_FRAME, PONG_FRAME } from "../src/types.js";
-
-class FakeWebSocket implements WebSocketLike {
-  sent: string[] = [];
-  closed = false;
-  onopen: ((ev: unknown) => void) | null = null;
-  onmessage: ((ev: { data: unknown }) => void) | null = null;
-  onclose: ((ev: unknown) => void) | null = null;
-  onerror: ((ev: unknown) => void) | null = null;
-  send(data: string): void {
-    this.sent.push(data);
-  }
-  close(): void {
-    this.closed = true;
-  }
-  /** The cloud accepted the upgrade and confirmed the subscription. */
-  subscribe(): void {
-    this.onopen?.({});
-    this.deliver({ type: "channels", channels: ["events"], fields: "full" });
-  }
-  deliver(frame: unknown): void {
-    this.onmessage?.({ data: typeof frame === "string" ? frame : JSON.stringify(frame) });
-  }
-  serverClose(code: number): void {
-    this.onclose?.({ code, reason: "" });
-  }
-}
-
-function recordingFactory(): { sockets: FakeWebSocket[]; urls: string[]; factory: WebSocketFactory } {
-  const sockets: FakeWebSocket[] = [];
-  const urls: string[] = [];
-  return {
-    sockets,
-    urls,
-    factory: (url) => {
-      urls.push(url);
-      const ws = new FakeWebSocket();
-      sockets.push(ws);
-      return ws;
-    },
-  };
-}
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -153,6 +112,19 @@ describe("CatalystEventSync over the events socket", () => {
       channels: "events",
       fields: "full",
     });
+  });
+
+  it("adds the filter to the socket URL, values of a key comma-joined", () => {
+    const url = new URL(eventsSocketUrl({
+      baseUrl: "https://cloud.invalid", auth: { kind: "token", token: "t" }, tenantId: "tenant-1",
+      filter: { type: ["pr.conflict.detected", "comms.message.posted"], ref: ["coalesce-labs/catalyst-cloud:ryan/stack-a"], to: "me" },
+    }));
+    expect(url.searchParams.get("channels")).toBe("events");
+    expect(url.searchParams.get("fields")).toBe("full");
+    expect(url.searchParams.get("type")).toBe("pr.conflict.detected,comms.message.posted");
+    expect(url.searchParams.get("ref")).toBe("coalesce-labs/catalyst-cloud:ryan/stack-a");
+    expect(url.searchParams.get("to")).toBe("me");
+    expect(url.searchParams.get("token")).toBe("t");
   });
 
   it("a bare syncOnce opens no socket, so a one-shot caller keeps its exit behavior", async () => {
