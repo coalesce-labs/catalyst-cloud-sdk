@@ -1,0 +1,917 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Catalyst Cloud API",
+    "version": "0.46.0"
+  },
+  "paths": {
+    "/api/v1/flow-series": {
+      "get": {
+        "operationId": "getFlowSeries",
+        "summary": "Flow metrics as a time series",
+        "x-catalyst-schema-depth": "modeled",
+        "x-catalyst-auth": "open",
+        "security": [
+          {
+            "bearerKey": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "repo",
+            "required": true,
+            "description": "Repository as owner/name",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "period",
+            "description": "Time window; defaults to two weeks",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "24h",
+                "2d",
+                "3d",
+                "1w",
+                "2w",
+                "4w",
+                "12w",
+                "26w"
+              ],
+              "default": "2w"
+            }
+          },
+          {
+            "in": "query",
+            "name": "granularity",
+            "description": "Hour or calendar-day buckets. Omitted preserves period-derived widths: 1h for 24h, 2h for 2d, 3h for 3d, daily for week periods. Short periods by day include every calendar day touched; week periods keep their day count. The final bucket ends at the generation time. Explicit granularity or a new 12w/26w period is limited to 100,000 ticket age samples across current and previous buckets; exceeding this budget returns HTTP 400 (flow-series-too-large). Use daily buckets or a shorter period.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "hour",
+                "day"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowSeries"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "FlowSeries": {
+        "type": "object",
+        "properties": {
+          "project": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "repo": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "repo"
+            ],
+            "additionalProperties": false
+          },
+          "period": {
+            "type": "string",
+            "enum": [
+              "24h",
+              "2d",
+              "3d",
+              "1w",
+              "2w",
+              "4w",
+              "12w",
+              "26w"
+            ]
+          },
+          "boundary": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "fixed-offset"
+                  },
+                  "offsetMinutes": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "offsetMinutes"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "iana"
+                  },
+                  "timeZone": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "timeZone"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "generatedAt": {
+            "type": "number"
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "startMs": {
+                  "type": "number"
+                },
+                "endMs": {
+                  "type": "number"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "partial": {
+                  "type": "boolean"
+                },
+                "ticket": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "started": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "shipped": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "shippedReachedIntake": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "shippedFromQueue": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "cancelled": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "cancelledReachedIntake": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "movedBack": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "removed": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "net": {
+                          "type": "integer",
+                          "minimum": -9007199254740991,
+                          "maximum": 9007199254740991
+                        },
+                        "open": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "todo": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "stages": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string",
+                            "enum": [
+                              "Todo",
+                              "Intake",
+                              "Research",
+                              "Plan",
+                              "Implement",
+                              "Validate",
+                              "Remediate",
+                              "PR",
+                              "Other"
+                            ]
+                          },
+                          "additionalProperties": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "required": [
+                            "Todo",
+                            "Intake",
+                            "Research",
+                            "Plan",
+                            "Implement",
+                            "Validate",
+                            "Remediate",
+                            "PR",
+                            "Other"
+                          ]
+                        },
+                        "cycleSeconds": {
+                          "type": "array",
+                          "items": {
+                            "type": "number"
+                          }
+                        },
+                        "openAgeSeconds": {
+                          "type": "array",
+                          "items": {
+                            "type": "number"
+                          }
+                        }
+                      },
+                      "required": [
+                        "started",
+                        "shipped",
+                        "shippedReachedIntake",
+                        "shippedFromQueue",
+                        "cancelled",
+                        "cancelledReachedIntake",
+                        "movedBack",
+                        "removed",
+                        "net",
+                        "open",
+                        "todo",
+                        "stages",
+                        "cycleSeconds",
+                        "openAgeSeconds"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pr": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "opened": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "merged": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "closedUnmerged": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "net": {
+                          "type": "integer",
+                          "minimum": -9007199254740991,
+                          "maximum": 9007199254740991
+                        },
+                        "open": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991,
+                          "description": "Pull requests open immediately before the bucket end, including drafts"
+                        },
+                        "cycleSeconds": {
+                          "type": "array",
+                          "items": {
+                            "type": "number"
+                          }
+                        }
+                      },
+                      "required": [
+                        "opened",
+                        "merged",
+                        "closedUnmerged",
+                        "net",
+                        "open",
+                        "cycleSeconds"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "startMs",
+                "endMs",
+                "label",
+                "partial",
+                "ticket",
+                "pr"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "previousColumns": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "startMs": {
+                  "type": "number"
+                },
+                "endMs": {
+                  "type": "number"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "partial": {
+                  "type": "boolean"
+                },
+                "ticket": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "started": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "shipped": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "shippedReachedIntake": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "shippedFromQueue": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "cancelled": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "cancelledReachedIntake": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "movedBack": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "removed": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "net": {
+                          "type": "integer",
+                          "minimum": -9007199254740991,
+                          "maximum": 9007199254740991
+                        },
+                        "open": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "todo": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "stages": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string",
+                            "enum": [
+                              "Todo",
+                              "Intake",
+                              "Research",
+                              "Plan",
+                              "Implement",
+                              "Validate",
+                              "Remediate",
+                              "PR",
+                              "Other"
+                            ]
+                          },
+                          "additionalProperties": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "required": [
+                            "Todo",
+                            "Intake",
+                            "Research",
+                            "Plan",
+                            "Implement",
+                            "Validate",
+                            "Remediate",
+                            "PR",
+                            "Other"
+                          ]
+                        },
+                        "cycleSeconds": {
+                          "type": "array",
+                          "items": {
+                            "type": "number"
+                          }
+                        },
+                        "openAgeSeconds": {
+                          "type": "array",
+                          "items": {
+                            "type": "number"
+                          }
+                        }
+                      },
+                      "required": [
+                        "started",
+                        "shipped",
+                        "shippedReachedIntake",
+                        "shippedFromQueue",
+                        "cancelled",
+                        "cancelledReachedIntake",
+                        "movedBack",
+                        "removed",
+                        "net",
+                        "open",
+                        "todo",
+                        "stages",
+                        "cycleSeconds",
+                        "openAgeSeconds"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pr": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "opened": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "merged": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "closedUnmerged": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "net": {
+                          "type": "integer",
+                          "minimum": -9007199254740991,
+                          "maximum": 9007199254740991
+                        },
+                        "open": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991,
+                          "description": "Pull requests open immediately before the bucket end, including drafts"
+                        },
+                        "cycleSeconds": {
+                          "type": "array",
+                          "items": {
+                            "type": "number"
+                          }
+                        }
+                      },
+                      "required": [
+                        "opened",
+                        "merged",
+                        "closedUnmerged",
+                        "net",
+                        "open",
+                        "cycleSeconds"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "startMs",
+                "endMs",
+                "label",
+                "partial",
+                "ticket",
+                "pr"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "ticketEvents": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "ticket": {
+                  "type": "string"
+                },
+                "atMs": {
+                  "type": "number"
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "started",
+                    "shipped",
+                    "cancelled",
+                    "movedBack",
+                    "removed"
+                  ]
+                },
+                "reachedIntake": {
+                  "type": "boolean"
+                },
+                "fromQueue": {
+                  "type": "boolean"
+                },
+                "cycleSeconds": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "repaired": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "ticket",
+                "atMs",
+                "kind",
+                "reachedIntake",
+                "cycleSeconds",
+                "repaired"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "ticketCycleEpisodes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "ticket": {
+                  "type": "string"
+                },
+                "atMs": {
+                  "type": "number"
+                },
+                "seconds": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "ticket",
+                "atMs",
+                "seconds"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "openAgeByColumn": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "prEvents": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "number": {
+                  "type": "number"
+                },
+                "atMs": {
+                  "type": "number"
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "opened",
+                    "merged",
+                    "closedUnmerged"
+                  ]
+                },
+                "cycleSeconds": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "number",
+                "atMs",
+                "kind",
+                "cycleSeconds"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "prCycleEpisodes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "number": {
+                  "type": "number"
+                },
+                "atMs": {
+                  "type": "number"
+                },
+                "seconds": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "number",
+                "atMs",
+                "seconds"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "currentTodo": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "currentOpen": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "scopeAvailability": {
+            "type": "object",
+            "properties": {
+              "tickets": {
+                "type": "object",
+                "properties": {
+                  "available": {
+                    "type": "boolean"
+                  },
+                  "reason": {
+                    "type": "string",
+                    "enum": [
+                      "ambiguous-team-scope",
+                      "ambiguous-repo-ownership"
+                    ]
+                  }
+                },
+                "required": [
+                  "available"
+                ],
+                "additionalProperties": false
+              },
+              "pullRequests": {
+                "type": "object",
+                "properties": {
+                  "available": {
+                    "type": "boolean"
+                  },
+                  "reason": {
+                    "type": "string",
+                    "enum": [
+                      "ambiguous-team-scope",
+                      "ambiguous-repo-ownership"
+                    ]
+                  }
+                },
+                "required": [
+                  "available"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "tickets",
+              "pullRequests"
+            ],
+            "additionalProperties": false
+          },
+          "coverage": {
+            "type": "object",
+            "properties": {
+              "issues": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "historyRows": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "pullRequests": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "missingCreationTimestamps": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "missingPrTimestamps": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "invalidPrDurations": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "softRemovedIssues": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "tailRepairs": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "discontinuities": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "unknownStates": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "issues",
+              "historyRows",
+              "pullRequests",
+              "missingCreationTimestamps",
+              "missingPrTimestamps",
+              "invalidPrDurations",
+              "softRemovedIssues",
+              "tailRepairs",
+              "discontinuities",
+              "unknownStates"
+            ],
+            "additionalProperties": false
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "tenant-do",
+              "clickhouse"
+            ]
+          }
+        },
+        "required": [
+          "project",
+          "period",
+          "boundary",
+          "generatedAt",
+          "columns",
+          "previousColumns",
+          "ticketEvents",
+          "ticketCycleEpisodes",
+          "openAgeByColumn",
+          "prEvents",
+          "prCycleEpisodes",
+          "currentTodo",
+          "currentOpen",
+          "scopeAvailability",
+          "coverage",
+          "source"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "securitySchemes": {
+      "bearerKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "A Catalyst API key: a person's key or the account's organization key. Which one a route needs is its `x-catalyst-auth` class."
+      },
+      "sessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__session",
+        "description": "The web app's signed-in session."
+      }
+    }
+  }
+}
