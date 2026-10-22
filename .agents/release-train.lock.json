@@ -1,11 +1,11 @@
 {
   "comment": "The release-train skill's carried files. Written by scripts/release-train-skill.mjs; never edit by hand. The source is coalesce-labs/catalyst-cloud-skills.",
   "source": "coalesce-labs/catalyst-cloud-skills",
-  "commit": "038c73431c4eae075edef3a4c70aff2a2a82a0a3",
+  "commit": "c67defe889ae8ff1348f896e738413f32d67a7a0",
   "files": [
     {
       "path": ".agents/skills/release-train/SKILL.md",
-      "sha256": "e1c1e0827c654b0e3e806c1f4d4f847d1c2e3c7c5a4e2f58cdb1e2ffa68319a0"
+      "sha256": "64b87cb6762377064000460eb0368a427b64c3336f77129ee8f1b31bc7848d27"
     },
     {
       "path": ".agents/skills/release-train/evals/README.md",
@@ -41,7 +41,7 @@
     },
     {
       "path": ".agents/skills/release-train/references/coordinated-release.md",
-      "sha256": "bf4eb08a91763f85b4c1d5faaf22bbc4e5d3045266c37f61ffa4b30ca30197a7"
+      "sha256": "a0a26c2f5fe499021889aab9c981e4b4f055838a1ce6361ba16fa5aab0e53da0"
     },
     {
       "path": ".agents/skills/release-train/scripts/train-status.mjs",
