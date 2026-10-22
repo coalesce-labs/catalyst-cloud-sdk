@@ -345,6 +345,21 @@ const recorded = await agentClient.agent.recordProxyAskAnswer({
 if (recorded.outcome === "refused") console.log(recorded.reason);
 ```
 
+A repository's Flow metrics come from `flow.series({ repo, period?, granularity? })`. `repo` is `owner/name`. `period` is one of `FLOW_PERIODS`, from `24h` to `26w`; left out, the cloud answers two weeks. `granularity` is `hour` or `day`; left out, the period picks the bucket width. Each entry of `series.columns` is one bucket with `startMs` and `endMs` (epoch milliseconds, end exclusive) and `pr.open`, the pull requests open just before the bucket ends, drafts included. `pr` is `null` when the workspace cannot attribute pull requests to the repository. The last bucket ends at `generatedAt` and is `partial`. Any other granularity is `rejected` with `error: "invalid-granularity"` and `allowed: ["hour", "day"]` before a request is sent. Hourly buckets over a long period can exceed the cloud's response budget; that answer is `rejected` with status 400 and a reason that suggests daily buckets or a shorter period.
+
+```ts
+import { createTenantClient } from "@catalyst-cloud/sdk";
+
+const client = createTenantClient({ key: process.env.CATALYST_API_KEY!, baseUrl: "https://staging.catalystcloud.dev" });
+
+const flow = await client.flow.series({ repo: "coalesce-labs/catalyst-cloud", period: "1w", granularity: "hour" });
+if (flow.outcome === "ok") {
+  for (const bucket of flow.series.columns) console.log(new Date(bucket.endMs).toISOString(), bucket.pr?.open ?? "unavailable");
+} else {
+  console.log(flow.outcome, flow.reason);
+}
+```
+
 ### Durable event cache for node and Bun
 
 `@catalyst-cloud/sdk/events` mirrors the tenant's exact durable Catalyst event backbone into an append-only local cache. It uses bounded HTTP replay with an idle backoff; local consumers tail files and never poll GitHub, Linear, or cloud tables. Start and stop it with the process that currently needs the tenant instead of installing another permanent daemon.
@@ -380,7 +395,7 @@ This API only reads the durable backbone. It does not publish events or treat ra
 | `AuthStrategy` | `{ kind: "token"; token }` (backend) or `{ kind: "cookie" }` (browser). |
 | `LiveSyncStatus` | `"connecting"` · `"live"` · `"reconnecting"` · `"resyncing"` · `"error"` · `"stopped"`. |
 | `ChangeFrame` · `EntityName` · `ChangeOp` | The change shape + the entity/op contract. |
-| `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `request()`, `issues.list/get/execution`, `pulls.list/get`, `projects.list`, `personalConnections.start/status`, `linearIdentity.get/set`, `askProxyAnswering.get/set/disown`, `cycles.list`, `search`, `workflowStages`, `changes.stream/list`, `snapshot.head`, `diagnostics.*` (workEligibility, dispatchQueue, fleetActivity, agentRoster, leaseAttributions, codingAccounts), `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept, recordProxyAskAnswer, projectRepositoryRegister, projectRepositoryRemove, message). Accepts either `key: string` or the CTC-2111 `auth: AuthStrategy`. |
+| `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `request()`, `issues.list/get/execution`, `pulls.list/get`, `projects.list`, `personalConnections.start/status`, `linearIdentity.get/set`, `askProxyAnswering.get/set/disown`, `cycles.list`, `flow.series`, `search`, `workflowStages`, `changes.stream/list`, `snapshot.head`, `diagnostics.*` (workEligibility, dispatchQueue, fleetActivity, agentRoster, leaseAttributions, codingAccounts), `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept, recordProxyAskAnswer, projectRepositoryRegister, projectRepositoryRemove, message). Accepts either `key: string` or the CTC-2111 `auth: AuthStrategy`. |
 | `TenantContract` · `routeByName` · `teamByKey` · `teamForTicket` · `stageIdForSlot` · `labelIdFor` | The contract document's shape and the pure accessors over it, each returning a typed miss rather than throwing. |
 | `TenantClientFailure` · `PageCursor` · `pageCursor` · `memoryContractCache` | The shared failure arms, the opaque page token, and the default contract cache store. |
 | `CatalystEventSync` · `readCachedEvents` · `tailCachedEvents` · `EventHistoryGapError` | Node/Bun durable-backbone replay, local cache readers, and explicit history-gap handling from `@catalyst-cloud/sdk/events`. |
