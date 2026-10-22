@@ -111,7 +111,7 @@ async function checkExactPin(plan, label, pin, name, fetcher) {
   if (!versionPattern.test(pin ?? "") || lineOf(pin) !== plan.releaseLine)
     throw new Error(`${label} must pin ${name} exactly on line ${plan.releaseLine}, not ${pin}`);
   if (!fetcher) return;
-  const response = await fetcher(`${registry}/${name.replace("/", "%2F")}/${pin}`, {
+  const response = await fetcher(`${registry}/${name.replaceAll("/", "%2F")}/${pin}`, {
     signal: AbortSignal.timeout(15000),
   });
   await response.body?.cancel();
