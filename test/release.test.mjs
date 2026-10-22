@@ -52,6 +52,15 @@ describe('registry publication visibility', () => {
     await waitForPublication(entry, 'sha512-ok', {now:() => clock, pause:async ms => {clock += ms;}, lookup:async () => clock < 420_000 ? null : 'sha512-ok', log:line => lines.push(line)});
     expect(lines).toEqual(['Registry visible after 420 s: @catalyst-cloud/sdk@0.14.0']);
   });
+  // CTC-6545 review F1 — the window is shared across packages, so a later package can start past it.
+  it('reads a package once even when the shared window has already passed', async () => {
+    let calls = 0;
+    await waitForPublication(entry, 'sha512-ok', {started:0, now:() => 900_001, pause:async () => {}, lookup:async () => { calls++; return 'sha512-ok'; }, log:() => {}});
+    expect(calls).toBe(1);
+    calls = 0;
+    await expect(waitForPublication(entry, 'sha512-ok', {started:0, now:() => 900_001, pause:async () => {}, lookup:async () => { calls++; return null; }, log:() => {}})).rejects.toThrow('900 seconds');
+    expect(calls).toBe(1);
+  });
   it('refuses incorrect bytes instead of retrying them', async () => {
     await expect(waitForPublication(entry, 'sha512-ok', {lookup:async () => 'sha512-wrong'})).rejects.toThrow('integrity mismatch');
   });

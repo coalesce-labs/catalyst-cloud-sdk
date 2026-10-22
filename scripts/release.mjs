@@ -40,7 +40,9 @@ export async function waitForPublication(entry, integrity, options = {}) {
   const started = options.started ?? now();
   const deadline = started + VISIBILITY_WINDOW_MS;
   let lastError = null;
-  while (now() < deadline) {
+  // Read at least once: a package checked after an earlier one spent the shared window may already
+  // be visible, and a window that has passed must not fail it unread.
+  for (;;) {
     let published = null;
     try {
       published = await lookup(entry.name, entry.version);
@@ -53,6 +55,7 @@ export async function waitForPublication(entry, integrity, options = {}) {
       log(`Registry visible after ${Math.round((now() - started) / 1000)} s: ${entry.name}@${entry.version}`);
       return;
     }
+    if (now() >= deadline) break;
     await pause(Math.min(5_000, Math.max(0, deadline - now())));
   }
   const cause = lastError === null ? '' : ` (last read: ${lastError.message})`;
