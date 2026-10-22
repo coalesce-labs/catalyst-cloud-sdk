@@ -1,5 +1,5 @@
 import {describe, it, expect} from 'vitest';
-import {publishedIntegrity, publicationNeeded, releaseCatalog, waitForPublication} from '../scripts/release.mjs';
+import {npmRefusedExistingVersion, publishPacked, publishedIntegrity, publicationNeeded, readPublishedIntegrity, releaseCatalog, waitForPublication} from '../scripts/release.mjs';
 
 describe('release recovery', () => {
   const entry = {name:'@catalyst-cloud/sdk', version:'0.14.0'};
@@ -63,5 +63,56 @@ describe('registry publication visibility', () => {
   });
   it('refuses incorrect bytes instead of retrying them', async () => {
     await expect(waitForPublication(entry, 'sha512-ok', {lookup:async () => 'sha512-wrong'})).rejects.toThrow('integrity mismatch');
+  });
+});
+
+describe('release rerun (CTC-6552)', () => {
+  const entry = {name:'@catalyst-cloud/sdk-replica-browser', version:'0.16.17'};
+  const timeout = () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); };
+  it('reads again when the pre-publish read times out once', async () => {
+    let calls = 0;
+    const pauses = [];
+    const integrity = await readPublishedIntegrity(entry, {lookup:async () => ++calls === 1 ? timeout() : 'sha512-ok', pause:async ms => { pauses.push(ms); }});
+    expect(integrity).toBe('sha512-ok');
+    expect(calls).toBe(2);
+    expect(pauses).toEqual([5_000]);
+  });
+  it('returns a 404 answer at once and fails only after every attempt throws', async () => {
+    let calls = 0;
+    expect(await readPublishedIntegrity(entry, {lookup:async () => { calls++; return null; }, pause:async () => {}})).toBeNull();
+    expect(calls).toBe(1);
+    calls = 0;
+    await expect(readPublishedIntegrity(entry, {lookup:async () => { calls++; timeout(); }, pause:async () => {}})).rejects.toThrow('aborted due to timeout');
+    expect(calls).toBe(4);
+  });
+  it('recognises npm refusing a version it already holds, and nothing else', () => {
+    expect(npmRefusedExistingVersion('npm error code E403\nnpm error 403 403 Forbidden - PUT https://registry.npmjs.org/@catalyst-cloud%2fsdk-replica-browser - You cannot publish over the previously published versions: 0.16.17.')).toBe(true);
+    expect(npmRefusedExistingVersion('npm error code EPUBLISHCONFLICT')).toBe(true);
+    for (const stderr of ['npm error code E401\nnpm error Unable to authenticate', 'npm error code E403\nnpm error 403 Forbidden - You do not have permission to publish', '', undefined]) {
+      expect(npmRefusedExistingVersion(stderr), String(stderr)).toBe(false);
+    }
+  });
+  it('treats a refused republish as already accepted and fails any other publish', () => {
+    const ran = result => () => ({status:1, signal:null, stderr:'', ...result});
+    const quiet = {writeErr:() => {}};
+    expect(publishPacked('pkg.tgz', {...quiet, spawn:ran({status:0})})).toBe('published');
+    expect(publishPacked('pkg.tgz', {...quiet, spawn:ran({stderr:'npm error 403 403 Forbidden - You cannot publish over the previously published versions: 0.16.17.'})})).toBe('already-accepted');
+    expect(() => publishPacked('pkg.tgz', {...quiet, spawn:ran({stderr:'npm error code E401'})})).toThrow('npm publish pkg.tgz failed with exit 1');
+    expect(() => publishPacked('pkg.tgz', {...quiet, spawn:ran({stderr:undefined})})).toThrow('failed with exit 1');
+    expect(() => publishPacked('pkg.tgz', {...quiet, spawn:ran({error:new Error('spawn npm ENOENT')})})).toThrow('spawn npm ENOENT');
+  });
+  // Review F1 on #219 — a green publish keeps npm's notices, the provenance link among them.
+  it('writes npm stderr to the log on success as well as on failure', () => {
+    const notice = 'npm notice publish Provenance statement published to transparency log: https://search.sigstore.dev/?logIndex=1\n';
+    for (const status of [0, 1]) {
+      const written = [];
+      try {
+        publishPacked('pkg.tgz', {spawn:() => ({status, signal:null, stderr:notice}), writeErr:text => written.push(text)});
+      } catch {}
+      expect(written, `status ${status}`).toEqual([notice]);
+    }
+  });
+  it('still refuses different bytes after a refused republish: the wait checks integrity', async () => {
+    await expect(waitForPublication(entry, 'sha512-new', {now:() => 0, pause:async () => {}, lookup:async () => 'sha512-old', log:() => {}})).rejects.toThrow('integrity mismatch');
   });
 });
