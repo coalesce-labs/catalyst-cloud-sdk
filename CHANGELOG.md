@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.16.16
+
+The SDK and the Node and browser replicas now use schema and replication packages 0.16.15, in which each durable event type states who may publish it. Update the SDK and both replicas together.
 
 You can now read a repository's open pull request counts over time. `flow.series({ repo, period, granularity })` takes the repository as `owner/name`, a period from `24h` to `26w`, and `hour` or `day` buckets. It returns one column per bucket with its start and end times in epoch milliseconds and its pull request counts; `pr.open` is the number open at the end of the bucket. Leave `granularity` out to keep the period's usual bucket width. Any other granularity is refused before a request is sent, with `error: "invalid-granularity"` and the allowed values. Hourly buckets over a long period can be too large for one answer; that refusal suggests daily buckets or a shorter period.
 
