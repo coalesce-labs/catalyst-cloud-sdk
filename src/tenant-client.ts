@@ -668,6 +668,79 @@ export type SnapshotHeadResult =
   | { outcome: "shape"; status: number; reason: string }
   | TenantClientFailure;
 
+// ── Flow — CTC-6367. `GET /api/v1/flow-series`, a repository's Flow metrics in hour or day buckets.
+//    The cloud models the body in its public OpenAPI document (`FlowSeries`, CTC-6365), but the
+//    latest published `@catalyst-cloud/read-model` (0.16.0, checked on npm 2026-10-22) predates the
+//    12w/26w periods and `granularity`. Same precedent as the query reads above: the SDK carries its
+//    own structural copy of the fields it names, open by Decision 4, and
+//    test/fixtures/flow-series-openapi.json pins those names to the cloud's schema. If a read-model
+//    publish carries the new periods, replace with an `import type`. ───────────────────────────────
+
+/** The windows the route accepts. Omitted, the cloud answers two weeks. */
+export const FLOW_PERIODS = ["24h", "2d", "3d", "1w", "2w", "4w", "12w", "26w"] as const;
+export type FlowPeriod = (typeof FLOW_PERIODS)[number];
+/** Bucket widths. Omitted, the period picks it: 1h for 24h, 2h for 2d, 3h for 3d, a day for weeks.
+ *  Anything else is refused before a request is sent. */
+export const FLOW_GRANULARITIES = ["hour", "day"] as const;
+export type FlowGranularity = (typeof FLOW_GRANULARITIES)[number];
+
+export interface FlowSeriesParams {
+  /** `owner/name`, exact case. */
+  repo: string;
+  period?: FlowPeriod;
+  granularity?: FlowGranularity;
+}
+
+/** One bucket's pull request counts. `open` is the number open just before the bucket ends,
+ *  drafts included. */
+export interface FlowPullRequestCounts {
+  readonly open: number;
+  readonly opened: number;
+  readonly merged: number;
+  readonly closedUnmerged: number;
+  readonly net: number;
+  readonly [key: string]: unknown;
+}
+
+/** One bucket, `[startMs, endMs)` in epoch ms. The last bucket ends at `generatedAt` and is
+ *  `partial`. */
+export interface FlowSeriesColumn {
+  readonly startMs: number;
+  readonly endMs: number;
+  readonly label: string;
+  readonly partial: boolean;
+  /** `null` when the workspace cannot attribute pull requests to this repository
+   *  (`scopeAvailability.pullRequests` says why). */
+  readonly pr: FlowPullRequestCounts | null;
+  readonly [key: string]: unknown;
+}
+
+/** `GET /api/v1/flow-series` — the SDK's own structural copy; see the section note above. */
+export interface FlowSeries {
+  readonly project: { readonly id: string; readonly name: string; readonly repo: string };
+  readonly period: FlowPeriod;
+  readonly generatedAt: number;
+  readonly columns: readonly FlowSeriesColumn[];
+  readonly [key: string]: unknown;
+}
+
+/** The client refused `granularity` without sending anything. `allowed` is every value the route
+ *  accepts. */
+export interface FlowGranularityRefusal {
+  outcome: "rejected";
+  status: 0;
+  error: "invalid-granularity";
+  /** What the caller passed. */
+  value: string;
+  allowed: readonly FlowGranularity[];
+  reason: string;
+}
+
+export type FlowSeriesResult =
+  | { outcome: "ok"; status: 200; series: FlowSeries }
+  | FlowGranularityRefusal
+  | TenantClientFailure;
+
 // ── The generic escape hatch — CTC-2132 Phase 5 ─────────────────────────────────────────────────
 
 export interface RawRequest {
@@ -1243,6 +1316,31 @@ function selectRefusal(answer: Answer): ReadSelectRefusal | null {
     allowed: Array.isArray(allowed) ? allowed.filter((a): a is string => typeof a === "string") : [],
     reason: reasonOf(answer),
   };
+}
+
+/** A Flow answer carries every field `FlowSeries` declares, so no declared field reads `undefined`.
+ *  Any other field passes untouched. `period` is checked as a string only: the cloud owns that list. */
+function isFlowSeries(body: Record<string, unknown>): boolean {
+  const project = body["project"];
+  return (
+    isRecord(project) &&
+    typeof project["id"] === "string" &&
+    typeof project["name"] === "string" &&
+    typeof project["repo"] === "string" &&
+    typeof body["period"] === "string" &&
+    Number.isFinite(body["generatedAt"]) &&
+    Array.isArray(body["columns"]) &&
+    body["columns"].every(isFlowColumn)
+  );
+}
+
+/** A Flow bucket carries its bounds, its label and partial flag, and its pull request counts, or
+ *  `pr: null` when pull requests are unavailable. */
+function isFlowColumn(value: unknown): boolean {
+  if (!isRecord(value) || !Number.isFinite(value["startMs"]) || !Number.isFinite(value["endMs"])) return false;
+  if (typeof value["label"] !== "string" || typeof value["partial"] !== "boolean") return false;
+  const pr = value["pr"];
+  return pr === null || (isRecord(pr) && ["open", "opened", "merged", "closedUnmerged", "net"].every((k) => Number.isSafeInteger(pr[k])));
 }
 
 function eventQueryCursor(value: unknown): value is EventQueryCursor {
@@ -2009,6 +2107,27 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     return r.outcome === "ok" ? { outcome: "ok", status: 200, results: r.body as SearchResults } : r;
   }
 
+  async function flowSeries(params: FlowSeriesParams): Promise<FlowSeriesResult> {
+    const { granularity } = params;
+    if (granularity !== undefined && !FLOW_GRANULARITIES.includes(granularity)) {
+      return {
+        outcome: "rejected",
+        status: 0,
+        error: "invalid-granularity",
+        value: String(granularity),
+        allowed: FLOW_GRANULARITIES,
+        reason: `flow.series(): granularity must be "hour" or "day", got ${JSON.stringify(String(granularity))}`,
+      };
+    }
+    const r = await objectRead(
+      "/api/v1/flow-series",
+      { repo: params.repo, period: params.period, granularity },
+      "GET /api/v1/flow-series",
+      isFlowSeries,
+    );
+    return r.outcome === "ok" ? { outcome: "ok", status: 200, series: r.body as FlowSeries } : r;
+  }
+
   /** Tolerant (Decision 7): accepts `{stages, source?}` OR a bare array, normalizing both — mirroring
    *  the bundle's own `fetchWorkflowStates`, which already defends against three shapes. */
   async function workflowStages(): Promise<WorkflowStagesResult> {
@@ -2587,6 +2706,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     pulls: { list: pullsList, get: pullsGet },
     projects: { list: projectsList },
     cycles: { list: cyclesList },
+    flow: { series: flowSeries },
     search,
     workflowStages,
     changes: { stream: changesStream, list: changesListFn },
@@ -2694,6 +2814,12 @@ export interface TenantClient {
   cycles: {
     /** `GET /api/v1/cycles` — the SDK's own structural row type; see {@link CycleRow}. */
     list(): Promise<CyclesListResult>;
+  };
+  flow: {
+    /** `GET /api/v1/flow-series?repo=&period=&granularity=` — a repository's Flow metrics, one
+     *  column per bucket; see {@link FlowSeries}. A granularity other than `hour` or `day` is
+     *  `rejected` with `error: "invalid-granularity"` before anything is sent. */
+    series(params: FlowSeriesParams): Promise<FlowSeriesResult>;
   };
   /** `GET /api/v1/search?q=&limit=`. */
   search(params: SearchParams): Promise<SearchResult>;

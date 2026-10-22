@@ -39,6 +39,7 @@ describe("⭐ every method on the TenantClient interface is present on a constru
       "pulls.get",
       "projects.list",
       "cycles.list",
+      "flow.series",
       "search",
       "workflowStages",
       "changes.stream",
