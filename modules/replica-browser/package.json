@@ -36,8 +36,8 @@
   },
   "dependencies": {
     "@catalyst-cloud/read-model": "^0.16.0",
-    "@catalyst-cloud/replicate": "0.16.14",
-    "@catalyst-cloud/schema": "0.16.14"
+    "@catalyst-cloud/replicate": "0.16.15",
+    "@catalyst-cloud/schema": "0.16.15"
   },
   "sideEffects": [
     "./db-worker.js"
