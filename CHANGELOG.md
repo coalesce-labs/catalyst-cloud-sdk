@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.14
+
+The SDK and the Node and browser replicas now use schema and replication packages 0.16.12, which add a case-insensitive index on pushed refs to the mirror schema. Update the SDK and both replicas together.
+
 ## 0.16.13
 
 The SDK and the Node and browser replicas now use schema and replication packages 0.16.11, which add three password-reset event types to the event registry. Update the SDK and both replicas together.
