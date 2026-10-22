@@ -1318,12 +1318,29 @@ function selectRefusal(answer: Answer): ReadSelectRefusal | null {
   };
 }
 
-/** A Flow bucket carries the three fields the SDK promises: its bounds and its open pull request
- *  count, or `pr: null` when pull requests are unavailable. Any other field passes untouched. */
+/** A Flow answer carries every field `FlowSeries` declares, so no declared field reads `undefined`.
+ *  Any other field passes untouched. `period` is checked as a string only: the cloud owns that list. */
+function isFlowSeries(body: Record<string, unknown>): boolean {
+  const project = body["project"];
+  return (
+    isRecord(project) &&
+    typeof project["id"] === "string" &&
+    typeof project["name"] === "string" &&
+    typeof project["repo"] === "string" &&
+    typeof body["period"] === "string" &&
+    Number.isFinite(body["generatedAt"]) &&
+    Array.isArray(body["columns"]) &&
+    body["columns"].every(isFlowColumn)
+  );
+}
+
+/** A Flow bucket carries its bounds, its label and partial flag, and its pull request counts, or
+ *  `pr: null` when pull requests are unavailable. */
 function isFlowColumn(value: unknown): boolean {
   if (!isRecord(value) || !Number.isFinite(value["startMs"]) || !Number.isFinite(value["endMs"])) return false;
+  if (typeof value["label"] !== "string" || typeof value["partial"] !== "boolean") return false;
   const pr = value["pr"];
-  return pr === null || (isRecord(pr) && Number.isSafeInteger(pr["open"]));
+  return pr === null || (isRecord(pr) && ["open", "opened", "merged", "closedUnmerged", "net"].every((k) => Number.isSafeInteger(pr[k])));
 }
 
 function eventQueryCursor(value: unknown): value is EventQueryCursor {
@@ -2106,7 +2123,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
       "/api/v1/flow-series",
       { repo: params.repo, period: params.period, granularity },
       "GET /api/v1/flow-series",
-      (body) => Array.isArray(body["columns"]) && body["columns"].every(isFlowColumn),
+      isFlowSeries,
     );
     return r.outcome === "ok" ? { outcome: "ok", status: 200, series: r.body as FlowSeries } : r;
   }

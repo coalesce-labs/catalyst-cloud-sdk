@@ -110,6 +110,20 @@ describe("flow.series", () => {
     }
   });
 
+  it("is a shape failure when any other field the SDK declares is missing", async () => {
+    const noProject = Object.fromEntries(Object.entries(body("1w", hourly)).filter(([key]) => key !== "project"));
+    for (const bad of [
+      { columns: [] },
+      noProject,
+      { ...body("1w", hourly), generatedAt: "now" },
+      body("1w", [{ ...column(T0, T0 + HOUR, 3), partial: "no" }]),
+      body("1w", [{ ...column(T0, T0 + HOUR, 3), pr: { open: 2 } }]),
+    ]) {
+      const { c } = client([() => json(200, bad)]);
+      expect((await c.flow.series({ repo: REPO })).outcome).toBe("shape");
+    }
+  });
+
   it("folds the budget refusal and the auth plane into the shared arms", async () => {
     const tooLarge = { error: "flow-series-too-large", reason: "Use daily buckets or a shorter period." };
     expect(await client([() => json(400, tooLarge)]).c.flow.series({ repo: REPO, period: "26w", granularity: "hour" })).toEqual({
