@@ -27,26 +27,46 @@ export function publicationNeeded(entry, packedIntegrity, registryIntegrity) {
   if (registryIntegrity !== packedIntegrity) throw new Error(`Published bytes differ for ${entry.name}@${entry.version}; bump the version instead of replacing it`);
   return false;
 }
+// CTC-6545: npm accepted every publish behind the red 0.16.12, 0.16.16 and 0.16.17 releases, and its
+// per-version document only became readable after the old 300 s window (0.16.17 read 200 by about
+// 8 minutes after its publish). A read that fails or times out is "not visible yet", never the
+// release's verdict.
+export const VISIBILITY_WINDOW_MS = 900_000;
 export async function waitForPublication(entry, integrity, options = {}) {
   const lookup = options.lookup ?? publishedIntegrity;
   const now = options.now ?? Date.now;
   const pause = options.pause ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
-  const deadline = now() + 300_000;
-  while (now() < deadline) {
-    const published = await lookup(entry.name, entry.version);
+  const log = options.log ?? console.log;
+  const started = options.started ?? now();
+  const deadline = started + VISIBILITY_WINDOW_MS;
+  let lastError = null;
+  // Read at least once: a package checked after an earlier one spent the shared window may already
+  // be visible, and a window that has passed must not fail it unread.
+  for (;;) {
+    let published = null;
+    try {
+      published = await lookup(entry.name, entry.version);
+      lastError = null;
+    } catch (error) {
+      lastError = error;
+    }
     if (published !== null) {
       if (published !== integrity) throw new Error(`Publication integrity mismatch for ${entry.name}@${entry.version}`);
+      log(`Registry visible after ${Math.round((now() - started) / 1000)} s: ${entry.name}@${entry.version}`);
       return;
     }
+    if (now() >= deadline) break;
     await pause(Math.min(5_000, Math.max(0, deadline - now())));
   }
-  throw new Error(`Registry visibility timed out after 300 seconds for ${entry.name}@${entry.version}; rerun this release`);
+  const cause = lastError === null ? '' : ` (last read: ${lastError.message})`;
+  throw new Error(`Registry visibility timed out after ${VISIBILITY_WINDOW_MS / 1000} seconds for ${entry.name}@${entry.version}${cause}; rerun this release`);
 }
 export async function release(root = process.cwd()) {
   await checkRelease({root, publish: 'sdk'});
   const catalog = releaseCatalog(root);
   if (process.env.GITHUB_EVENT_NAME === 'release' && process.env.GITHUB_REF_NAME !== `v${catalog[0].version}`) throw new Error('Release tag does not match the package version');
   const scratch = mkdtempSync(join(tmpdir(), 'catalyst-sdk-release-'));
+  const published = [];
   try {
     for (const entry of catalog) {
       const packed = JSON.parse(execFileSync('npm', ['pack', '--json', '--pack-destination', scratch], {cwd:resolve(root, entry.path), encoding:'utf8'}))[0];
@@ -66,9 +86,15 @@ export async function release(root = process.cwd()) {
         delete env.SDK_BOOTSTRAP_TOKEN;
       }
       execFileSync('npm', ['publish', join(scratch, packed.filename), '--provenance', '--access', 'public'], {cwd:root, env, stdio:'inherit'});
-      await waitForPublication(entry, packed.integrity);
-      console.log(`Verified publication: ${entry.name}@${entry.version}`);
+      published.push({entry, integrity:packed.integrity});
     }
   } finally { rmSync(scratch, {recursive:true, force:true}); }
+  // One window for every package published above, measured from the last publish, so a slow
+  // read-back on one package does not spend the job's timeout three times over.
+  const started = Date.now();
+  for (const {entry, integrity} of published) {
+    await waitForPublication(entry, integrity, {started});
+    console.log(`Verified publication: ${entry.name}@${entry.version}`);
+  }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) await release();
