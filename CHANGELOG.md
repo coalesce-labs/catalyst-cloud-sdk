@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.12
+
+The SDK and the Node and browser replicas now use schema and replication packages 0.16.10, which add a request summary event type to the event registry. Update the SDK and both replicas together.
+
 ## 0.16.11
 
 The SDK and the Node and browser replicas now use schema and replication packages 0.16.9, which add four event types to the event registry. Update the SDK and both replicas together.
