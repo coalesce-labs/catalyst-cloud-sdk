@@ -217,6 +217,15 @@ test("both published replicas pin one schema and replicate on the line, and npm 
       }),
       /schema@0\.16\.10, which is not on npm/,
     );
+    // Every pin set must name the pin: a missing one in the first set is refused, not adopted.
+    const core = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+    for (const field of ["devDependencies", "peerDependencies"]) {
+      const without = structuredClone(core);
+      delete without[field]["@catalyst-cloud/schema"];
+      await writeFile(join(root, "package.json"), JSON.stringify(without));
+      await assert.rejects(checkRelease(options), /must pin schema/);
+    }
+    await writeFile(join(root, "package.json"), JSON.stringify(core));
     for (const module of ["replica-node", "replica-browser"]) {
       for (const [id, version] of [
         ["schema", "0.15.2"],

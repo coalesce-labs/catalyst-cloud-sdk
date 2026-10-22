@@ -23,8 +23,9 @@ const lineOf = (version) => version.split(".").slice(0, 2).join(".");
 const registry = "https://registry.npmjs.org";
 
 /** CTC-6446: the declaration names the line and the members, never a member's exact patch. A copy
- *  that still carries the retired `version`/`sourceVersion` fields is read the same way, so the
- *  three repositories can drop them in any order. */
+ *  that still carries the retired `version`/`sourceVersion` fields is read the same way. The SDK and
+ *  CLI copies of this check must ship before catalyst-cloud deploys the field-free declaration: an
+ *  older check refuses a deployed copy without them. */
 export function declarationIdentity(plan) {
   return {
     releaseLine: plan.releaseLine,
@@ -215,7 +216,7 @@ export async function checkRelease(options = {}) {
       for (const [member, field] of pinSets) {
         for (const id of ["schema", "replicate"]) {
           const pin = packages[member][field]?.[`@catalyst-cloud/${id}`];
-          if ((exact[id] ??= pin) !== pin)
+          if (pin === undefined || (exact[id] ??= pin) !== pin)
             throw new Error(`${member} ${field} must pin ${id} at the SDK's one ${id} version`);
         }
         const range = packages[member][field]?.["@catalyst-cloud/read-model"] ?? "";
