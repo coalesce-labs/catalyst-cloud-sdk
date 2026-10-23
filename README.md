@@ -30,7 +30,7 @@ Use your existing credential provider for token refresh. A native desktop proces
 | `@catalyst-cloud/sdk/live` | Storage-independent WebSocket transport | None |
 | `@catalyst-cloud/sdk-replica-node` | Optional Node/Bun replica | Native SQLite |
 | `@catalyst-cloud/sdk-replica-browser` | Optional browser replica | SQLite WASM and OPFS |
-| `@catalyst-cloud/sdk/events` | Existing opt-in Node event cache | Local JSONL files |
+| `@catalyst-cloud/sdk/events` | Direct event waits and optional Node/Bun event cache | None for direct waits; local JSONL files for cache waits |
 
 `LiveSyncClient` is a change-feed transport. The caller supplies cursor and resync handlers. Importing or constructing it does not open a database. A consumer may use changes to invalidate cloud views; replay underflow requires refreshing those views and its cursor, not seeding SQL. An authoritative domain-event stream is separate from this row feed.
 
@@ -291,6 +291,8 @@ switch (moved.outcome) {
 }
 ```
 
+`client.messages.read({ ticket: "CTC-1234", since: 932140 })` reads message bodies, senders (`from`) and timestamps (`sentAt`), oldest first, at most 50 a page. `since` is the inclusive backbone sequence of the `comms.message.posted` event; omit it for the first page, then pass the returned `next` as `since` on the following read. Stop paging when `messages` is empty or `next` is `null`. An empty page can retain a numeric `next`; save it to resume when another message arrives. Use your own key: a phase session credential is refused by this read route. A ticket outside your teams returns `forbidden` with the server's reason; a server without the route returns `unsupported`.
+
 The contract cache is in memory per client by default; pass `contractCache: { get, set }` to keep it on disk (the bundle does). `fetch`, `now` and `timeoutMs` are injectable so a test never opens a socket.
 
 **CTC-2132 — the remaining routes the bundle's own transport used to reach:**
@@ -386,6 +388,85 @@ The writer fsyncs appended records before atomically advancing its cursor. On re
 
 This API only reads the durable backbone. It does not publish events or treat raw provider events, the legacy coordination feed, or analytical samples as execution or billing authority. Use the existing authorized cloud operations to report outcomes and changes.
 
+#### Waiting for events
+
+`waitForEvents` waits directly on the cloud, with its own subscription and no local cache. Its default timeout, `DEFAULT_EVENT_WAIT_TIMEOUT_MS`, is four hours. Socket keepalive and occasional replay checks keep the wait healthy; it produces no output and does not return during a silent wait. Supply a token or refreshing bearer credential. Phase session credentials can subscribe when the server admits them.
+
+```ts
+import { waitForEvents, EVENT_WAIT_EXIT_CODES } from "@catalyst-cloud/sdk/events";
+
+const result = await waitForEvents({
+  baseUrl: "https://staging.catalystcloud.dev",
+  auth: { kind: "token", token: process.env.CATALYST_API_KEY! },
+  tenantId: "workspace-1", // your workspace ID
+  filter: {
+    type: "pr.conflict.detected",
+    ref: "acme/web:feature/checkout",
+  },
+  timeoutMs: 4 * 60 * 60 * 1000,
+});
+if (result.outcome === "matched") {
+  for (const event of result.events) console.log(JSON.stringify(event));
+}
+process.exitCode = EVENT_WAIT_EXIT_CODES[result.outcome];
+```
+
+A filter needs at least one key. Values of one key are OR'ed; different keys are AND'ed. Each key accepts a string or a list of up to 50 distinct values, except `to`, which accepts only `"me"`. `events.query` accepts the same keys and sends each value separately.
+
+| Filter key | Example |
+| --- | --- |
+| `type` | `"pr.conflict.detected"` or a family prefix, `"pr.*"` |
+| `ticket` | `"CTC-1234"` |
+| `repo` | `"coalesce-labs/catalyst-cloud"` |
+| `ref` | `"acme/web:feature/checkout"` |
+| `pr` | `"coalesce-labs/catalyst-cloud#9001"` |
+| `session` | `"CTC-1234/implement#7"` |
+| `to` | `"me"`, resolved by the cloud against your credential |
+
+A direct wait checks access before opening its socket and returns the server's refusal when your key cannot reach the requested scope. After a dropped connection it replays from its cursor, waits for index coverage, and falls back to backbone replay where permitted. It reports a history gap explicitly if retained history cannot cover the cursor.
+
+A matched result contains events oldest first, up to `maxEvents` (default 100). Save its `cursor` and pass it as `after` on the next wait: later matches are delivered once. The cursor covers only events already delivered or proven absent; a capped batch leaves later events for the next call. Timeout and abort results also include the last proven cursor, which may be `null` if none was established.
+
+| Outcome | Meaning | `EVENT_WAIT_EXIT_CODES` |
+| --- | --- | --- |
+| `matched` | One or more matching events and a resume cursor | `0` |
+| `failed` | A history gap, unsupported server, invalid response, or unavailable cache; inspect `code` and `reason` | `1` |
+| `refused` | Invalid filter or refused cloud access; inspect `source`, `filter` and `reason` | `3` |
+| `timeout` | No match before the deadline; includes `waitedMs` and the resume cursor | `124` |
+| `aborted` | The caller aborted its signal; includes the resume cursor | `130` |
+
+For continuous delivery, `watchEvents({ ...options, signal })` yields matched batches from one subscription without a timeout. It finishes after yielding a refusal, failure or abort. Breaking out of the loop closes the subscription.
+
+```ts
+import { watchEvents } from "@catalyst-cloud/sdk/events";
+
+const controller = new AbortController();
+for await (const batch of watchEvents({
+  baseUrl: "https://staging.catalystcloud.dev",
+  auth: { kind: "token", token: process.env.CATALYST_API_KEY! },
+  tenantId: "workspace-1",
+  filter: { type: "comms.message.posted", ticket: "CTC-1234" },
+  signal: controller.signal,
+})) {
+  if (batch.outcome === "matched") console.log(batch.events, batch.cursor);
+  else console.error(batch);
+}
+```
+
+A key can hold at most 20 event sockets at once. To share one upstream connection among many waits, run one `CatalystEventSync` writer and use `waitForCachedEvents` for each reader:
+
+```ts
+import { waitForCachedEvents } from "@catalyst-cloud/sdk/events";
+
+const result = await waitForCachedEvents({
+  tenantId: "workspace-1",
+  filter: { type: "comms.message.posted", ticket: "CTC-1234" },
+  // directory: "/path/to/existing/event-cache", // optional override
+});
+```
+
+A cache wait reads incrementally, opens no upstream connection and never creates or writes a cache. It fails immediately with `cache-missing` or `cache-writer-stopped` when the cache or its live writer is absent. A cache holds only its retained history, so a cursor older than that history returns `history-gap`. It supports the same cursor, timeout and batch options. `to: "me"` is refused locally because only the cloud can resolve your identity; use a direct wait for that filter.
+
 ## API
 
 | Export | What it is |
@@ -395,10 +476,16 @@ This API only reads the durable backbone. It does not publish events or treat ra
 | `AuthStrategy` | `{ kind: "token"; token }` (backend) or `{ kind: "cookie" }` (browser). |
 | `LiveSyncStatus` | `"connecting"` · `"live"` · `"reconnecting"` · `"resyncing"` · `"error"` · `"stopped"`. |
 | `ChangeFrame` · `EntityName` · `ChangeOp` | The change shape + the entity/op contract. |
-| `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `request()`, `issues.list/get/execution`, `pulls.list/get`, `projects.list`, `personalConnections.start/status`, `linearIdentity.get/set`, `askProxyAnswering.get/set/disown`, `cycles.list`, `flow.series`, `search`, `workflowStages`, `changes.stream/list`, `snapshot.head`, `diagnostics.*` (workEligibility, dispatchQueue, fleetActivity, agentRoster, leaseAttributions, codingAccounts), `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept, recordProxyAskAnswer, projectRepositoryRegister, projectRepositoryRemove, message). Accepts either `key: string` or the CTC-2111 `auth: AuthStrategy`. |
+| `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `request()`, `issues.list/get/execution`, `pulls.list/get`, `projects.list`, `personalConnections.start/status`, `linearIdentity.get/set`, `askProxyAnswering.get/set/disown`, `cycles.list`, `flow.series`, `search`, `workflowStages`, `changes.stream/list`, `events.query/pages`, `messages.read`, `snapshot.head`, `diagnostics.*` (workEligibility, dispatchQueue, fleetActivity, agentRoster, leaseAttributions, codingAccounts), `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept, recordProxyAskAnswer, projectRepositoryRegister, projectRepositoryRemove, message). Accepts either `key: string` or the CTC-2111 `auth: AuthStrategy`. |
 | `TenantContract` · `routeByName` · `teamByKey` · `teamForTicket` · `stageIdForSlot` · `labelIdFor` | The contract document's shape and the pure accessors over it, each returning a typed miss rather than throwing. |
 | `TenantClientFailure` · `PageCursor` · `pageCursor` · `memoryContractCache` | The shared failure arms, the opaque page token, and the default contract cache store. |
 | `CatalystEventSync` · `readCachedEvents` · `tailCachedEvents` · `EventHistoryGapError` | Node/Bun durable-backbone replay, local cache readers, and explicit history-gap handling from `@catalyst-cloud/sdk/events`. |
+| `waitForEvents` · `watchEvents` · `waitForCachedEvents` | One-shot and continuous filtered waits from `@catalyst-cloud/sdk/events`. |
+| `EventWaitOptions` · `EventWatchOptions` · `EventWaitResult` · `WaitedEvent` · `CachedEventWaitOptions` | Wait inputs, event batches and typed terminal outcomes from `@catalyst-cloud/sdk/events`. |
+| `DEFAULT_EVENT_WAIT_TIMEOUT_MS` · `EVENT_WAIT_EXIT_CODES` | Four-hour default and outcome-to-exit-code mapping from `@catalyst-cloud/sdk/events`. |
+| `EventScopeFilter` · `EventScopeFilterInput` · `checkEventFilter` · `eventScopeKeys` · `matchesEventFilter` · `matchesEventType` | Shared filter grammar, scope derivation and matching from `@catalyst-cloud/sdk/events`. |
+| `EventFilterKey` · `EventFilterCheck` · `EventScopeKeys` · `EVENT_FILTER_MAX_VALUES` · `eventFilterSocketParams` · `eventFilterQueryParams` | Filter validation types, limits and serialization from `@catalyst-cloud/sdk/events`. |
+| `MessagesReadParams` · `MessagesReadResult` · `AgentMessageRecord` | Message read inputs, results and records from the package root. |
 
 `start()` resolves only when `stop()` is called. On a backend, `await` it to keep the process alive; in a browser, never await it — just call `stop()` on teardown.
 

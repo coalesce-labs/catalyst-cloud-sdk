@@ -1,4 +1,17 @@
 import {
+  EventHistoryGapError,
+  EventSyncHttpError,
+  parseEvent,
+  readCurrentHead,
+  readPage,
+} from "./events-backbone.js";
+export { EventHistoryGapError, eventIdentity } from "./events-backbone.js";
+import {
+  cacheSegmentIndex,
+  compareCacheSegments,
+  isCacheSegment,
+} from "./events-cache-reader.js";
+import {
   mkdir,
   open,
   readFile,
@@ -36,14 +49,11 @@ export {
   type EventsSocketState,
 } from "./events-socket.js";
 
-const HEAD_HEADER = "x-catalyst-event-backbone-head-seq";
 const MAX_EVENT_LINE_BYTES = 1024 * 1024;
-const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_IDLE_MIN_MS = 5_000;
 const DEFAULT_IDLE_MAX_MS = 30_000;
 const DEFAULT_RETAIN_DAYS = 7;
 const DEFAULT_MAX_CACHE_BYTES = 256 * 1024 * 1024;
-const SEGMENT_PATTERN = /^\d{4}-\d{2}-\d{2}(?:-\d{3})?\.jsonl$/;
 /** Backbone pages one catch-up may read before handing back to the loop. */
 const MAX_CATCH_UP_PAGES = 20;
 
@@ -103,25 +113,6 @@ export interface EventSyncResult {
   head: number;
 }
 
-export class EventHistoryGapError extends Error {
-  constructor(
-    message: string,
-    readonly head: number,
-    readonly resumeFrom: number,
-    readonly reason: string,
-  ) {
-    super(message);
-    this.name = "EventHistoryGapError";
-  }
-}
-
-class EventSyncHttpError extends Error {
-  constructor(readonly status: number) {
-    super(`event sync: backbone returned ${status}`);
-    this.name = "EventSyncHttpError";
-  }
-}
-
 export function defaultEventCacheDirectory(tenantId: string): string {
   const state =
     (globalThis as { process?: { env?: Record<string, string | undefined> } })
@@ -139,67 +130,6 @@ export function eventCachePaths(
     cursor: join(root, "cursor.json"),
     lock: join(root, ".sync"),
   };
-}
-
-function positiveInteger(value: unknown, name: string): number {
-  if (
-    (typeof value !== "string" && typeof value !== "number") ||
-    String(value).trim() === ""
-  )
-    throw new Error(`event sync: invalid ${name}`);
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 0)
-    throw new Error(`event sync: invalid ${name}`);
-  return parsed;
-}
-
-function parseEvent(value: unknown): CatalystEvent {
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    throw new Error("event sync: invalid event");
-  const event = value as Partial<CatalystEvent>;
-  if (
-    typeof event.tenantId !== "string" ||
-    !Number.isSafeInteger(event.sequence) ||
-    (event.sequence ?? -1) < 0 ||
-    typeof event.eventId !== "string" ||
-    typeof event.type !== "string" ||
-    !Number.isSafeInteger(event.schemaVersion) ||
-    typeof event.recordedAt !== "string" ||
-    !("payload" in event)
-  )
-    throw new Error("event sync: invalid event");
-  return event as CatalystEvent;
-}
-
-async function readNdjson(
-  response: Response,
-): Promise<Array<{ event: CatalystEvent; line: string }>> {
-  if (!response.body) return [];
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let pending = "";
-  const rows: Array<{ event: CatalystEvent; line: string }> = [];
-  const consume = (line: string) => {
-    if (!line) return;
-    if (new TextEncoder().encode(line).byteLength > MAX_EVENT_LINE_BYTES)
-      throw new Error("event sync: event line exceeds 1 MiB");
-    rows.push({ event: parseEvent(JSON.parse(line)), line });
-  };
-  for (;;) {
-    const { done, value } = await reader.read();
-    pending += decoder.decode(value, { stream: !done });
-    let newline = pending.indexOf("\n");
-    while (newline >= 0) {
-      consume(pending.slice(0, newline));
-      pending = pending.slice(newline + 1);
-      newline = pending.indexOf("\n");
-    }
-    if (pending.length > MAX_EVENT_LINE_BYTES)
-      throw new Error("event sync: event line exceeds 1 MiB");
-    if (done) break;
-  }
-  if (pending) consume(pending);
-  return rows;
 }
 
 function segmentName(date: Date, index = 0): string {
@@ -246,8 +176,8 @@ async function readCursor(path: string): Promise<CursorState | null> {
 
 async function repairTail(directory: string): Promise<number | null> {
   const segments = (await readdir(directory))
-    .filter((name) => SEGMENT_PATTERN.test(name))
-    .sort();
+    .filter(isCacheSegment)
+    .sort(compareCacheSegments);
   for (const name of segments.reverse()) {
     const path = join(directory, name);
     const bytes = await readFile(path);
@@ -272,10 +202,11 @@ async function retainBoundedSegments(
   maxBytes: number,
   current: string,
   floor: number,
+  publishFloor: (floor: number) => Promise<void>,
 ): Promise<number> {
   const segments = (await readdir(directory))
-    .filter((name) => SEGMENT_PATTERN.test(name))
-    .sort();
+    .filter(isCacheSegment)
+    .sort(compareCacheSegments);
   const sizes = new Map<string, number>();
   for (const name of segments)
     sizes.set(name, (await stat(join(directory, name))).size);
@@ -296,6 +227,9 @@ async function retainBoundedSegments(
     const last = lines.at(-1);
     if (last) floor = Math.max(floor, parseEvent(JSON.parse(last)).sequence);
   }
+  // A reader may open segments while retention runs. Publish the conservative floor before
+  // removing any bytes, so its checkpoint recheck cannot prove a range whose files disappeared.
+  if (remove.length > 0) await publishFloor(floor);
   await Promise.all(
     remove.map((name) => rm(join(directory, name), { force: true })),
   );
@@ -312,9 +246,11 @@ async function appendBoundedRows(
     throw new Error("event sync: maxCacheBytes must be at least 1 MiB");
   const day = date.toISOString().slice(0, 10);
   const existing = (await readdir(directory))
-    .filter((name) => name.startsWith(day) && SEGMENT_PATTERN.test(name))
-    .sort();
-  let index = existing.length === 0 ? 0 : existing.length - 1;
+    .filter((name) => name.startsWith(day) && isCacheSegment(name))
+    .sort(compareCacheSegments);
+  const latest = existing.at(-1);
+  // Retention removes old files, so their count cannot identify the current segment.
+  let index = latest === undefined ? 0 : cacheSegmentIndex(latest);
   let name = segmentName(date, index);
   let size = 0;
   try {
@@ -366,7 +302,6 @@ function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
 
 export class CatalystEventSync {
   readonly paths: EventCachePaths;
-  private readonly fetchImpl: typeof fetch;
   private readonly now: () => Date;
   private readonly sleeper: (ms: number, signal: AbortSignal) => Promise<void>;
   private lock: WriterLockHandle | null = null;
@@ -388,7 +323,6 @@ export class CatalystEventSync {
 
   constructor(private readonly options: EventSyncOptions) {
     this.paths = eventCachePaths(options.tenantId, options.directory);
-    this.fetchImpl = options.fetch ?? fetch;
     this.now = options.now ?? (() => new Date());
     this.sleeper = options.sleep ?? abortableSleep;
   }
@@ -438,7 +372,8 @@ export class CatalystEventSync {
       this.recoveredCursor = cursor;
     }
     // Every sequence through a pushed frame's `through` was scanned, events or not.
-    if (result.through !== null && result.through > cursor) cursor = result.through;
+    if (result.through !== null && result.through > cursor)
+      cursor = result.through;
     this.floor = await retainBoundedSegments(
       this.paths.directory,
       now,
@@ -446,6 +381,8 @@ export class CatalystEventSync {
       maxCacheBytes,
       segment,
       this.floor,
+      (floor) =>
+        writeJsonAtomic(this.paths.cursor, { version: 1, cursor, floor }),
     );
     await writeJsonAtomic(this.paths.cursor, {
       version: 1,
@@ -532,7 +469,10 @@ export class CatalystEventSync {
           await this.sleeper(idle, signal);
         } else {
           // While the socket is live a wait costs no request, so wait the longest; a frame ends it early.
-          await this.waitForChange(this.socket?.state === "live" ? maxIdle : idle, signal);
+          await this.waitForChange(
+            this.socket?.state === "live" ? maxIdle : idle,
+            signal,
+          );
         }
       }
     } catch (error) {
@@ -561,7 +501,10 @@ export class CatalystEventSync {
     if (socket.hasPending() || this.needsCatchUp(socket)) return true;
     const waker = new AbortController();
     const woke = socket.changed(waker.signal).then(() => true);
-    const slept = this.sleeper(maxMs, AbortSignal.any([signal, waker.signal])).then(
+    const slept = this.sleeper(
+      maxMs,
+      AbortSignal.any([signal, waker.signal]),
+    ).then(
       () => false,
       (error: unknown) => {
         if (signal.aborted) throw error;
@@ -599,7 +542,10 @@ export class CatalystEventSync {
   }
 
   private needsCatchUp(socket: EventsChannelClient): boolean {
-    return socket.state === "live" && (socket.generation !== this.syncedGeneration || this.catchUpPending);
+    return (
+      socket.state === "live" &&
+      (socket.generation !== this.syncedGeneration || this.catchUpPending)
+    );
   }
 
   /**
@@ -639,7 +585,8 @@ export class CatalystEventSync {
         const page = await this.readPage(cursor, signal);
         pages++;
         rows.push(...page.rows);
-        if (page.rows.length > 0) cursor = page.rows[page.rows.length - 1]!.event.sequence;
+        if (page.rows.length > 0)
+          cursor = page.rows[page.rows.length - 1]!.event.sequence;
         head = Math.max(head, page.head);
         if (page.rows.length === 0 || cursor >= page.head) break;
         if (pages >= MAX_CATCH_UP_PAGES) {
@@ -668,12 +615,17 @@ export class CatalystEventSync {
       const frame = frames[index]!;
       if (frame.through <= cursor) continue;
       const fresh = frame.events.filter(
-        (value) => ((value as { sequence?: unknown } | null)?.sequence as number) > cursor,
+        (value) =>
+          ((value as { sequence?: unknown } | null)?.sequence as number) >
+          cursor,
       );
       if (
         frame.gap ||
         frame.after > cursor ||
-        fresh.some((value) => (value as { payloadOmitted?: unknown }).payloadOmitted === true)
+        fresh.some(
+          (value) =>
+            (value as { payloadOmitted?: unknown }).payloadOmitted === true,
+        )
       )
         return { cursor, rows, broken: true, rest: frames.slice(index + 1) };
       for (const value of fresh) {
@@ -690,67 +642,12 @@ export class CatalystEventSync {
     return { cursor, rows, broken: false, rest: [] };
   }
 
-  private async request(since: number, signal: AbortSignal): Promise<Response> {
-    const timeout = AbortSignal.timeout(
-      this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-    );
-    const token =
-      this.options.auth.kind === "token"
-        ? this.options.auth.token
-        : await this.options.auth.getToken();
-    return this.fetchImpl(
-      `${this.options.baseUrl.replace(/\/$/, "")}/api/v1/events/backbone?since=${since}`,
-      {
-        headers: { authorization: `Bearer ${token}` },
-        signal: AbortSignal.any([signal, timeout]),
-      },
-    );
+  private readCurrentHead(signal: AbortSignal): Promise<number> {
+    return readCurrentHead(this.options, signal);
   }
 
-  private async readCurrentHead(signal: AbortSignal): Promise<number> {
-    const response = await this.request(Number.MAX_SAFE_INTEGER, signal);
-    if (response.status !== 409) throw new EventSyncHttpError(response.status);
-    const body = (await response.json()) as Record<string, unknown>;
-    if (body.error !== "cursor_ahead_of_head")
-      throw new Error("event sync: head bootstrap contract mismatch");
-    return positiveInteger(body.resumeFrom, "bootstrap cursor");
-  }
-
-  private async readPage(
-    cursor: number,
-    signal: AbortSignal,
-  ): Promise<{
-    head: number;
-    rows: Array<{ event: CatalystEvent; line: string }>;
-  }> {
-    const response = await this.request(cursor, signal);
-    if (!response.ok && response.status !== 409)
-      throw new EventSyncHttpError(response.status);
-    const head = positiveInteger(
-      response.headers.get(HEAD_HEADER),
-      "head header",
-    );
-    if (response.status === 409) {
-      const body = (await response.json()) as Record<string, unknown>;
-      throw new EventHistoryGapError(
-        "event sync: durable history has a gap",
-        head,
-        positiveInteger(body.resumeFrom, "resume cursor"),
-        typeof body.reason === "string"
-          ? body.reason
-          : String(body.error ?? "cursor_refused"),
-      );
-    }
-    const rows = await readNdjson(response);
-    let previous = cursor;
-    for (const row of rows) {
-      if (row.event.tenantId !== this.options.tenantId)
-        throw new Error("event sync: tenant mismatch");
-      if (row.event.sequence <= previous)
-        throw new Error("event sync: non-monotonic sequence");
-      previous = row.event.sequence;
-    }
-    return { head, rows };
+  private readPage(cursor: number, signal: AbortSignal) {
+    return readPage(this.options, cursor, signal);
   }
 }
 
@@ -781,8 +678,8 @@ export async function readCachedEvents(
   let names: string[];
   try {
     names = (await readdir(directory))
-      .filter((name) => SEGMENT_PATTERN.test(name))
-      .sort();
+      .filter(isCacheSegment)
+      .sort(compareCacheSegments);
   } catch (error) {
     if ((error as { code?: string }).code === "ENOENT") return [];
     throw error;
@@ -838,6 +735,32 @@ export async function* tailCachedEvents(
   }
 }
 
-export function eventIdentity(event: CatalystEvent): string {
-  return JSON.stringify([event.tenantId, event.sequence, event.eventId]);
-}
+export {
+  checkEventFilter,
+  matchesEventFilter,
+  matchesEventType,
+  eventScopeKeys,
+  eventFilterSocketParams,
+  eventFilterQueryParams,
+  EVENT_FILTER_MAX_VALUES,
+  type EventScopeFilter,
+  type EventScopeFilterInput,
+  type EventFilterKey,
+  type EventFilterCheck,
+  type EventScopeKeys,
+} from "./event-filter.js";
+export {
+  waitForEvents,
+  watchEvents,
+  DEFAULT_EVENT_WAIT_TIMEOUT_MS,
+  EVENT_WAIT_EXIT_CODES,
+  type EventWaitOptions,
+  type EventWatchOptions,
+  type EventWaitResult,
+  type WaitedEvent,
+} from "./events-wait.js";
+
+export {
+  waitForCachedEvents,
+  type CachedEventWaitOptions,
+} from "./events-cache-wait.js";
