@@ -619,6 +619,42 @@ describe("the seed is bounded and supersedable (CTC-114 review, Ks9)", () => {
     expect(c.statuses.at(-1)).toBe("error");
   });
 
+  it("the default idle bound waits 150 s for a silent /snapshot before aborting (CTC-6569)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal("navigator", {});
+      vi.stubGlobal("WebSocket", undefined);
+      // Headers arrive, then the body sends nothing, and no snapshotIdleTimeoutMs is passed.
+      stubFetch((_url, init) => stalledResponse((init as RequestInit).signal));
+      const worker = new FakeWorker({
+        open: undefined,
+        getCursor: null,
+        seedBegin: undefined,
+        seedAbort: undefined,
+      });
+      const c = collect();
+      const replica = new BrowserReplica(c.handlers, opts({
+        createWorker: () => worker as unknown as Worker,
+      }));
+      const started = replica.start();
+      let settled = false;
+      started.then(
+        () => (settled = true),
+        () => (settled = true),
+      );
+
+      // The server may spend up to 120 s preparing a large workspace's snapshot (a 30 s default
+      // aborted it); a stream silent for the whole 150 s window is still treated as dead.
+      await vi.advanceTimersByTimeAsync(149_000);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(started).rejects.toThrow();
+      expect(c.statuses.at(-1)).toBe("error");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("close() aborts an in-flight seed", async () => {
     vi.stubGlobal("navigator", {});
     vi.stubGlobal("WebSocket", undefined);

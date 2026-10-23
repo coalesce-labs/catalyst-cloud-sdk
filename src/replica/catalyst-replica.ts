@@ -269,7 +269,9 @@ export interface CatalystReplicaOptions {
    * a half-open /snapshot connection (the fleet-incident network profile) previously hung the fetch /
    * body read forever, wedging the client in "resyncing" with no socket and no timers (restart-only).
    * On abort the seed rejects and the transport retries through the normal backoff path. Default
-   * `30_000`; `0` disables.
+   * `150_000`: the server may spend up to 120 s preparing a large workspace's snapshot before it
+   * sends the response headers, and a 30 s default aborted nearly every such seed (CTC-6569).
+   * `0` disables.
    */
   snapshotIdleTimeoutMs?: number;
   /** Transport-level TOTAL-duration backstop on any reseed (CTC-281): ms the LiveSyncClient waits for
@@ -1296,7 +1298,7 @@ export class CatalystReplica {
         // The idle (NO-PROGRESS) deadline: (re)armed before the fetch and on every body chunk, so a
         // big-but-flowing seed never trips it while a silent half-open connection always does.
         // Unref'd — the timer must never itself hold the process open.
-        const idleMs = this.opts.snapshotIdleTimeoutMs ?? 30_000;
+        const idleMs = this.opts.snapshotIdleTimeoutMs ?? 150_000;
         let idleTimer: ReturnType<typeof setTimeout> | null = null;
         const clearIdle = (): void => {
           if (idleTimer != null) {

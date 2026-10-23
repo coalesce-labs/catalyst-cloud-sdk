@@ -1144,6 +1144,91 @@ describe("CatalystReplica bounded teardown + seed abort (CTC-281)", () => {
     expect(sockets).toHaveLength(0); // it failed FAST; the supervisor owns the restart policy
   });
 
+  it("the default snapshotIdleTimeoutMs outlasts the server's 120 s snapshot preparation: headers at 120 s still seed (CTC-6569)", async () => {
+    vi.useFakeTimers();
+    const enc = new TextEncoder();
+    const body = [
+      JSON.stringify({
+        accountId: "tenant-0",
+        entity: "issues",
+        op: "upsert",
+        row: { id: "i1", identifier: "CTC-1", title: "slow to prepare", updated_at: 1 },
+      }) + "\n",
+      JSON.stringify({ accountId: "tenant-0", cursor: 7 }) + "\n",
+    ];
+    // The server answers only after its full 120 s preparation cap. A 30 s default aborted here.
+    const fetchImpl = ((_url: string, init?: { signal?: AbortSignal }) =>
+      new Promise<Response>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const line of body) controller.enqueue(enc.encode(line));
+              controller.close();
+            },
+          });
+          resolve(new Response(stream, { status: 200 }));
+        }, 120_000);
+        init?.signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(init.signal?.reason);
+        });
+      })) as unknown as typeof fetch;
+
+    const { sockets, factory } = recordingFactory();
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl,
+        wsFactory: factory,
+      }),
+    );
+    const started = replica.start();
+    started.catch(() => {});
+    await vi.advanceTimersByTimeAsync(120_001);
+
+    expect(sockets).toHaveLength(1); // the seed completed and the transport moved on to /connect
+    sockets[0]!.fireOpen();
+    await started;
+    expect(replica.cursor).toBe(7);
+  });
+
+  it("the default snapshotIdleTimeoutMs still aborts a /snapshot that sends nothing for 150 s (CTC-6569)", async () => {
+    vi.useFakeTimers();
+    const fetchImpl = ((_url: string, init?: { signal?: AbortSignal }) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+      })) as unknown as typeof fetch;
+
+    const { sockets, factory } = recordingFactory();
+    const replica = track(
+      new CatalystReplica({
+        baseUrl: BASE,
+        account: "tenant-0",
+        auth: { kind: "cookie" },
+        dbPath: ":memory:",
+        engine: nodeSqliteEngine,
+        fetchImpl,
+        wsFactory: factory,
+      }),
+    );
+    const started = replica.start();
+    let settled = false;
+    started.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+
+    await vi.advanceTimersByTimeAsync(149_000);
+    expect(settled).toBe(false); // still waiting inside the default bound
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(started).rejects.toThrow(/no progress for 150000ms/);
+    expect(sockets).toHaveLength(0);
+  });
+
   it("snapshotIdleTimeoutMs is an IDLE bound, not a total-duration one: a slow-but-progressing seed completes", async () => {
     vi.useFakeTimers();
     const rows = [1, 2, 3, 4].map(

@@ -52,9 +52,11 @@ const CLOSE_GRACE_MS = 250;
  * How long the seed tolerates NO PROGRESS before aborting. IDLE, never total duration: a legitimate
  * ~100 MB snapshot streams for minutes, and the node replica rejects a total cap for exactly that
  * reason. The timer re-arms before the fetch, on response headers, and on every body chunk — so this
- * only fires when the server has genuinely stopped sending.
+ * only fires when the server has genuinely stopped sending. 150 s because the server may spend up to
+ * 120 s preparing a large workspace's snapshot before it sends the response headers; a 30 s default
+ * aborted nearly every such seed (CTC-6569).
  */
-const DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS = 30_000;
+const DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS = 150_000;
 
 /**
  * How long a SEED's worker RPC may go unanswered before the worker is declared dead (CTC-114 review
@@ -211,7 +213,7 @@ export interface BrowserReplicaOptions {
   /** Disable the Web Locks single-owner gate (NOT recommended — see browser-lock.ts). */
   disableLock?: boolean;
   /**
-   * Abort the seed after this many ms with NO PROGRESS. Default 30s; `0` disables.
+   * Abort the seed after this many ms with NO PROGRESS. Default 150s; `0` disables.
    *
    * Idle, never total duration — a legitimate ~100 MB snapshot streams for minutes, so a total cap
    * would kill real seeds. Without any bound a stalled `/snapshot` never settles `start()`, every read
@@ -756,7 +758,7 @@ export class BrowserReplica {
      * It re-armed on body chunks alone, so it stayed armed across every `seedBatch` RPC and — the
      * sharp case — across the final `seedCommit`, which runs after the body is fully consumed and so
      * can never be re-armed by progress. A commit of a ~100 MB snapshot on slow or background-
-     * throttled OPFS that crossed the 30s bound aborted a seed whose stream was perfectly healthy;
+     * throttled OPFS that crossed the then-30s bound aborted a seed whose stream was perfectly healthy;
      * the post-stream re-check then reported a snapshot that had ALREADY COMMITTED as "seed
      * superseded", so the client threw it away and re-fetched. On a big corpus that can fail to
      * converge at all. This restores what DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS already documents: "this
@@ -764,8 +766,8 @@ export class BrowserReplica {
      *
      * Taking the network timer down leaves the WORKER unbounded on its own — which is why `call()`
      * now applies a separate, much longer deadline to every RPC (rounds 6-9). One number could not
-     * serve both: 30s of network silence means a dead server, while 30s inside a `seedCommit` can be
-     * honest work. See {@link DEFAULT_WORKER_RPC_TIMEOUT_MS}.
+     * serve both: long network silence means a dead server, while the same wait inside a `seedCommit`
+     * can be honest work. See {@link DEFAULT_WORKER_RPC_TIMEOUT_MS}.
      */
     const seedCall = async (req: ReplicaRequest): Promise<unknown> => {
       clearIdle();
