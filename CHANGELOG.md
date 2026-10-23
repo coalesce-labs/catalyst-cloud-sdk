@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.16.19
+
+You can now wait for the events that matter to one branch, pull request, phase session or person, for hours, without polling. `waitForEvents({ filter, timeoutMs })` in `@catalyst-cloud/sdk/events` holds one connection and returns as soon as a matching event arrives, or at the timeout, with a cursor to resume from. Filters take an event type or a family such as `pr.*`, a ticket, a repository (`owner/name`), a branch (`owner/name:branch`), a pull request (`owner/name#n`), a phase session (`TICKET/phase#n`) and `to: "me"`. A filter outside your teams is refused before the wait starts, with the reason. After a dropped connection the wait replays what it missed, and each event is delivered once. `watchEvents` keeps delivering on the same connection, and `waitForCachedEvents` waits on the local event cache so many waits share one connection. `events.query` takes the same keys.
+
+`messages.read({ ticket, since })` reads the messages sent to a ticket on your teams: body, sender and time.
+
+Requires a Catalyst Cloud server that offers these event filters and the message read.
+
 ## 0.16.18
 
 The Node and browser replicas now wait up to 150 seconds, instead of 30, for a full snapshot to start sending before they give up and retry. The server can spend up to two minutes preparing a large workspace's snapshot, so with the old default a replica on a large workspace could abort almost every first sync and never catch up. The bound is still an idle bound: it restarts whenever data arrives, and a snapshot that sends nothing for 150 seconds is still abandoned and retried.
