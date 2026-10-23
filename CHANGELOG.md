@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.16.18
+
+The Node and browser replicas now wait up to 150 seconds, instead of 30, for a full snapshot to start sending before they give up and retry. The server can spend up to two minutes preparing a large workspace's snapshot, so with the old default a replica on a large workspace could abort almost every first sync and never catch up. The bound is still an idle bound: it restarts whenever data arrives, and a snapshot that sends nothing for 150 seconds is still abandoned and retried.
+
+If you already pass `snapshotIdleTimeoutMs`, nothing changes for you. Update the SDK and both replicas together.
+
 ## 0.16.17
 
 The SDK and the Node and browser replicas now use schema and replication packages 0.16.16, which add two telemetry point types for environment setup: one when a setup run completes or fails, with its duration, and one when a saved setup snapshot is restored or refused. Update the SDK and both replicas together.
