@@ -679,13 +679,25 @@ describe("direct event waits", () => {
     expect(sequences(await result)).toEqual([5003]);
     expect(new URL(run.urls[0] ?? "").searchParams.get("to")).toBe("me");
   });
-  it("uses the first frame's after when a credential cannot probe the backbone head", async () => {
+  it("replays the connect window from the preflight when a credential cannot probe the backbone head", async () => {
     const run = setup();
+    run.cloud.state.backboneStatus = 403;
+    const result = launch(run);
+    const ws = await live(run);
+    run.cloud.state.events = [conflict(5003), conflict(5006)];
+    run.cloud.state.coverage = 5006;
+    ws.deliver(frame(5005, 5006, [conflict(5006)]));
+    expect(await result).toMatchObject({ outcome: "matched", cursor: 5006 });
+    expect(sequences(await result)).toEqual([5003, 5006]);
+  });
+  it("uses the first frame's after when there is neither a head probe nor a preflight position", async () => {
+    const run = setup({}, -1);
     run.cloud.state.backboneStatus = 403;
     const result = launch(run);
     const ws = await live(run);
     ws.deliver(frame(5005, 5006, [conflict(5006)]));
     expect(await result).toMatchObject({ outcome: "matched", cursor: 5006 });
+    expect(sequences(await result)).toEqual([5006]);
   });
   it("a retained index gap fails with its resume cursor when the backbone is unavailable", async () => {
     const run = setup({ after: 5000 }, 6000);

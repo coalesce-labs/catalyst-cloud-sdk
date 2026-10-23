@@ -561,7 +561,9 @@ class Follower {
       const batch = this.socket.take();
       if (batch.overflowed) yield* this.replay(await this.head());
       for (const frame of batch.frames) {
-        this.cursor ??= frame.after;
+        // Without a head probe, start from the preflight's proven position so the connect window
+        // (fallback, frame.after] is replayed through the index instead of skipped.
+        this.cursor ??= this.fallback ?? frame.after;
         if (frame.through <= this.cursor) continue;
         if (
           frame.gap ||
