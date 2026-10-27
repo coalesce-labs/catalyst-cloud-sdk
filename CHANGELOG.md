@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.20
+
+The SDK and the Node and browser replicas now use schema and replication packages 0.16.17. Update the SDK and both replicas together.
+
 ## 0.16.19
 
 You can now wait for the events that matter to one branch, pull request, phase session or person, for hours, without polling. `waitForEvents({ filter, timeoutMs })` in `@catalyst-cloud/sdk/events` holds one connection and returns as soon as a matching event arrives, or at the timeout, with a cursor to resume from. Filters take an event type or a family such as `pr.*`, a ticket, a repository (`owner/name`), a branch (`owner/name:branch`), a pull request (`owner/name#n`), a phase session (`TICKET/phase#n`) and `to: "me"`. A filter outside your teams is refused before the wait starts, with the reason. After a dropped connection the wait replays what it missed, and each event is delivered once. `watchEvents` keeps delivering on the same connection, and `waitForCachedEvents` waits on the local event cache so many waits share one connection. `events.query` takes the same keys.

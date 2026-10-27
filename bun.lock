@@ -6,8 +6,8 @@
       "name": "@catalyst-cloud/sdk",
       "devDependencies": {
         "@catalyst-cloud/read-model": "^0.16.0",
-        "@catalyst-cloud/replicate": "0.16.16",
-        "@catalyst-cloud/schema": "0.16.16",
+        "@catalyst-cloud/replicate": "0.16.17",
+        "@catalyst-cloud/schema": "0.16.17",
         "@opentelemetry/api": "^1.9.0",
         "@opentelemetry/context-async-hooks": "^2.8.0",
         "@opentelemetry/resources": "^2.8.0",
@@ -22,8 +22,8 @@
       },
       "peerDependencies": {
         "@catalyst-cloud/read-model": "^0.16.0",
-        "@catalyst-cloud/replicate": "0.16.16",
-        "@catalyst-cloud/schema": "0.16.16",
+        "@catalyst-cloud/replicate": "0.16.17",
+        "@catalyst-cloud/schema": "0.16.17",
         "@opentelemetry/api": ">=1.3.0 <2",
         "@sqlite.org/sqlite-wasm": "*",
         "better-sqlite3": "*",
@@ -41,9 +41,9 @@
   "packages": {
     "@catalyst-cloud/read-model": ["@catalyst-cloud/read-model@0.16.0", "", {}, "sha512-sKYeS5+BAxYIeWezeLaKmjRkUO0BHh5SwAD9zPB5Zv2G2iXHR73deQF5gMGTGspEb41bb8TIIHxKnRr9gsdtmA=="],
 
-    "@catalyst-cloud/replicate": ["@catalyst-cloud/replicate@0.16.16", "", { "dependencies": { "@catalyst-cloud/schema": "0.16.16" } }, "sha512-Gc08VVDziuoKjJ6IKiwATEo+wJ2i6+1u6gaMkBtcFGCjnJa3Ciq4CUOW0CGORQY1TRSGDfeHgGA0LpOuHRQVKQ=="],
+    "@catalyst-cloud/replicate": ["@catalyst-cloud/replicate@0.16.17", "", { "dependencies": { "@catalyst-cloud/schema": "0.16.17" } }, "sha512-+2p+3wuZvVp/mW/Y3J6j3fU6gZPHR/Q5zTHOZuq/pMPuWaZ2smO4QqjtK4bo6vDg8Tq6nCFyvbZPSL+FIx9FfQ=="],
 
-    "@catalyst-cloud/schema": ["@catalyst-cloud/schema@0.16.16", "", { "dependencies": { "drizzle-orm": "0.45.2" } }, "sha512-UL9y199vGxWai0I0FVuVs2XAlwX2CFvS1ZX/CT0yehpkE01IIw9LR1eXTSdAQdQGt5T0elCodb5RqLdnKZao0Q=="],
+    "@catalyst-cloud/schema": ["@catalyst-cloud/schema@0.16.17", "", { "dependencies": { "drizzle-orm": "0.45.2" } }, "sha512-ABI9TUp3OpLqcO3/Ymgs8avHRskKxX0YoO5BiIWa5W5e+V3IbZ1Z8IwR583xONNCyMgZeeHfyvgf90DtyhLs5g=="],
 
     "@esbuild/aix-ppc64": ["@esbuild/aix-ppc64@0.28.2", "", { "os": "aix", "cpu": "ppc64" }, "sha512-XExcO+dvLKvVtNTibSTBej1NCAbaGhWn9Ww1ZPx80qsahhPFe/8jgWP0IchNe0F3HwkU7n8ejhH8bjonqht8mQ=="],
 
