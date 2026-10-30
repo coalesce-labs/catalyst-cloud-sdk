@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.21
+
+The SDK and the Node and browser replicas now use schema and replication packages 0.16.18. Update the SDK and both replicas together.
+
 ## 0.16.20
 
 The SDK and the Node and browser replicas now use schema and replication packages 0.16.17. Update the SDK and both replicas together.
