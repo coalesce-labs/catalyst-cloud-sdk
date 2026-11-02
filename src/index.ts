@@ -219,6 +219,42 @@ export {
   type ProjectRepositoryRemoveResult,
 } from "./tenant-client.js";
 
+// CTC-8872 — the ticket lease client: take, renew, release, read and list a seat's ticket leases
+// over the cloud's literal /api/v1/agent/ticket-lease(s) routes. A store refusal resolves as a
+// result value on `outcome`; an HTTP failure throws `TicketLeaseHttpError` with the server's status
+// and code. The wire types restate the cloud's private protocol package's lease.ts (holder details
+// included), pinned against the committed fixture in test/fixtures/.
+export {
+  createTicketLeaseClient,
+  TicketLeaseHttpError,
+  type TicketLeaseClient,
+  type TicketLeaseClientOptions,
+  type TicketLeaseHolderKind,
+  type TicketLeaseHolderDetailsInput,
+  type TicketLeaseHolderOwner,
+  type TicketLeaseHolderDetails,
+  type TicketLeaseRowWire,
+  type SeatTicketLeaseRowWire,
+  type TicketLeaseDelegationWire,
+  type TicketLeaseOccupiedWire,
+  type TicketLeaseRefusalReasonWire,
+  type TicketLeaseRefusedWire,
+  type SeatTicketLeaseRefusedWire,
+  type TicketLeaseStatusWire,
+  type TicketLeaseHandoff,
+  type ReadTicketLeaseResponse,
+  type ListTicketLeasesParams,
+  type ListTicketLeasesResponse,
+  type SeatTicketLeaseIdentity,
+  type TakeSeatTicketLeaseParams,
+  type SeatTicketLeaseProgress,
+  type RenewSeatTicketLeaseParams,
+  type ReleaseSeatTicketLeaseParams,
+  type TakeSeatTicketLeaseResponse,
+  type RenewSeatTicketLeaseResponse,
+  type ReleaseSeatTicketLeaseResponse,
+} from "./ticket-lease-client.js";
+
 export {
   CONTRACT_ROUTE,
   TENANT_CONTRACT_KEYS,
