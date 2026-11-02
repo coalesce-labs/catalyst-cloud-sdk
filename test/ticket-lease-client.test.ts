@@ -30,8 +30,10 @@ const KEY = "ctc_acct_writer";
 const TAKE_URL = `${BASE}/api/v1/agent/ticket-lease/take`;
 
 // A JSON import widens every string literal, so the fixture cannot assign to the response unions
-// directly. The cast only names the declared shapes for compile-time use; every body is also driven
-// through the client's own runtime guards by the transport tests below, which is the real pin.
+// directly (TS2322 on `outcome`). The cast only names the declared shapes for compile-time use;
+// every body is also driven through the client's own runtime guards by the transport tests below,
+// which is the real pin. Tracked by CTC-8872; swap for `@catalyst-cloud/protocol` types when
+// published.
 const fixture = fixtureJson as unknown as {
   takeTaken: TakeSeatTicketLeaseResponse;
   takeRefusedHeld: TakeSeatTicketLeaseResponse;
@@ -206,6 +208,9 @@ describe("HTTP failures throw TicketLeaseHttpError", () => {
   });
 
   it("keeps the deadline armed through body reading", async () => {
+    // A real Response cannot hang mid-body, so this double is the only way to prove the abort
+    // signal stays honored while the body is read; it rejects with the signal's own reason, which
+    // the client must propagate unwrapped. Tracked by CTC-8872.
     const slowBody: typeof fetch = (_input, init) =>
       Promise.resolve({
         ok: true,
@@ -505,9 +510,11 @@ describe("root exports and the protocol-derived types", () => {
   });
 
   it("rejects an invalid progress kind and a mistyped detail at compile time", () => {
-    // @ts-expect-error "deploy" is not a progress kind
+    // Deliberate compile-time negative cases (CTC-8872 type fixture): each @ts-expect-error is
+    // asserted unused by tsc — the error is the test.
+    // @ts-expect-error CTC-8872: "deploy" is not a progress kind
     const badProgress: SeatTicketLeaseProgress = { kind: "deploy", ref: "15901" };
-    // @ts-expect-error displayName must be a string
+    // @ts-expect-error CTC-8872: displayName must be a string
     const badDetail: TicketLeaseHolderDetailsInput = { kind: "factory", displayName: 7 };
     expect(badProgress.ref).toBe("15901");
     expect(badDetail.kind).toBe("factory");

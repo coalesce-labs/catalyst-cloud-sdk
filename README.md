@@ -410,7 +410,7 @@ try {
 }
 ```
 
-`list` returns one page; pass `nextCursor` back unchanged for the next. Pages sort by lease deadline, which moves on renew, so a page boundary can repeat or skip a lease that renewed between reads. Each call makes exactly one request. This requires a Catalyst Cloud server that offers ticket lease holder details and the team lease list.
+`list` returns one page; pass `nextCursor` back unchanged for the next. Pages sort by lease deadline, which moves on renew, so a page boundary can repeat or skip a lease that renewed between reads. Each call makes exactly one request. This requires a Catalyst Cloud server that offers ticket lease holder details and the team lease list (contract 2.65).
 
 ### Durable event cache for node and Bun
 
