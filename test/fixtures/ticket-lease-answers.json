@@ -1,0 +1,347 @@
+{
+  "takeTaken": {
+    "outcome": "taken",
+    "lease": {
+      "ticket": "CTC-6480",
+      "holder": "seat:key_factory:factory-droid",
+      "lastHolder": null,
+      "generation": 1,
+      "deadlineMs": 1793441036221,
+      "hardDeadlineMs": 1793522036221,
+      "acquiredAtMs": 1793439236221,
+      "lastProgress": null,
+      "lastProgressAtMs": null,
+      "holderDetails": {
+        "kind": "factory",
+        "displayName": "factory-droid",
+        "sessionUrl": null,
+        "externalId": null,
+        "contact": null,
+        "owner": {
+          "type": "organization-key",
+          "keyId": "key_factory",
+          "keyName": "factory-trial"
+        },
+        "declared": true,
+        "generation": 1,
+        "recordedAtMs": 1793439236221
+      }
+    },
+    "minted": true,
+    "adopted": []
+  },
+  "takeRefusedHeld": {
+    "outcome": "refused",
+    "refusal": {
+      "reason": "ticket_lease_held",
+      "current": {
+        "ticket": "CTC-6480",
+        "holder": "seat:key_review:review-2",
+        "lastHolder": "seat:key_factory:factory-droid",
+        "generation": 3,
+        "deadlineMs": 1793439836221,
+        "hardDeadlineMs": 1793522636221,
+        "acquiredAtMs": 1793437436221,
+        "lastProgress": "pr:15893",
+        "lastProgressAtMs": 1793438636221,
+        "holderDetails": {
+          "kind": "claude-code",
+          "displayName": "review-2",
+          "sessionUrl": "https://claude.ai/code/abc",
+          "externalId": null,
+          "contact": "https://linear.app/coalesce-labs/profiles/ryan",
+          "owner": {
+            "type": "person",
+            "userId": "user_2f9c",
+            "name": "Ryan"
+          },
+          "declared": true,
+          "generation": 3,
+          "recordedAtMs": 1793437436221
+        }
+      },
+      "occupied": null,
+      "retryAtMs": 1793439836221
+    },
+    "code": "operation_refused",
+    "reason": "request refused"
+  },
+  "takeRejectedContact": {
+    "outcome": "rejected",
+    "code": "holder_contact_invalid",
+    "field": "contact",
+    "reason": "holder contact must be a link to linear.app, github.com or app.slack.com, not an email"
+  },
+  "renewRenewed": {
+    "outcome": "renewed",
+    "lease": {
+      "ticket": "CTC-6480",
+      "holder": "seat:key_factory:factory-droid",
+      "lastHolder": "seat:key_review:review-2",
+      "generation": 2,
+      "deadlineMs": 1793441636221,
+      "hardDeadlineMs": 1793522636221,
+      "acquiredAtMs": 1793439236221,
+      "lastProgress": "pr:15901",
+      "lastProgressAtMs": 1793439836221,
+      "holderDetails": {
+        "kind": "factory",
+        "displayName": "factory-droid",
+        "sessionUrl": null,
+        "externalId": "s_91aa",
+        "contact": null,
+        "owner": {
+          "type": "organization-key",
+          "keyId": "key_factory",
+          "keyName": "factory-trial"
+        },
+        "declared": true,
+        "generation": 2,
+        "recordedAtMs": 1793439836221
+      }
+    }
+  },
+  "renewRefusedStale": {
+    "outcome": "refused",
+    "refusal": {
+      "reason": "stale_generation",
+      "current": {
+        "ticket": "CTC-6480",
+        "holder": "seat:key_factory:factory-droid",
+        "lastHolder": "seat:key_review:review-2",
+        "generation": 3,
+        "deadlineMs": 1793441636221,
+        "hardDeadlineMs": 1793522636221,
+        "acquiredAtMs": 1793439236221,
+        "lastProgress": "pr:15901",
+        "lastProgressAtMs": 1793439836221,
+        "holderDetails": {
+          "kind": "factory",
+          "displayName": "factory-droid",
+          "sessionUrl": null,
+          "externalId": "s_91aa",
+          "contact": null,
+          "owner": {
+            "type": "organization-key",
+            "keyId": "key_factory",
+            "keyName": "factory-trial"
+          },
+          "declared": true,
+          "generation": 3,
+          "recordedAtMs": 1793439836221
+        }
+      },
+      "occupied": null,
+      "retryAtMs": null
+    },
+    "code": "operation_refused",
+    "reason": "request refused"
+  },
+  "renewRejectedKindChanged": {
+    "outcome": "rejected",
+    "code": "holder_kind_changed",
+    "field": "kind",
+    "reason": "holder kind cannot change within a generation"
+  },
+  "releaseReleased": {
+    "outcome": "released",
+    "lease": {
+      "ticket": "CTC-6480",
+      "holder": "seat:key_factory:factory-droid",
+      "lastHolder": "seat:key_review:review-2",
+      "generation": 3,
+      "deadlineMs": 1793441636221,
+      "hardDeadlineMs": 1793522636221,
+      "acquiredAtMs": 1793439236221,
+      "lastProgress": "pr:15901",
+      "lastProgressAtMs": 1793439836221,
+      "holderDetails": {
+        "kind": "factory",
+        "displayName": "factory-droid",
+        "sessionUrl": null,
+        "externalId": "s_91aa",
+        "contact": null,
+        "owner": {
+          "type": "organization-key",
+          "keyId": "key_factory",
+          "keyName": "factory-trial"
+        },
+        "declared": true,
+        "generation": 3,
+        "recordedAtMs": 1793439836221
+      }
+    }
+  },
+  "readNeverLeased": {
+    "ticket": "CTC-6480",
+    "lease": null,
+    "delegations": [],
+    "lastHandoff": null
+  },
+  "readLive": {
+    "ticket": "CTC-6480",
+    "lease": {
+      "holder": "seat:key_factory:factory-droid",
+      "lastHolder": "seat:key_review:review-2",
+      "generation": 2,
+      "live": true,
+      "deadlineMs": 1793441636221,
+      "hardDeadlineMs": 1793522636221,
+      "acquiredAtMs": 1793439236221,
+      "lastProgress": "pr:15901",
+      "lastProgressAtMs": 1793439836221,
+      "retryAtMs": 1793441636221,
+      "holderDetails": {
+        "kind": "factory",
+        "displayName": "factory-droid",
+        "sessionUrl": null,
+        "externalId": "s_91aa",
+        "contact": null,
+        "owner": {
+          "type": "organization-key",
+          "keyId": "key_factory",
+          "keyName": "factory-trial"
+        },
+        "declared": true,
+        "generation": 2,
+        "recordedAtMs": 1793439836221
+      },
+      "lastHolderDetails": {
+        "kind": "claude-code",
+        "displayName": "review-2",
+        "sessionUrl": "https://claude.ai/code/abc",
+        "externalId": null,
+        "contact": "https://linear.app/coalesce-labs/profiles/ryan",
+        "owner": {
+          "type": "person",
+          "userId": "user_2f9c",
+          "name": "Ryan"
+        },
+        "declared": true,
+        "generation": 1,
+        "recordedAtMs": 1793437436221
+      }
+    },
+    "delegations": [
+      {
+        "ticket": "CTC-6480",
+        "delegationGeneration": 1,
+        "ticketGeneration": 2,
+        "executor": "review-2",
+        "phase": "validate",
+        "createdAtMs": 1793439836221,
+        "revokedAtMs": null
+      }
+    ],
+    "lastHandoff": {
+      "generation": 1,
+      "completedStage": "implement",
+      "nextStage": "validate",
+      "headSha": "405a0b4702336c859051fbd96cb953980d7bc0f3",
+      "digest": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "byteLength": 512,
+      "recordedAtMs": 1793439836221,
+      "body": "Handoff: implementation complete, plan criteria met."
+    }
+  },
+  "listLive": {
+    "team": "CTC",
+    "state": "live",
+    "leases": [
+      {
+        "ticket": "CTC-6480",
+        "holder": "seat:key_factory:factory-droid",
+        "lastHolder": "seat:key_review:review-2",
+        "generation": 2,
+        "live": true,
+        "deadlineMs": 1793441636221,
+        "hardDeadlineMs": 1793522636221,
+        "acquiredAtMs": 1793439236221,
+        "lastProgress": "pr:15901",
+        "lastProgressAtMs": 1793439836221,
+        "retryAtMs": 1793441636221,
+        "holderDetails": {
+          "kind": "factory",
+          "displayName": "factory-droid",
+          "sessionUrl": null,
+          "externalId": "s_91aa",
+          "contact": null,
+          "owner": {
+            "type": "organization-key",
+            "keyId": "key_factory",
+            "keyName": "factory-trial"
+          },
+          "declared": true,
+          "generation": 2,
+          "recordedAtMs": 1793439836221
+        },
+        "lastHolderDetails": null
+      },
+      {
+        "ticket": "CTC-6477",
+        "holder": "seat:key_ops:ops-runner",
+        "lastHolder": null,
+        "generation": 1,
+        "live": true,
+        "deadlineMs": 1793441000000,
+        "hardDeadlineMs": 1793522600000,
+        "acquiredAtMs": 1793439200000,
+        "lastProgress": "commit:405a0b4702336c859051fbd96cb953980d7bc0f3",
+        "lastProgressAtMs": 1793439500000,
+        "retryAtMs": 1793441000000,
+        "holderDetails": {
+          "kind": "catalyst-runner",
+          "displayName": "ops-runner",
+          "sessionUrl": null,
+          "externalId": null,
+          "contact": null,
+          "owner": {
+            "type": "person",
+            "userId": "user_2f9c",
+            "name": null
+          },
+          "declared": true,
+          "generation": 1,
+          "recordedAtMs": 1793439200000
+        },
+        "lastHolderDetails": null
+      },
+      {
+        "ticket": "CTC-6476",
+        "holder": null,
+        "lastHolder": "seat:key_review:review-2",
+        "generation": 4,
+        "live": true,
+        "deadlineMs": 1793440500000,
+        "hardDeadlineMs": 1793522500000,
+        "acquiredAtMs": 1793438700000,
+        "lastProgress": "finding:2214598701",
+        "lastProgressAtMs": 1793439100000,
+        "retryAtMs": 1793440500000,
+        "holderDetails": null,
+        "lastHolderDetails": {
+          "kind": "claude-code",
+          "displayName": "review-2",
+          "sessionUrl": "https://claude.ai/code/abc",
+          "externalId": null,
+          "contact": null,
+          "owner": {
+            "type": "person",
+            "userId": "user_2f9c",
+            "name": "Ryan"
+          },
+          "declared": true,
+          "generation": 4,
+          "recordedAtMs": 1793438700000
+        }
+      }
+    ],
+    "nextCursor": null
+  },
+  "listRecentNext": {
+    "team": "CTC",
+    "state": "recent",
+    "leases": [],
+    "nextCursor": "opaque+/="
+  }
+}

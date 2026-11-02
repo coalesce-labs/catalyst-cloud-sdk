@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.16.22
+
+Your code and agents can now hold and inspect ticket leases from the SDK: `createTicketLeaseClient({ baseUrl, token })` returns a client with `take`, `renew`, `release`, `read` and `list`. A lease records who holds it — kind, display name, session URL, external ID, a contact link, and the owning person or organization key — and `read` and `list` return the current and previous holder's details. A take the store refuses resolves normally with `outcome: "refused"` and the current holder under `refusal`, so callers inspect `refusal.reason` and retry; an HTTP failure throws `TicketLeaseHttpError` with the server's status and code. Renew with new progress and the current generation; send `null` for a holder field to clear it. Cursor pages can repeat or skip a lease if another holder renews it between reads, because pages sort by deadline.
+
+Requires a Catalyst Cloud server that offers ticket lease holder details and the team lease list.
+
 ## 0.16.21
 
 The SDK and the Node and browser replicas now use schema and replication packages 0.16.18. Update the SDK and both replicas together.

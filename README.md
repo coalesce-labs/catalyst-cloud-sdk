@@ -362,6 +362,56 @@ if (flow.outcome === "ok") {
 }
 ```
 
+### Ticket leases — take, renew, release, read and list
+
+`createTicketLeaseClient` wraps the cloud's ticket lease routes for agents and other seat holders. Call `take` to claim a ticket. A refused result is a normal answer, not an error: inspect `refusal.reason` and the current holder before retrying. Renew with new progress and the current generation. Release with that generation when finished. Read one ticket or list one team to inspect holders. HTTP failures throw `TicketLeaseHttpError` with the server's status and code.
+
+```ts
+import { createTicketLeaseClient, TicketLeaseHttpError } from "@catalyst-cloud/sdk";
+
+const leases = createTicketLeaseClient({
+  baseUrl: "https://staging.catalystcloud.dev",
+  token: process.env.CATALYST_CLOUD_TOKEN!,
+  // fetch and timeoutMs are optional; timeoutMs defaults to 15 s.
+});
+
+const taken = await leases.take({
+  ticket: "CTC-6480",
+  agent: "factory-droid",
+  holderDetails: { kind: "factory" },
+});
+if (taken.outcome === "taken") {
+  console.log(taken.lease.holderDetails?.owner); // the server derives the owner from the credential
+} else {
+  console.log(taken.refusal.reason, taken.refusal.current?.holderDetails); // e.g. ticket_lease_held
+}
+
+const renewed = await leases.renew({
+  ticket: "CTC-6480",
+  agent: "factory-droid",
+  generation: taken.outcome === "taken" ? taken.lease.generation : 0,
+  progress: { kind: "pr", ref: "15901" },
+  holderDetails: { externalId: "s_91aa", contact: null }, // a value replaces, null clears, omitted stays
+});
+await leases.release({ ticket: "CTC-6480", agent: "factory-droid", generation: renewed.outcome === "renewed" ? renewed.lease.generation : 0 });
+
+const read = await leases.read("CTC-6480"); // lease is null when never leased; holderDetails/lastHolderDetails survive
+const page = await leases.list({ team: "CTC" }); // state "live" (default) or "recent", optional limit and cursor
+```
+
+Holder details are what the holder declared and the server accepted: kind, display name, session URL, external ID, a contact link, plus the owner the server derives from the credential (a client-sent owner is ignored). A lease taken before the server recorded details, or held through a route that does not declare them, reads `holderDetails: null`. Validation failures — an email where a link is required, an unknown kind, a kind change mid-generation — throw:
+
+```ts
+try {
+  await leases.take({ ticket: "CTC-6480", agent: "factory-droid", holderDetails: { kind: "factory", contact: "ops@example.com" } });
+} catch (error) {
+  if (error instanceof TicketLeaseHttpError) console.log(error.status, error.code, error.field); // 400 holder_contact_invalid contact
+  else throw error;
+}
+```
+
+`list` returns one page; pass `nextCursor` back unchanged for the next. Pages sort by lease deadline, which moves on renew, so a page boundary can repeat or skip a lease that renewed between reads. Each call makes exactly one request. This requires a Catalyst Cloud server that offers ticket lease holder details and the team lease list.
+
 ### Durable event cache for node and Bun
 
 `@catalyst-cloud/sdk/events` mirrors the tenant's exact durable Catalyst event backbone into an append-only local cache. It uses bounded HTTP replay with an idle backoff; local consumers tail files and never poll GitHub, Linear, or cloud tables. Start and stop it with the process that currently needs the tenant instead of installing another permanent daemon.
@@ -478,6 +528,7 @@ A cache wait reads incrementally, opens no upstream connection and never creates
 | `ChangeFrame` · `EntityName` · `ChangeOp` | The change shape + the entity/op contract. |
 | `createTenantClient` | The typed HTTP client — `contract()`, `me()`, `request()`, `issues.list/get/execution`, `pulls.list/get`, `projects.list`, `personalConnections.start/status`, `linearIdentity.get/set`, `askProxyAnswering.get/set/disown`, `cycles.list`, `flow.series`, `search`, `workflowStages`, `changes.stream/list`, `events.query/pages`, `messages.read`, `snapshot.head`, `diagnostics.*` (workEligibility, dispatchQueue, fleetActivity, agentRoster, leaseAttributions, codingAccounts), `agent.*` (issueState, issueLabel, issueComment, issueCreate, reaction, attachment, attachments, session, ask, askAccept, recordProxyAskAnswer, projectRepositoryRegister, projectRepositoryRemove, message). Accepts either `key: string` or the CTC-2111 `auth: AuthStrategy`. |
 | `TenantContract` · `routeByName` · `teamByKey` · `teamForTicket` · `stageIdForSlot` · `labelIdFor` | The contract document's shape and the pure accessors over it, each returning a typed miss rather than throwing. |
+| `createTicketLeaseClient` · `TicketLeaseHttpError` | The ticket lease client — `take({ ticket, agent, holderDetails? })`, `renew({ …, generation, progress })`, `release({ …, generation })`, `read(ticket)`, `list({ team, state?, limit?, cursor? })` from the package root. Store refusals resolve on `outcome`; HTTP failures throw with the server's status and code. |
 | `TenantClientFailure` · `PageCursor` · `pageCursor` · `memoryContractCache` | The shared failure arms, the opaque page token, and the default contract cache store. |
 | `CatalystEventSync` · `readCachedEvents` · `tailCachedEvents` · `EventHistoryGapError` | Node/Bun durable-backbone replay, local cache readers, and explicit history-gap handling from `@catalyst-cloud/sdk/events`. |
 | `waitForEvents` · `watchEvents` · `waitForCachedEvents` | One-shot and continuous filtered waits from `@catalyst-cloud/sdk/events`. |
