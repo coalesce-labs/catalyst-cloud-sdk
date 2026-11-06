@@ -6,6 +6,7 @@ import {
   type WorkerCore,
 } from "../../src/replica/browser/worker-core.js";
 import { buildOpenedReplica } from "../../src/replica/browser/ports.js";
+import type { ReplicaRequest } from "../../src/replica/browser/protocol.js";
 import type {
   IssueFacetCount,
   IssueScope,
@@ -791,14 +792,12 @@ describe("scoped reads (CTC-6150)", () => {
   it("an unknown facet dimension rejects", async () => {
     const core = await openCore();
     await seed(core, []);
-    await expect(
-      core.handle({
-        type: "queryIssueFacetCounts",
-        scope: { teamId: "team-ctc" },
-        // A caller outside the type system (JS, or a newer web build) can send any string.
-        dimension: "nonsense" as unknown as "project",
-      }),
-    ).rejects.toThrow(/unknown facet dimension/);
+    // A message that crosses postMessage is untyped: JS, or a newer web build, can send any string. The
+    // JSON round trip models that, where a cast would only silence the compiler.
+    const wire: ReplicaRequest = JSON.parse(
+      '{"type":"queryIssueFacetCounts","scope":{"teamId":"team-ctc"},"dimension":"nonsense"}',
+    );
+    await expect(core.handle(wire)).rejects.toThrow(/unknown facet dimension/);
   });
 
   it("a scope carrying waitingOn.excludeSql rejects, for both ops", async () => {

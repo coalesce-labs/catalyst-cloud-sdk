@@ -295,7 +295,12 @@ Measure p50 for both ops at the scenario sizes through `WorkerCore.handle`, and 
 
 #### Manual Verification:
 
-- [ ] In a browser (the web dev build, or a scratch page bundling `@catalyst-cloud/sdk/browser` with the db-worker subpath) holding a seeded 20,000-issue replica, time `await replica.queryIssuesScoped(...)` and `await replica.queryIssueFacetCounts(...)` from the main thread with `performance.now()` over 50 calls each. Record the p50 values, which include the Worker round trip and OPFS, in the PR description against the 10 ms and 25 ms targets.
+- [x] In a browser (the web dev build, or a scratch page bundling `@catalyst-cloud/sdk/browser` with the db-worker subpath) holding a seeded 20,000-issue replica, time `await replica.queryIssuesScoped(...)` and `await replica.queryIssueFacetCounts(...)` from the main thread with `performance.now()` over 50 calls each. Record the p50 values, which include the Worker round trip and OPFS, in the PR description against the 10 ms and 25 ms targets.
+  - Done in headless Chrome 147 on a scratch page (outside the repo) bundling `dist/browser.js` and the db-worker, seeded by streaming a 20,000-issue `/snapshot` into the real Worker and OPFS (6,000 in team CTC; 12 projects; 300 with no project). 200 calls after 20 warmups, from the main thread.
+  - `queryIssuesScoped`, limit 100: p50 4.3 ms and p95 8.7 ms with the label on 120 issues; p50 5.8 ms and p95 9.0 ms with it on 1,500. Target 10 ms.
+  - `queryIssueFacetCounts` (project, team CTC): p50 4.3 ms and p95 6.2 ms (4.5 and 6.2 in the second run). Target 25 ms. It returned 13 groups, the last `{ key: null, name: null, count: 300 }`.
+  - For comparison, the existing unscoped `queryIssues(100)` read p50 3.2 to 3.3 ms in the same pages.
+  - The keyset builder met its target at both densities, so the offset fallback in decision 3 was not needed.
 
 ---
 
@@ -335,6 +340,8 @@ None beyond the existing `release:check` and `test:pack`. This phase changes doc
 ### Overview
 
 Publish the SDK release that scenario 3 starts from, and hand the catalyst-cloud half to that repository.
+
+> **Status (implement run, 2026-11-06): version files NOT bumped.** `train-status.mjs` exited 2 (`declared line: Command failed: gh api repos/coalesce-labs/catalyst-cloud/contents/packages/types/src/install-block.ts?ref=main`, the container's token cannot read catalyst-cloud). The release-train skill says exit 2 is not a pass and to stop and ask, so `package.json`, `modules/replica-node/package.json` and `modules/replica-browser/package.json` stay at 0.16.23. Observed, not a substitute for the check: every member read 0.16.x, this repository's `release-train.json` declares `0.16` and `aligned`, and `npm run release:check` passes. The CHANGELOG already carries the `## 0.16.24` entry (Phase 4). CTC-5078 was also not re-checked: the `catalyst-dev:linearis` skill is not available in this container, and bare `linearis` is not allowed. To finish, a person (or a run that can read catalyst-cloud) runs train-status, confirms CTC-5078, then applies steps 3 to 5 below.
 
 ### Tests First (Red):
 
