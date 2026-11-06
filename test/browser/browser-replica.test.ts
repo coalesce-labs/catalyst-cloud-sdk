@@ -9,6 +9,7 @@ import type {
   Envelope,
   ReplicaResponse,
 } from "../../src/replica/browser/protocol.js";
+import type { IssueScope } from "@catalyst-cloud/read-model";
 
 // CTC-114 — the main-thread client shell, driven against a FAKE worker (the real worker logic is
 // covered by worker-core.test.ts over real sqlite-wasm). What is pinned here is the client's own
@@ -1266,4 +1267,177 @@ describe("a queue overflow quiesces the socket and never stays latched (CTC-114 
     ).not.toThrow();
     expect(() => new BrowserReplica(c.handlers, opts({}))).not.toThrow();
   });
+});
+
+// CTC-6150 — queryIssuesScoped and queryIssueFacetCounts, the client half. The worker half (what the
+// ops return) is pinned in worker-core.test.ts; here the FAKE worker pins the envelope the client
+// posts, that a null project id survives, and that both reads are bounded like the other reads.
+describe("BrowserReplica scoped reads (CTC-6150)", () => {
+  const scope: IssueScope = { teamId: "team-ctc", labelId: "l-mirror" };
+
+  /** A started replica over a warm fake worker (no seed), answering `answers`. */
+  async function warmReplica(
+    answers: Record<string, unknown>,
+    over: Partial<BrowserReplicaOptions> = {},
+    silentFor: readonly string[] = [],
+  ) {
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("WebSocket", undefined);
+    const worker = new FakeWorker(
+      { open: undefined, getCursor: 42, close: undefined, ...answers },
+      {},
+      silentFor,
+    );
+    const replica = new BrowserReplica(
+      collect().handlers,
+      opts({ createWorker: () => worker as unknown as Worker, ...over }),
+    );
+    await replica.start();
+    return { worker, replica };
+  }
+
+  const lastRequest = (worker: FakeWorker) => worker.received.at(-1)?.request;
+
+  it("queryIssuesScoped posts the scope, limit, cursor and sort, and resolves with the page", async () => {
+    const page = { rows: [{ id: "c3" }], nextCursor: { updatedAt: "300", id: "c3" } };
+    const { worker, replica } = await warmReplica({ queryIssuesScoped: page });
+
+    const got = await replica.queryIssuesScoped(scope, { limit: 50 });
+
+    expect(got).toBe(page);
+    expect(lastRequest(worker)).toEqual({
+      type: "queryIssuesScoped",
+      scope,
+      limit: 50,
+      after: undefined,
+      sort: undefined,
+    });
+
+    const after = { updatedAt: "300", id: "c3" };
+    await replica.queryIssuesScoped(scope, { after, sort: "priority" });
+    expect(lastRequest(worker)).toEqual({
+      type: "queryIssuesScoped",
+      scope,
+      limit: undefined,
+      after,
+      sort: "priority",
+    });
+
+    await replica.queryIssuesScoped(scope); // opts are optional
+    expect(lastRequest(worker)).toMatchObject({ type: "queryIssuesScoped", scope });
+    replica.close();
+  });
+
+  it("queryIssueFacetCounts posts the scope and dimension, and resolves with the counts", async () => {
+    const counts = [
+      { key: "p1", name: "Project 1", count: 4 },
+      { key: null, name: null, count: 300 },
+    ];
+    const { worker, replica } = await warmReplica({ queryIssueFacetCounts: counts });
+
+    const got = await replica.queryIssueFacetCounts(scope, "project");
+
+    expect(got).toBe(counts);
+    expect(lastRequest(worker)).toEqual({
+      type: "queryIssueFacetCounts",
+      scope,
+      dimension: "project",
+    });
+    replica.close();
+  });
+
+  it("a projectId: null scope reaches the worker as null, not dropped", async () => {
+    const { worker, replica } = await warmReplica({
+      queryIssuesScoped: { rows: [], nextCursor: null },
+      queryIssueFacetCounts: [],
+    });
+
+    await replica.queryIssuesScoped({ teamId: "team-ctc", projectId: null });
+    await replica.queryIssueFacetCounts({ teamId: "team-ctc", projectId: null }, "label");
+
+    const posted = worker.received.slice(-2).map((e) => e.request) as { scope: IssueScope }[];
+    for (const request of posted) {
+      expect(request.scope.projectId).toBeNull();
+      expect("projectId" in request.scope).toBe(true);
+    }
+    replica.close();
+  });
+
+  it("a worker error reply rejects the call with its message", async () => {
+    const { replica } = await warmReplica({
+      queryIssueFacetCounts: new Error("unknown facet dimension: nonsense"),
+    });
+    await expect(replica.queryIssueFacetCounts(scope, "project")).rejects.toThrow(
+      /unknown facet dimension/,
+    );
+    replica.close();
+  });
+
+  it("a scoped read the worker never answers is bounded once no seed is in flight", async () => {
+    // The same deadline the other reads get (CTC-114 round 10): a wedged worker must not leave the
+    // web's filtered list pending forever.
+    const { worker, replica } = await warmReplica(
+      {},
+      { workerRpcTimeoutMs: 40 },
+      ["queryIssuesScoped", "queryIssueFacetCounts"],
+    );
+
+    await expect(replica.queryIssuesScoped(scope)).rejects.toThrow(/wedged/);
+    expect(worker.terminated).toBe(true);
+  }, 15_000);
+
+  it("a facet read the worker never answers is bounded too", async () => {
+    const { worker, replica } = await warmReplica(
+      {},
+      { workerRpcTimeoutMs: 40 },
+      ["queryIssueFacetCounts"],
+    );
+
+    await expect(replica.queryIssueFacetCounts(scope, "project")).rejects.toThrow(/wedged/);
+    expect(worker.terminated).toBe(true);
+  }, 15_000);
+
+  it("while a seed is in flight a scoped read past the deadline keeps waiting, then resolves", async () => {
+    // The seed-gated branch of withWorkerDeadline: a read legitimately waits behind the worker's
+    // SeedReadGate for as long as a seed runs, so its window pauses instead of declaring the worker
+    // wedged. The replies below arrive 150 ms in, past the 40 ms deadline, while the cold start's
+    // /snapshot fetch is stalled and the seed is therefore in flight.
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("WebSocket", undefined);
+    const fetchSpy = stubFetch((_url, init) => stalledResponse((init as RequestInit).signal));
+    const page = { rows: [], nextCursor: null };
+    const counts = [{ key: null, name: null, count: 1 }];
+    const worker = new FakeWorker(
+      {
+        open: undefined,
+        getCursor: null, // COLD → start() seeds
+        seedAbort: undefined,
+        close: undefined,
+        queryIssuesScoped: page,
+        queryIssueFacetCounts: counts,
+      },
+      { queryIssuesScoped: 150, queryIssueFacetCounts: 150 },
+    );
+    const replica = new BrowserReplica(
+      collect().handlers,
+      opts({
+        workerRpcTimeoutMs: 40,
+        snapshotIdleTimeoutMs: 0, // the stalled fetch is the seed in flight; only close() ends it
+        createWorker: () => worker as unknown as Worker,
+      }),
+    );
+    const started = replica.start().catch(() => undefined);
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled(), { timeout: 4000 });
+
+    const list = replica.queryIssuesScoped(scope);
+    const facets = replica.queryIssueFacetCounts(scope, "project");
+
+    await expect(list).resolves.toBe(page);
+    await expect(facets).resolves.toBe(counts);
+    expect(worker.terminated).toBe(false); // never declared wedged
+
+    replica.close();
+    await started;
+    await settleTeardown();
+  }, 15_000);
 });

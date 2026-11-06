@@ -43,6 +43,19 @@ export {
   SEED_BATCH_ROWS,
 } from "./replica/browser/snapshot-stream.js";
 
+// Re-export the read-model types the replica's read methods take and return (CTC-6150), so the web types
+// `queryIssuesScoped` / `queryIssueFacetCounts` calls from this one import. Type-only: no bundle growth.
+export type {
+  IssueView,
+  IssueDetailView,
+  PullView,
+  IssueScope,
+  IssueFacetCount,
+  IssueFacetDimension,
+  KeysetCursor,
+  KeysetPage,
+} from "@catalyst-cloud/read-model";
+
 export type {
   WireChange,
   ReplicaRequest,

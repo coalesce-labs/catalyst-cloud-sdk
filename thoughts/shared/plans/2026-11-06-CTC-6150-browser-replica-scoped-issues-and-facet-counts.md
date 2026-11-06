@@ -255,13 +255,13 @@ Retype `SEED_GATED_WORKER_RPCS` to `ReadonlySet<ReplicaRequest["type"]>` and add
 
 #### Automated Verification:
 
-- [ ] `npx vitest run test/browser test/browser-transport-exports.test.ts`
-- [ ] `npm run typecheck`
-- [ ] `npm run build && npm run test:pack` (the browser bundle still builds and the types resolve)
+- [x] `npx vitest run test/browser test/browser-transport-exports.test.ts`
+- [x] `npm run typecheck`
+- [x] `npm run build && npm run test:pack` (the browser bundle still builds and the types resolve)
 
 #### Manual Verification:
 
-- [ ] `dist/browser.d.ts` names both methods and the re-exported types
+- [x] `dist/browser.d.ts` names both methods and the re-exported types
 
 ---
 

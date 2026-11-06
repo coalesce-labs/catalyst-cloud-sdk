@@ -27,6 +27,11 @@ import type {
   IssueView,
   IssueDetailView,
   PullView,
+  IssueScope,
+  IssueFacetCount,
+  IssueFacetDimension,
+  KeysetCursor,
+  KeysetPage,
 } from "@catalyst-cloud/read-model";
 import type {
   Envelope,
@@ -94,8 +99,10 @@ const DEFAULT_WORKER_RPC_TIMEOUT_MS = 120_000;
  * operation is able to progress, not wall-clock. We can do it precisely because THIS client drives
  * the seed, so it knows exactly when a read is legitimately gated.
  */
-const SEED_GATED_WORKER_RPCS: ReadonlySet<string> = new Set([
+const SEED_GATED_WORKER_RPCS: ReadonlySet<ReplicaRequest["type"]> = new Set([
   "queryIssues",
+  "queryIssuesScoped",
+  "queryIssueFacetCounts",
   "queryIssueDetail",
   "queryPulls",
 ]);
@@ -957,6 +964,44 @@ export class BrowserReplica {
     return this.call({ type: "queryIssues", limit, offset });
   }
 
+  /**
+   * Read a scoped, keyset-paged issues list from the local replica (buildIssuesViewKeyset over OPFS),
+   * newest first unless `sort` says otherwise (CTC-6150). Pass the previous page's `nextCursor` as
+   * `after` for the next page; `nextCursor` is null on the last page.
+   *
+   * `scope.projectId: null` means "no project", while leaving the field out means no filter. A scope
+   * carrying `waitingOn.excludeSql` (raw SQL) is rejected.
+   */
+  queryIssuesScoped(
+    scope: IssueScope,
+    opts?: {
+      limit?: number;
+      after?: KeysetCursor | null;
+      sort?: "updated" | "priority" | "blocking";
+    },
+  ): Promise<KeysetPage<IssueView>> {
+    return this.call({
+      type: "queryIssuesScoped",
+      scope,
+      limit: opts?.limit,
+      after: opts?.after,
+      sort: opts?.sort,
+    });
+  }
+
+  /**
+   * Count the scope's live issues per group of `dimension` from the local replica (buildIssueFacetCounts
+   * over OPFS), largest group first (CTC-6150). `key: null` is the dimension's "none" group (for
+   * `"project"`, "No project"), listed only when it holds an issue and always last. Pass a scope: an
+   * unscoped count walks every live issue.
+   */
+  queryIssueFacetCounts(
+    scope: IssueScope,
+    dimension: IssueFacetDimension,
+  ): Promise<IssueFacetCount[]> {
+    return this.call({ type: "queryIssueFacetCounts", scope, dimension });
+  }
+
   /** Read one issue's detail view from the local replica (buildIssueDetail over OPFS). */
   queryIssueDetail(identifier: string): Promise<IssueDetailView | null> {
     return this.call({ type: "queryIssueDetail", identifier });
@@ -1004,7 +1049,10 @@ export class BrowserReplica {
    * Double-settle is harmless: failWorker() rejects the pending map entry too, so the underlying call
    * rejects moments later against an already-settled promise.
    */
-  private withWorkerDeadline<T>(label: string, call: Promise<T>): Promise<T> {
+  private withWorkerDeadline<T>(
+    label: ReplicaRequest["type"],
+    call: Promise<T>,
+  ): Promise<T> {
     const ms = this.options.workerRpcTimeoutMs ?? DEFAULT_WORKER_RPC_TIMEOUT_MS;
     if (ms <= 0) return call;
     const seedGated = SEED_GATED_WORKER_RPCS.has(label);
