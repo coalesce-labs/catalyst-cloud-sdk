@@ -52,9 +52,6 @@ describe("CTC-4633 complete tenant contract compatibility", () => {
 
 const refusedRows = [
   { name: "arbitrary PUT", row: { ...reviewWrite, path: "/api/v1/agent/custom" } },
-  { name: "DELETE", row: { ...reviewWrite, method: "DELETE" } },
-  { name: "PATCH", row: { ...reviewWrite, method: "PATCH" } },
-  { name: "custom method", row: { ...reviewWrite, method: "CUSTOM" } },
   { name: "changed since", row: { ...reviewWrite, since: "2.9.0" } },
   { name: "changed write budget", row: { ...reviewWrite, takesWriteBudgetUnit: true } },
   { name: "changed key field", row: { ...reviewWrite, idempotencyKeyField: "requestId" } },
@@ -74,5 +71,82 @@ describe("CTC-4633 PUT admission remains restricted", () => {
       });
       expect(await client.contract()).toMatchObject({ outcome: "shape", status: 200 });
     }
+  });
+});
+
+// The row the cloud has published since contract 2.28.0, which every read refused until CTC-9961.
+const projectDelete = {
+  method: "DELETE",
+  path: "/api/v1/agent/projects/:id",
+  takesWriteBudgetUnit: false,
+  idempotencyKeyField: null,
+  since: "2.28.0",
+};
+const unseenRows = [
+  { name: "the published project DELETE", row: projectDelete },
+  { name: "PATCH", row: { ...projectDelete, method: "PATCH" } },
+  { name: "custom method", row: { ...projectDelete, method: "CUSTOM" } },
+];
+
+function clientFor(doc: unknown, calls: string[] = []) {
+  return createTenantClient({
+    baseUrl: "https://contract-fixture.invalid",
+    key: "synthetic-only",
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      calls.push(`${init?.method ?? "GET"} ${url.pathname}`);
+      if (url.pathname === "/api/v1/agent/contract") return Response.json(doc);
+      return Response.json({ outcome: "ok", servers: [] });
+    },
+  });
+}
+
+describe("CTC-9961 a route with a method this SDK has not seen", () => {
+  it.each(unseenRows)("drops only $name and reads the rest of the document", async ({ row }) => {
+    for (const { doc } of fixtures) {
+      const newer = { ...doc, routes: [...doc.routes, row] };
+      expect(isTenantContract(newer)).toBe(false);
+      expect(readTenantContract(newer)).toEqual(doc);
+      const result = await clientFor(newer).contract();
+      expect(result.outcome).toBe("ok");
+      if (result.outcome === "ok") expect(result.doc).toEqual(doc);
+    }
+  });
+
+  it("does not change the document it was given", () => {
+    const newer = { ...main, routes: [...main.routes, projectDelete] };
+    readTenantContract(newer);
+    expect(newer.routes).toContain(projectDelete);
+  });
+
+  it("still lists MCP servers from a contract holding the project DELETE", async () => {
+    const calls: string[] = [];
+    const client = clientFor({ ...main, routes: [...main.routes, projectDelete] }, calls);
+    const result = await client.agent.portalServers();
+    expect(result.outcome).toBe("ok");
+    expect(calls).toContain("GET /api/v1/agent/portal-servers");
+  });
+
+  it("answers an unseen-method route as unknown and never sends it", async () => {
+    const calls: string[] = [];
+    const remove = "/api/v1/agent/portal-servers/remove";
+    const routes = main.routes.filter((route) => route.path !== remove);
+    const client = clientFor({ ...main, routes: [...routes, { ...projectDelete, path: remove }] }, calls);
+    const result = await client.agent.portalServerRemove({ name: "docs" });
+    expect(result).toMatchObject({ outcome: "route-unknown" });
+    expect(calls).toEqual(["GET /api/v1/agent/contract"]);
+  });
+
+  const malformed = [
+    { name: "no path", row: { method: "DELETE", takesWriteBudgetUnit: false, since: "2.28.0" } },
+    { name: "no write budget", row: { method: "DELETE", path: projectDelete.path, since: "2.28.0" } },
+    { name: "no since", row: { method: "DELETE", path: projectDelete.path, takesWriteBudgetUnit: false } },
+    { name: "a method that is not text", row: { ...projectDelete, method: 7 } },
+    { name: "no method", row: { path: projectDelete.path, takesWriteBudgetUnit: false, since: "2.28.0" } },
+  ];
+  it.each(malformed)("still refuses a row with $name", async ({ row }) => {
+    const broken = { ...main, routes: [...main.routes, row] };
+    expect(readTenantContract(broken)).toBeNull();
+    expect(await clientFor(broken).contract()).toMatchObject({ outcome: "shape", status: 200 });
   });
 });
