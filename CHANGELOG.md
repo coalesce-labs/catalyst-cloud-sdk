@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.24
+
+The SDK now reads a contract that lists a route with an HTTP method it does not know. Before this release, one such route made `contract()` return a `shape` outcome and every `agent.*` method fail, for any code calling them directly. Only that route now counts as unknown, and the agent methods return `route-unknown` for it. No change is needed beyond updating the SDK and both replicas together.
+
 ## 0.16.23
 
 Your code and agents can now hold and inspect ticket leases from the SDK: `createTicketLeaseClient({ baseUrl, token })` returns a client with `take`, `renew`, `release`, `read` and `list`. A lease records who holds it — kind, display name, session URL, external ID, a contact link, and the owning person or organization key — and `read` and `list` return the current and previous holder's details. A take the store refuses resolves normally with `outcome: "refused"` and the current holder under `refusal`, so callers inspect `refusal.reason` and retry; an HTTP failure throws `TicketLeaseHttpError` with the server's status and code. Renew with new progress and the current generation; send `null` for a holder field to clear it. Cursor pages can repeat or skip a lease if another holder renews it between reads, because pages sort by deadline.
