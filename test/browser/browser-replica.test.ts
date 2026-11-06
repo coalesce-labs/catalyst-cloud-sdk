@@ -1290,6 +1290,7 @@ describe("BrowserReplica scoped reads (CTC-6150)", () => {
     );
     const replica = new BrowserReplica(
       collect().handlers,
+      // FakeWorker implements only the Worker surface BrowserReplica uses; the double cast is the test seam.
       opts({ createWorker: () => worker as unknown as Worker, ...over }),
     );
     await replica.start();
@@ -1423,6 +1424,7 @@ describe("BrowserReplica scoped reads (CTC-6150)", () => {
       opts({
         workerRpcTimeoutMs: 40,
         snapshotIdleTimeoutMs: 0, // the stalled fetch is the seed in flight; only close() ends it
+        // FakeWorker implements only the Worker surface BrowserReplica uses; the double cast is the test seam.
         createWorker: () => worker as unknown as Worker,
       }),
     );

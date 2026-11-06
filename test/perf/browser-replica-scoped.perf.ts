@@ -95,6 +95,8 @@ beforeAll(async () => {
  */
 async function seedFixture(labelledCount: number): Promise<Fixture> {
   const core = createWorkerCore(() => {
+    // sqlite-wasm's oo1.DB and the package's Database interface describe the same handle with
+    // incompatible declared types; same cast as test/browser/worker-core.test.ts.
     const db = new sqlite3.oo1.DB(":memory:", "c") as unknown as Database;
     return Promise.resolve(buildOpenedReplica(db));
   });
