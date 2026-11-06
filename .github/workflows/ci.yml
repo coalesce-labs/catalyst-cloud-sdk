@@ -48,3 +48,30 @@ jobs:
 
       - name: Packed consumer and optional module boundaries
         run: bun run test:pack
+
+  # CTC-9951: a working document belongs in the run's artifact directory, never on a branch of this
+  # public repository. A repository whose default branch tracks its own thoughts/ keeps them.
+  no-thoughts-documents:
+    name: no thoughts documents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse thoughts/ documents the default branch does not track
+        env:
+          BASE: ${{ github.base_ref || github.event.repository.default_branch }}
+        run: |
+          git fetch -q --no-tags --depth=1 origin "refs/heads/${BASE}"
+          if [ -n "$(git ls-tree --name-only FETCH_HEAD -- thoughts)" ]; then
+            echo "${BASE} tracks thoughts/, so this repository keeps its own."
+            exit 0
+          fi
+          paths="$(git ls-tree -r --name-only HEAD -- thoughts)"
+          if [ -z "${paths}" ]; then
+            echo "No thoughts/ documents."
+            exit 0
+          fi
+          echo "${paths}" | while read -r path; do
+            echo "::error file=${path}::${path} is a thoughts/ document, and ${BASE} does not track thoughts/. Remove it from this branch."
+          done
+          exit 1
