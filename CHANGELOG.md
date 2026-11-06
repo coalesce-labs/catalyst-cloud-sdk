@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.16.24
+
+The browser replica can now answer filtered ticket lists and group counts locally, without a request to the server. `queryIssuesScoped(scope, { limit, after, sort })` returns one page of a team's tickets narrowed by label, project, initiative, cycle and the other filters in `IssueScope`, newest first, with a `nextCursor` to pass back as `after` for the next page. `queryIssueFacetCounts(scope, dimension)` returns how many tickets fall in each label, project, initiative, cycle, state, assignee, team or priority group, with a `key: null` group, such as "No project", listed last.
+
+In a scope, `projectId: null` means tickets with no project, and leaving it out means no filter. A scope carrying `waitingOn.excludeSql` is rejected, because that field is raw SQL. `IssueScope`, `IssueFacetCount`, `IssueFacetDimension`, `KeysetCursor` and `KeysetPage` are now exported from `@catalyst-cloud/sdk/browser` and `@catalyst-cloud/sdk/node`, and `IssueView`, `IssueDetailView` and `PullView` from `@catalyst-cloud/sdk/browser`.
+
+Update the SDK and both replicas together.
+
 ## 0.16.23
 
 Your code and agents can now hold and inspect ticket leases from the SDK: `createTicketLeaseClient({ baseUrl, token })` returns a client with `take`, `renew`, `release`, `read` and `list`. A lease records who holds it — kind, display name, session URL, external ID, a contact link, and the owning person or organization key — and `read` and `list` return the current and previous holder's details. A take the store refuses resolves normally with `outcome: "refused"` and the current holder under `refusal`, so callers inspect `refusal.reason` and retry; an HTTP failure throws `TicketLeaseHttpError` with the server's status and code. Renew with new progress and the current generation; send `null` for a holder field to clear it. Cursor pages can repeat or skip a lease if another holder renews it between reads, because pages sort by deadline.

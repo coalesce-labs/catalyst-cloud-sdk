@@ -214,6 +214,38 @@ if (isBrowserReplicaSupported()) {
 }
 ```
 
+#### Filtered lists and group counts, answered locally
+
+`queryIssuesScoped(scope, { limit, after, sort })` returns one page of a filtered ticket list, newest first, and `queryIssueFacetCounts(scope, dimension)` returns the size of each group for a group-by header or a filter menu. Both read the local replica, so a filter change needs no request to the server. The scope is the `IssueScope` type, exported from `@catalyst-cloud/sdk/browser`, along with `IssueFacetCount`, `IssueFacetDimension`, `KeysetCursor` and `KeysetPage`.
+
+```ts
+import type { IssueScope, IssueView } from "@catalyst-cloud/sdk/browser";
+
+// A team's tickets carrying one label. Filter by the label's id (the `key` of its facet count).
+const scope: IssueScope = { teamId: team.id, labelId: label.id };
+
+let page = await replica.queryIssuesScoped(scope, { limit: 50 });
+const rows: IssueView[] = [...page.rows];
+// `nextCursor` is null on the last page. Pass it back as `after` for the next one.
+while (page.nextCursor !== null) {
+  page = await replica.queryIssuesScoped(scope, { limit: 50, after: page.nextCursor });
+  rows.push(...page.rows);
+}
+
+// How many of the team's tickets are in each project.
+const counts = await replica.queryIssueFacetCounts({ teamId: team.id }, "project");
+for (const { key, name, count } of counts) {
+  // `key: null` is the group with no project. It is listed only when it holds a ticket, and always last.
+  render(key === null ? "No project" : name, count);
+}
+```
+
+- `sort` is `"updated"` (the default, newest first), `"priority"` or `"blocking"`. Pages follow a cursor rather than an offset, so a ticket you already received that changes between pages does not shift the next page.
+- `dimension` is one of `"label"`, `"project"`, `"initiative"`, `"cycle"`, `"state"`, `"assignee"`, `"team"` or `"priority"`. Counts cover the scope you pass, so to count a menu's choices while that menu's own filter is set, leave that filter out of the scope.
+- Always pass a scope, at least a team. An unscoped count walks every ticket in the replica.
+- In a scope, `projectId: null` means "tickets with no project", while leaving `projectId` out means no filter on project. Do not pass a lookup result straight through: an absent value would turn into "No project".
+- A scope that carries `waitingOn.excludeSql` is rejected with an error, because that field is raw SQL.
+
 `status` above is whatever your `onStatus` handler last recorded. `start()` REJECTS if the boot fails (bad origin, missing worker chunk, OPFS unavailable) — it does not resolve into a broken state, so a `try`/`catch` around it is where you surface the error to the user.
 
 Built in, because browsers need them:

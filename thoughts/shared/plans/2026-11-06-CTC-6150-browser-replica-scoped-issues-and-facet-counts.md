@@ -322,11 +322,11 @@ None beyond the existing `release:check` and `test:pack`. This phase changes doc
 
 #### Automated Verification:
 
-- [ ] `npm run typecheck && npm test`
+- [x] `npm run typecheck && npm test`
 
 #### Manual Verification:
 
-- [ ] The CHANGELOG entry follows the release-train skill's customer wording rules
+- [x] The CHANGELOG entry follows the release-train skill's customer wording rules
 
 ---
 
