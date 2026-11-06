@@ -333,10 +333,37 @@ function isContractTeam(value: unknown): value is ContractTeam {
   );
 }
 
+/** The methods {@link ContractRoute} can hold. A row with any other method cannot be sent by this SDK. */
+const SEEN_ROUTE_METHODS: readonly unknown[] = ["GET", "POST", "PUT"];
+
+/** A complete route row whose method this SDK has not seen. A row missing a field stays malformed. */
+function isUnseenMethodRow(row: unknown): boolean {
+  return (
+    isRecord(row) &&
+    typeof row["method"] === "string" &&
+    !SEEN_ROUTE_METHODS.includes(row["method"]) &&
+    typeof row["path"] === "string" &&
+    typeof row["takesWriteBudgetUnit"] === "boolean" &&
+    typeof row["since"] === "string"
+  );
+}
+
+function withoutUnseenMethodRows(value: unknown): unknown {
+  if (!isRecord(value) || !Array.isArray(value["routes"])) return value;
+  return { ...value, routes: value["routes"].filter((row: unknown) => !isUnseenMethodRow(row)) };
+}
+
 /** {@link isTenantContract} as a read: the typed document, or `null` — never a throw, because the
- *  caller's answer to a malformed document is a typed `shape` outcome, not an exception. */
+ *  caller's answer to a malformed document is a typed `shape` outcome, not an exception.
+ *
+ *  CTC-9961: a cloud newer than this SDK may list a route with a method this SDK has not seen. Only
+ *  that row is dropped, so `routeByName` answers it as unknown and the rest of the document reads.
+ *  The agent client sends every non-GET route as a POST, so a kept row would be sent with the wrong
+ *  method. {@link isTenantContract} stays strict, because its predicate says every row is a
+ *  {@link ContractRoute}. */
 export function readTenantContract(value: unknown): TenantContract | null {
-  return isTenantContract(value) ? value : null;
+  const known = withoutUnseenMethodRows(value);
+  return isTenantContract(known) ? known : null;
 }
 
 // ── Pure accessors — the bundle's contract.ts helpers, returning results instead of throwing ──────
