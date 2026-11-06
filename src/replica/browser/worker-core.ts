@@ -46,12 +46,14 @@ export interface WorkerCore {
 /**
  * Reject a scope the worker will not run (CTC-6150). `waitingOn.excludeSql` is the one raw SQL fragment
  * in an `IssueScope`: read-model splices it into the statement unchanged. Whatever can post a message to
- * the Worker could otherwise run arbitrary SQL over the replica, so a non-empty value is refused. The
+ * the Worker could otherwise run arbitrary SQL over the replica, so any value other than absent, null or "" is refused. The
  * scenarios do not need it, and lifting the refusal later is additive.
  */
 function assertWireScope(scope: IssueScope): void {
-  const excludeSql = scope?.waitingOn?.excludeSql;
-  if (typeof excludeSql === "string" && excludeSql !== "") {
+  // `excludeSql` is typed `string | undefined`, but the wire is untyped: structured clone also delivers
+  // arrays, numbers and objects, which read-model would splice in. Only absent or "" passes.
+  const excludeSql: unknown = scope?.waitingOn?.excludeSql;
+  if (excludeSql !== undefined && excludeSql !== null && excludeSql !== "") {
     throw new Error("excludeSql is not accepted by the browser replica");
   }
 }

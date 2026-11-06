@@ -816,6 +816,27 @@ describe("scoped reads (CTC-6150)", () => {
     ).rejects.toThrow(/excludeSql is not accepted by the browser replica/);
   });
 
+  it.each([
+    ["an array", ["1 = 1"]],
+    ["a number", 1],
+    ["an object", { raw: "1 = 1" }],
+    ["true", true],
+  ])("a non-string excludeSql (%s) rejects, for both ops", async (_label, excludeSql) => {
+    // Structured clone preserves these across postMessage, so a string-only check lets them reach SQL.
+    const core = await openCore();
+    await seed(core, [{ entity: "issues", row: issueRow("a", { team_id: "team-ctc" }) }]);
+    // JSON.parse yields `any`, the same untyped shape the wire delivers; no type assertion needed.
+    const scope: IssueScope = JSON.parse(
+      JSON.stringify({ teamId: "team-ctc", waitingOn: { linearUserId: "u1", mode: "all", excludeSql } }),
+    );
+    await expect(core.handle({ type: "queryIssuesScoped", scope })).rejects.toThrow(
+      /excludeSql is not accepted by the browser replica/,
+    );
+    await expect(
+      core.handle({ type: "queryIssueFacetCounts", scope, dimension: "project" }),
+    ).rejects.toThrow(/excludeSql is not accepted by the browser replica/);
+  });
+
   it("a waitingOn scope without excludeSql is accepted", async () => {
     const core = await openCore();
     await seed(core, [{ entity: "issues", row: issueRow("a", { team_id: "team-ctc" }) }]);
