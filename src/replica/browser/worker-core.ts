@@ -11,8 +11,11 @@
 
 import {
   buildIssuesView,
+  buildIssuesViewKeyset,
+  buildIssueFacetCounts,
   buildIssueDetail,
   buildPullsView,
+  type IssueScope,
 } from "@catalyst-cloud/read-model";
 import type { OpenedReplica } from "./ports.js";
 import {
@@ -38,6 +41,19 @@ export type ReplicaOpener = (request: OpenRequest) => Promise<OpenedReplica>;
 /** The dispatcher: `handle` resolves one request to its (untyped) result the client casts via ResultMap. */
 export interface WorkerCore {
   handle(request: ReplicaRequest): Promise<unknown>;
+}
+
+/**
+ * Reject a scope the worker will not run (CTC-6150). `waitingOn.excludeSql` is the one raw SQL fragment
+ * in an `IssueScope`: read-model splices it into the statement unchanged. Whatever can post a message to
+ * the Worker could otherwise run arbitrary SQL over the replica, so a non-empty value is refused. The
+ * scenarios do not need it, and lifting the refusal later is additive.
+ */
+function assertWireScope(scope: IssueScope): void {
+  const excludeSql = scope?.waitingOn?.excludeSql;
+  if (typeof excludeSql === "string" && excludeSql !== "") {
+    throw new Error("excludeSql is not accepted by the browser replica");
+  }
 }
 
 export function createWorkerCore(open: ReplicaOpener): WorkerCore {
@@ -202,6 +218,26 @@ export function createWorkerCore(open: ReplicaOpener): WorkerCore {
           requireReplica().read,
           request.limit,
           request.offset,
+        );
+
+      // CTC-6150 — the web's scoped list and group counts, answered locally instead of by the server.
+      case "queryIssuesScoped":
+        await readGate.whenReadable(session !== null);
+        assertWireScope(request.scope);
+        return buildIssuesViewKeyset(requireReplica().read, {
+          scope: request.scope,
+          limit: request.limit,
+          after: request.after,
+          sort: request.sort,
+        });
+
+      case "queryIssueFacetCounts":
+        await readGate.whenReadable(session !== null);
+        assertWireScope(request.scope);
+        return buildIssueFacetCounts(
+          requireReplica().read,
+          request.scope,
+          request.dimension,
         );
 
       case "queryIssueDetail":

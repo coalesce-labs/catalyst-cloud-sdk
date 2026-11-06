@@ -14,6 +14,7 @@ import {
 } from "@catalyst-cloud/read-model";
 import { createWorkerCore } from "../../src/replica/browser/worker-core.js";
 import { buildOpenedReplica } from "../../src/replica/browser/ports.js";
+import type { OpenedReplica } from "../../src/replica/browser/ports.js";
 import {
   REPLICA_READ_INDEX_NAMES,
   fullScans,
@@ -22,6 +23,7 @@ import {
   readModelObjects,
   recordStatements,
   schemaText,
+  type RecordedStatement,
 } from "../helpers/read-model-plan.js";
 
 let sqlite3: Awaited<ReturnType<typeof sqlite3InitModule>>;
@@ -100,5 +102,83 @@ describe("CTC-4324 — the browser replica builds the read-model DDL on open", (
     expect(facet).toContainEqual(expect.stringMatching(/^SEARCH r2 USING INDEX idx_reviews_pr\b/));
     expect(reviewFacet(opened.read).map((p) => p.number)).toEqual([3, 2, 1]);
     opened.close();
+  });
+});
+
+// CTC-6150 — the two scoped reads run read-model's statements over the worker's own read seam. Record
+// what the WORKER sends for each op (not what a builder would send when called by hand) and ask SQLite
+// for the plan: neither the team plus label page nor the team project facet may walk a whole table.
+describe("CTC-6150 — the scoped worker reads seek read-model's indexes", () => {
+  /** A worker core whose read seam records every statement, over a store seeded for team CTC. */
+  async function recordingCore() {
+    const statements: RecordedStatement[] = [];
+    const real = buildOpenedReplica(memoryDb());
+    const core = createWorkerCore(() =>
+      Promise.resolve({
+        ...real,
+        read: {
+          exec: (query, ...bindings) => {
+            statements.push({ query, bindings });
+            return real.read.exec(query, ...bindings);
+          },
+        },
+      } satisfies OpenedReplica),
+    );
+    await core.handle({ type: "open", dbPath: ":memory:", directory: "unused", identity: "test" });
+    const rows: { entity: string; op: "upsert"; row: Record<string, unknown> }[] = [
+      { entity: "labels", op: "upsert", row: { id: "l-mirror", name: "mirror-do" } },
+      { entity: "projects", op: "upsert", row: { id: "p1", name: "Project 1" } },
+    ];
+    for (let i = 1; i <= 30; i++) {
+      rows.push({
+        entity: "issues",
+        op: "upsert",
+        row: {
+          id: `c${i}`,
+          identifier: `CTC-${i}`,
+          title: `issue ${i}`,
+          state: "Todo",
+          team_id: i % 3 === 0 ? "team-other" : "team-ctc",
+          project_id: i % 2 === 0 ? "p1" : null,
+          updated_at: i,
+        },
+      });
+      if (i % 5 === 0) rows.push({ entity: "issue_labels", op: "upsert", row: { issue_id: `c${i}`, label_id: "l-mirror" } });
+    }
+    await core.handle({ type: "seedBegin" });
+    await core.handle({ type: "seedBatch", rows });
+    await core.handle({ type: "seedCommit", cursor: 1 });
+    statements.length = 0; // only the statements the read itself sends
+    return { core, statements, read: real.read };
+  }
+
+  it("the team plus label keyset page seeks the label and the team order index, never scanning issues", async () => {
+    const { core, statements, read } = await recordingCore();
+    const page = (await core.handle({
+      type: "queryIssuesScoped",
+      scope: { teamId: "team-ctc", labelId: "l-mirror" },
+      limit: 100,
+    })) as { rows: { id: string }[] };
+    expect(page.rows.map((r) => r.id)).toEqual(["c25", "c20", "c10", "c5"]);
+
+    expect(statements.length).toBeGreaterThan(0);
+    const plan = planDetails(read, statements);
+    expect(fullScans(plan, ["issues", "issue_labels"])).toEqual([]);
+    expect(plan.join("\n")).toMatch(/idx_issue_labels_label/);
+  });
+
+  it("the team project facet seeks the team order index, never scanning issues", async () => {
+    const { core, statements, read } = await recordingCore();
+    const counts = (await core.handle({
+      type: "queryIssueFacetCounts",
+      scope: { teamId: "team-ctc" },
+      dimension: "project",
+    })) as { key: string | null; count: number }[];
+    expect(counts.map((c) => c.key)).toEqual(["p1", null]);
+
+    expect(statements.length).toBeGreaterThan(0);
+    const plan = planDetails(read, statements);
+    expect(fullScans(plan, ["issues"])).toEqual([]);
+    expect(plan.join("\n")).toMatch(/idx_issues_team_order/);
   });
 });

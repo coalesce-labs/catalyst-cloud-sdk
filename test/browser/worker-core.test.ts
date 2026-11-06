@@ -6,7 +6,12 @@ import {
   type WorkerCore,
 } from "../../src/replica/browser/worker-core.js";
 import { buildOpenedReplica } from "../../src/replica/browser/ports.js";
-import type { IssueView } from "@catalyst-cloud/read-model";
+import type {
+  IssueFacetCount,
+  IssueScope,
+  IssueView,
+  KeysetPage,
+} from "@catalyst-cloud/read-model";
 import { applyMigrations, MIRROR_MIGRATIONS } from "@catalyst-cloud/schema";
 
 /** The newest migration tag that changes row shape — the one a "behind by a column" DB is missing. */
@@ -576,5 +581,294 @@ describe("row-shape migration forces one re-seed — CTC-127's browser twin (CTC
     const db = new sqlite3.oo1.DB(":memory:", "c") as unknown as Database;
     buildOpenedReplica(db);
     expect(cursorOf(db)).toBeNull();
+  });
+});
+
+// CTC-6150 — the two scoped reads the web needs to answer filtered ticket lists and group counts
+// locally: queryIssuesScoped (buildIssuesViewKeyset) and queryIssueFacetCounts (buildIssueFacetCounts).
+// Same production dispatch over a :memory: sqlite-wasm DB as the tests above.
+describe("scoped reads (CTC-6150)", () => {
+  type SeedRow = { entity: string; row: Record<string, unknown> };
+
+  async function openCore(): Promise<WorkerCore> {
+    const core = memoryCore();
+    await core.handle({
+      type: "open",
+      dbPath: ":memory:",
+      directory: "unused",
+      identity: "test-identity",
+    });
+    return core;
+  }
+
+  /**
+   * Team CTC (`ctc` issues) next to another team (`other` issues). The first `noProject` CTC issues
+   * carry no project; the rest are spread over `projects` projects, project N holding the CTC issues
+   * whose index lands on it. Counts per project are therefore uneven when `ctc - noProject` does not
+   * divide by `projects`, which exercises the facet's largest-first order.
+   */
+  function teamFixtureRows(o: {
+    ctc: number;
+    other: number;
+    projects: number;
+    noProject: number;
+  }): SeedRow[] {
+    const rows: SeedRow[] = [];
+    for (let p = 1; p <= o.projects; p++) {
+      rows.push({ entity: "projects", row: { id: `p${p}`, name: `Project ${p}` } });
+    }
+    for (let i = 1; i <= o.ctc; i++) {
+      const projectId =
+        i <= o.noProject ? null : `p${((i - o.noProject - 1) % o.projects) + 1}`;
+      rows.push({
+        entity: "issues",
+        row: issueRow(`c${i}`, { team_id: "team-ctc", project_id: projectId, updated_at: 1000 + i }),
+      });
+    }
+    for (let i = 1; i <= o.other; i++) {
+      // The other team's issues sit in the same projects, so a facet that ignored the scope would show.
+      rows.push({
+        entity: "issues",
+        row: issueRow(`o${i}`, {
+          team_id: "team-other",
+          project_id: `p${((i - 1) % o.projects) + 1}`,
+          updated_at: 5000 + i,
+        }),
+      });
+    }
+    return rows;
+  }
+
+  async function seedTeamFixture(
+    core: WorkerCore,
+    o: { ctc: number; other: number; projects: number; noProject: number },
+  ): Promise<void> {
+    await seed(core, teamFixtureRows(o));
+  }
+
+  const ctcScope = { teamId: "team-ctc", labelId: "l-mirror" } satisfies IssueScope;
+
+  it("queryIssuesScoped returns team CTC's issues carrying the label, newest first", async () => {
+    const core = await openCore();
+    await seed(core, [
+      { entity: "labels", row: { id: "l-mirror", name: "mirror-do" } },
+      { entity: "labels", row: { id: "l-other", name: "other" } },
+      // Three CTC issues carry the label, at three updated_at values.
+      { entity: "issues", row: issueRow("c1", { team_id: "team-ctc", updated_at: 100 }) },
+      { entity: "issues", row: issueRow("c2", { team_id: "team-ctc", updated_at: 200 }) },
+      { entity: "issues", row: issueRow("c3", { team_id: "team-ctc", updated_at: 300 }) },
+      { entity: "issue_labels", row: { issue_id: "c1", label_id: "l-mirror" } },
+      { entity: "issue_labels", row: { issue_id: "c2", label_id: "l-mirror" } },
+      { entity: "issue_labels", row: { issue_id: "c3", label_id: "l-mirror" } },
+      // Newer than all of them, but: another team's issue with the label,
+      { entity: "issues", row: issueRow("o1", { team_id: "team-other", updated_at: 400 }) },
+      { entity: "issue_labels", row: { issue_id: "o1", label_id: "l-mirror" } },
+      // a CTC issue with a different label,
+      { entity: "issues", row: issueRow("c4", { team_id: "team-ctc", updated_at: 500 }) },
+      { entity: "issue_labels", row: { issue_id: "c4", label_id: "l-other" } },
+      // and a removed CTC issue that carries the label.
+      { entity: "issues", row: issueRow("c5", { team_id: "team-ctc", updated_at: 600, removed_at: 1 }) },
+      { entity: "issue_labels", row: { issue_id: "c5", label_id: "l-mirror" } },
+    ]);
+
+    const page = (await core.handle({
+      type: "queryIssuesScoped",
+      scope: ctcScope,
+      limit: 2,
+    })) as KeysetPage<IssueView>;
+    expect(page.rows.map((r) => r.id)).toEqual(["c3", "c2"]); // updated_at DESC, CTC and label only
+    expect(page.rows[0]?.labels).toEqual([{ id: "l-mirror", name: "mirror-do", color: null }]);
+    expect(page.nextCursor).not.toBeNull();
+
+    const next = (await core.handle({
+      type: "queryIssuesScoped",
+      scope: ctcScope,
+      limit: 2,
+      after: page.nextCursor,
+    })) as KeysetPage<IssueView>;
+    expect(next.rows.map((r) => r.id)).toEqual(["c1"]);
+    expect(next.nextCursor).toBeNull();
+  });
+
+  it("queryIssuesScoped with no limit, cursor or sort returns the whole scope in the default order", async () => {
+    const core = await openCore();
+    await seedTeamFixture(core, { ctc: 5, other: 3, projects: 2, noProject: 1 });
+
+    const page = (await core.handle({
+      type: "queryIssuesScoped",
+      scope: { teamId: "team-ctc" },
+    })) as KeysetPage<IssueView>;
+    expect(page.rows.map((r) => r.id)).toEqual(["c5", "c4", "c3", "c2", "c1"]);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  it("queryIssuesScoped honours the sort option", async () => {
+    const core = await openCore();
+    await seed(core, [
+      { entity: "issues", row: issueRow("low", { team_id: "team-ctc", priority: 4, updated_at: 300 }) },
+      { entity: "issues", row: issueRow("urgent", { team_id: "team-ctc", priority: 1, updated_at: 100 }) },
+    ]);
+
+    const byUpdated = (await core.handle({
+      type: "queryIssuesScoped",
+      scope: { teamId: "team-ctc" },
+    })) as KeysetPage<IssueView>;
+    expect(byUpdated.rows.map((r) => r.id)).toEqual(["low", "urgent"]);
+
+    const byPriority = (await core.handle({
+      type: "queryIssuesScoped",
+      scope: { teamId: "team-ctc" },
+      sort: "priority",
+    })) as KeysetPage<IssueView>;
+    expect(byPriority.rows.map((r) => r.id)).toEqual(["urgent", "low"]);
+  });
+
+  it("queryIssueFacetCounts returns each project's count and the no-project group last", async () => {
+    const core = await openCore();
+    // 12 projects and 300 CTC issues with no project, the ticket's scenario 2.
+    await seedTeamFixture(core, { ctc: 300 + 78, other: 40, projects: 12, noProject: 300 });
+
+    const counts = (await core.handle({
+      type: "queryIssueFacetCounts",
+      scope: { teamId: "team-ctc" },
+      dimension: "project",
+    })) as IssueFacetCount[];
+
+    expect(counts).toHaveLength(13); // 12 projects and the "No project" group
+    expect(counts.at(-1)).toEqual({ key: null, name: null, count: 300 });
+    // 78 project issues over 12 projects: six projects of 7 and six of 6, never the other team's issues.
+    const projectCounts = counts.slice(0, 12);
+    expect(projectCounts.reduce((sum, c) => sum + c.count, 0)).toBe(78);
+    expect(projectCounts.map((c) => c.count)).toEqual([7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6]);
+    expect(projectCounts.every((c) => typeof c.key === "string" && c.name === `Project ${c.key?.toString().slice(1)}`)).toBe(true);
+  });
+
+  it("the facet's null group count equals queryIssuesScoped's total for { projectId: null }", async () => {
+    const core = await openCore();
+    await seedTeamFixture(core, { ctc: 130, other: 10, projects: 3, noProject: 120 });
+
+    const counts = (await core.handle({
+      type: "queryIssueFacetCounts",
+      scope: { teamId: "team-ctc" },
+      dimension: "project",
+    })) as IssueFacetCount[];
+    const none = counts.find((c) => c.key === null);
+
+    // Walk the list by cursor and count what comes back: the group opens as exactly its count.
+    let total = 0;
+    let after: KeysetPage<IssueView>["nextCursor"] = null;
+    do {
+      const page = (await core.handle({
+        type: "queryIssuesScoped",
+        scope: { teamId: "team-ctc", projectId: null },
+        limit: 50,
+        after,
+      })) as KeysetPage<IssueView>;
+      total += page.rows.length;
+      after = page.nextCursor;
+    } while (after !== null);
+
+    expect(none?.count).toBe(120);
+    expect(total).toBe(none?.count);
+  });
+
+  it("an omitted projectId narrows nothing, while null means no project", async () => {
+    const core = await openCore();
+    await seedTeamFixture(core, { ctc: 6, other: 0, projects: 2, noProject: 2 });
+
+    const all = (await core.handle({
+      type: "queryIssuesScoped",
+      scope: { teamId: "team-ctc" },
+    })) as KeysetPage<IssueView>;
+    const none = (await core.handle({
+      type: "queryIssuesScoped",
+      scope: { teamId: "team-ctc", projectId: null },
+    })) as KeysetPage<IssueView>;
+    expect(all.rows).toHaveLength(6);
+    expect(none.rows.map((r) => r.id).sort()).toEqual(["c1", "c2"]);
+  });
+
+  it("an unknown facet dimension rejects", async () => {
+    const core = await openCore();
+    await seed(core, []);
+    await expect(
+      core.handle({
+        type: "queryIssueFacetCounts",
+        scope: { teamId: "team-ctc" },
+        // A caller outside the type system (JS, or a newer web build) can send any string.
+        dimension: "nonsense" as unknown as "project",
+      }),
+    ).rejects.toThrow(/unknown facet dimension/);
+  });
+
+  it("a scope carrying waitingOn.excludeSql rejects, for both ops", async () => {
+    const core = await openCore();
+    await seed(core, [{ entity: "issues", row: issueRow("a", { team_id: "team-ctc" }) }]);
+    const scope: IssueScope = {
+      teamId: "team-ctc",
+      waitingOn: { linearUserId: "u1", mode: "all", excludeSql: "1 = 1" },
+    };
+
+    await expect(core.handle({ type: "queryIssuesScoped", scope })).rejects.toThrow(
+      /excludeSql is not accepted by the browser replica/,
+    );
+    await expect(
+      core.handle({ type: "queryIssueFacetCounts", scope, dimension: "project" }),
+    ).rejects.toThrow(/excludeSql is not accepted by the browser replica/);
+  });
+
+  it("a waitingOn scope without excludeSql is accepted", async () => {
+    const core = await openCore();
+    await seed(core, [{ entity: "issues", row: issueRow("a", { team_id: "team-ctc" }) }]);
+    for (const excludeSql of [undefined, null, ""]) {
+      const page = (await core.handle({
+        type: "queryIssuesScoped",
+        scope: { teamId: "team-ctc", waitingOn: { linearUserId: "u1", mode: "all", excludeSql } },
+      })) as KeysetPage<IssueView>;
+      expect(page.rows).toEqual([]); // nothing is waiting on u1, and nothing threw
+    }
+  });
+
+  it("scoped reads defer while a seed is open, then answer from the fresh snapshot", async () => {
+    const core = await openCore();
+    await seed(core, [{ entity: "issues", row: issueRow("old", { team_id: "team-ctc" }) }], 5);
+
+    await core.handle({ type: "seedBegin" });
+    let listSettled = false;
+    let facetSettled = false;
+    const list = core
+      .handle({ type: "queryIssuesScoped", scope: { teamId: "team-ctc" } })
+      .then((page) => {
+        listSettled = true;
+        return page as KeysetPage<IssueView>;
+      });
+    const facets = core
+      .handle({ type: "queryIssueFacetCounts", scope: { teamId: "team-ctc" }, dimension: "project" })
+      .then((counts) => {
+        facetSettled = true;
+        return counts as IssueFacetCount[];
+      });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(listSettled).toBe(false); // GATED: neither read may see the truncated mid-seed state
+    expect(facetSettled).toBe(false);
+
+    await core.handle({
+      type: "seedBatch",
+      rows: [{ entity: "issues", op: "upsert", row: issueRow("new", { team_id: "team-ctc" }) }],
+    });
+    await core.handle({ type: "seedCommit", cursor: 6 });
+
+    expect((await list).rows.map((r) => r.id)).toEqual(["new"]);
+    expect(await facets).toEqual([{ key: null, name: null, count: 1 }]);
+  });
+
+  it("scoped reads before open reject with 'not open'", async () => {
+    const core = memoryCore();
+    await expect(
+      core.handle({ type: "queryIssuesScoped", scope: { teamId: "team-ctc" } }),
+    ).rejects.toThrow(/not open/);
+    await expect(
+      core.handle({ type: "queryIssueFacetCounts", scope: { teamId: "team-ctc" }, dimension: "project" }),
+    ).rejects.toThrow(/not open/);
   });
 });

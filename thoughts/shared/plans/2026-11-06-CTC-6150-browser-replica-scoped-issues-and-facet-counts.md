@@ -198,12 +198,12 @@ None expected. Keep the cases in the same commented "Reads DEFER" block.
 
 #### Automated Verification:
 
-- [ ] Worker-core tests pass: `npx vitest run test/browser/worker-core.test.ts test/browser/read-model-ddl.test.ts`
-- [ ] Type checking passes: `npm run typecheck`
+- [x] Worker-core tests pass: `npx vitest run test/browser/worker-core.test.ts test/browser/read-model-ddl.test.ts`
+- [x] Type checking passes: `npm run typecheck`
 
 #### Manual Verification:
 
-- [ ] Read the diff: each new case awaits the read gate before touching `requireReplica()`
+- [x] Read the diff: each new case awaits the read gate before touching `requireReplica()`
 
 ---
 

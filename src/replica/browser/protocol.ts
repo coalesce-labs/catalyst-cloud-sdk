@@ -13,6 +13,11 @@ import type {
   IssueView,
   IssueDetailView,
   PullView,
+  IssueScope,
+  IssueFacetCount,
+  IssueFacetDimension,
+  KeysetCursor,
+  KeysetPage,
 } from "@catalyst-cloud/read-model";
 
 /** A change-feed record as it rides the wire — the shape both /snapshot data lines and /changes rows
@@ -85,6 +90,32 @@ export interface QueryIssuesRequest {
   offset?: number;
 }
 
+/**
+ * Read a scoped, keyset-paged issues list locally (buildIssuesViewKeyset). CTC-6150.
+ *
+ * `scope.projectId: null` means "no project"; an absent field means no filter. Both survive structured
+ * clone. `scope.waitingOn.excludeSql` is raw SQL, so the worker rejects a non-empty one.
+ */
+export interface QueryIssuesScopedRequest {
+  type: "queryIssuesScoped";
+  scope: IssueScope;
+  limit?: number;
+  /** The previous page's `nextCursor`; absent or null reads the first page. */
+  after?: KeysetCursor | null;
+  /** Defaults to `"updated"`, newest first. */
+  sort?: "updated" | "priority" | "blocking";
+}
+
+/**
+ * Count the scope's live issues per group of one dimension locally (buildIssueFacetCounts). CTC-6150.
+ * `key: null` in a result is the dimension's "none" group (for example "No project"), always last.
+ */
+export interface QueryIssueFacetCountsRequest {
+  type: "queryIssueFacetCounts";
+  scope: IssueScope;
+  dimension: IssueFacetDimension;
+}
+
 /** Read one issue's detail view locally (buildIssueDetail). */
 export interface QueryIssueDetailRequest {
   type: "queryIssueDetail";
@@ -120,6 +151,8 @@ export type ReplicaRequest =
   | SeedAbortRequest
   | ApplyChangesRequest
   | QueryIssuesRequest
+  | QueryIssuesScopedRequest
+  | QueryIssueFacetCountsRequest
   | QueryIssueDetailRequest
   | QueryPullsRequest
   | GetCursorRequest
@@ -165,6 +198,8 @@ export interface ResultMap {
   seedAbort: void;
   applyChanges: ApplyChangesResult;
   queryIssues: IssueView[];
+  queryIssuesScoped: KeysetPage<IssueView>;
+  queryIssueFacetCounts: IssueFacetCount[];
   queryIssueDetail: IssueDetailView | null;
   queryPulls: PullView[];
   getCursor: number | null;
