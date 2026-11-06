@@ -84,6 +84,7 @@
     "build": "tsc -p tsconfig.build.json && node scripts/build-wire-types.mjs && node scripts/build-node.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:perf": "vitest run --config vitest.perf.config.ts",
     "prepublishOnly": "npm run build",
     "typecheck:scripts": "tsc --noEmit -p tsconfig.scripts.json",
     "test:pack": "node scripts/verify-pack.mjs",

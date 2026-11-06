@@ -290,8 +290,8 @@ Measure p50 for both ops at the scenario sizes through `WorkerCore.handle`, and 
 
 #### Automated Verification:
 
-- [ ] `npm run test:perf` passes and prints p50 under 10 ms (scoped, both densities) and under 25 ms (project facet)
-- [ ] `npm test` is unchanged in duration within noise (the perf suite is not in it)
+- [x] `npm run test:perf` passes and prints p50 under 10 ms (scoped, both densities) and under 25 ms (project facet)
+- [x] `npm test` is unchanged in duration within noise (the perf suite is not in it)
 
 #### Manual Verification:
 
