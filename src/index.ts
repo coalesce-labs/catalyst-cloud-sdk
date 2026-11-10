@@ -114,6 +114,10 @@ export {
   type MeResult,
   type TicketExecutionReport,
   type TicketExecutionResult,
+  type ExecutionCardResult,
+  type ExecutionCardListParams,
+  type ExecutionCardListResult,
+  type LinearStateType,
   type IssueGetProjection,
   type IssueExecutionProjection,
   type ReadSelectOptions,
@@ -285,3 +289,33 @@ export type { MemberLinearIdentity, LinearIdentityOption, LinearIdentityView, Li
 
 export { isMachineInventory } from "./machine-inventory.js";
 export type { Machine, MachineInventory, MachineMutation } from "./machine-inventory.js";
+
+// The ticket execution card (CTC-10373): the SDK's documented copy of the cloud's card shape.
+export {
+  EXECUTION_CONDITIONS,
+  EXECUTION_SOURCES,
+  EXECUTION_EVIDENCE_KINDS,
+  CONDITION_REASON_CODES,
+  COST_PART_STATES,
+  TICKET_EXECUTION_PAGE_LIMIT_MAX,
+  isTicketExecutionCard,
+  costIsComplete,
+} from "./ticket-execution-card.js";
+export type {
+  ExecutionCondition,
+  ExecutionSource,
+  ExecutionEvidenceKind,
+  ConditionReasonCode,
+  ClaimHolderKind,
+  CostBasis,
+  Amount,
+  CostPartState,
+  CostPart,
+  CostLine,
+  TicketCost,
+  TicketCostRead,
+  TicketExecutionHistoryRow,
+  TicketExecutionCard,
+  TicketExecutionCardPage,
+  TicketExecutionCardRead,
+} from "./ticket-execution-card.js";

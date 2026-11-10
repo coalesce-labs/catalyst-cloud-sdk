@@ -1,6 +1,12 @@
 import { eventFilterQueryParams, type EventScopeFilter } from "./event-filter.js";
 import { isMachineInventory, isMachineMutation, type MachineInventory, type MachineMutation } from "./machine-inventory.js";
 import { parseLinearIdentityView, type LinearIdentityResult } from "./linear-identity.js";
+import {
+  isTicketExecutionCard,
+  TICKET_EXECUTION_PAGE_LIMIT_MAX,
+  type ExecutionCondition,
+  type TicketExecutionCard,
+} from "./ticket-execution-card.js";
 // tenant-client.ts — CTC-2004. ONE typed client for every tenant read and write, so the CLI, the
 // skill scripts, MCP tools and the cloud repo's own scripts share one implementation instead of six.
 //
@@ -440,6 +446,35 @@ export interface TicketExecutionReport {
 export type TicketExecutionResult =
   | { outcome: "ok"; status: 200; report: TicketExecutionReport }
   | { outcome: "not-found"; status: 404 }
+  | TenantClientFailure;
+
+// ── Execution cards — CTC-10373. One card per ticket: condition, claim, current stage, queue place,
+//    blocker, completion, history and recorded cost (ticket-execution-card.ts holds the shape).
+
+/** `GET /api/v1/issues/:identifier/execution-card`. A ticket the cloud knows with no runs answers a
+ *  card in its empty states; only an unknown ticket is `not-found`. */
+export type ExecutionCardResult =
+  | { outcome: "ok"; status: 200; serverTime: string; card: TicketExecutionCard }
+  | { outcome: "not-found"; status: 404 }
+  | TenantClientFailure;
+
+/** The Linear state types the list filters on (names differ by team; types do not). */
+export type LinearStateType = "backlog" | "unstarted" | "started" | "completed" | "canceled";
+
+export interface ExecutionCardListParams {
+  /** One team key. Required by the cloud. */
+  team: string;
+  condition?: readonly ExecutionCondition[];
+  linearStateType?: readonly LinearStateType[];
+  /** 1 to 100; the cloud's default is 50. */
+  limit?: number;
+  /** The previous page's `nextCursor`. */
+  cursor?: string;
+}
+
+/** `GET /api/v1/execution-cards`. List rows never carry `cost.detail`; read one card for that. */
+export type ExecutionCardListResult =
+  | { outcome: "ok"; status: 200; serverTime: string; cards: TicketExecutionCard[]; nextCursor: string | null }
   | TenantClientFailure;
 
 // ── Read selection — CTC-4549. `?fields=a,b` names top-level keys, `?projection=<name>` names a
@@ -2004,6 +2039,55 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     return { outcome: "ok", status: 200, report: answer.json as TicketExecutionReport };
   }
 
+  async function executionCard(identifier: string): Promise<ExecutionCardResult> {
+    const label = "GET /api/v1/issues/:id/execution-card";
+    const sent = await send("GET", url(`/api/v1/issues/${encodeURIComponent(identifier)}/execution-card`), {});
+    if (!sent.ok) return sent.failure;
+    const { answer } = sent;
+    if (answer.status === 404) return { outcome: "not-found", status: 404 };
+    if (answer.status !== 200) return classify(answer);
+    const body = answer.json;
+    if (!isRecord(body) || typeof body["serverTime"] !== "string" || !isTicketExecutionCard(body["card"])) {
+      return { outcome: "shape", status: 200, reason: `${label} did not answer the documented shape` };
+    }
+    return { outcome: "ok", status: 200, serverTime: body["serverTime"], card: body["card"] };
+  }
+
+  async function executionCardsList(params: ExecutionCardListParams): Promise<ExecutionCardListResult> {
+    if (params.team.trim() === "") return { outcome: "rejected", status: 0, reason: "team must not be empty" };
+    if (
+      params.limit !== undefined &&
+      (!Number.isSafeInteger(params.limit) || params.limit < 1 || params.limit > TICKET_EXECUTION_PAGE_LIMIT_MAX)
+    ) {
+      return { outcome: "rejected", status: 0, reason: `limit must be an integer from 1 to ${TICKET_EXECUTION_PAGE_LIMIT_MAX}` };
+    }
+    const joined = (v: readonly string[] | undefined) => (v === undefined || v.length === 0 ? undefined : v.join(","));
+    const r = await objectRead(
+      "/api/v1/execution-cards",
+      {
+        team: params.team,
+        condition: joined(params.condition),
+        linearStateType: joined(params.linearStateType),
+        limit: params.limit,
+        cursor: params.cursor,
+      },
+      "GET /api/v1/execution-cards",
+      (body) =>
+        typeof body["serverTime"] === "string" &&
+        Array.isArray(body["cards"]) &&
+        body["cards"].every(isTicketExecutionCard) &&
+        (body["nextCursor"] === null || typeof body["nextCursor"] === "string"),
+    );
+    if (r.outcome !== "ok") return r;
+    return {
+      outcome: "ok",
+      status: 200,
+      serverTime: r.body["serverTime"] as string,
+      cards: r.body["cards"] as TicketExecutionCard[],
+      nextCursor: r.body["nextCursor"] as string | null,
+    };
+  }
+
   async function messagesRead(params: MessagesReadParams): Promise<MessagesReadResult> {
     if (params.ticket.trim() === "") return { outcome: "rejected", status: 0, reason: "ticket must not be empty" };
     if (params.since !== undefined && (!Number.isSafeInteger(params.since) || params.since < 0)) {
@@ -2767,7 +2851,8 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     setProjectWipLimit: (team, limit) => limit === null || Number.isFinite(limit)
       ? teamCall("POST", "/api/v1/agent/team-wip-limit", { team, limit }, projectWipLimit)
       : Promise.resolve({ outcome: "rejected", status: 0, error: "invalid-limit", reason: "limit must be a finite number, or null for the default" }),
-    issues: { list: issuesList, get: issuesGet, execution: issuesExecution },
+    issues: { list: issuesList, get: issuesGet, execution: issuesExecution, executionCard },
+    executionCards: { list: executionCardsList },
     pulls: { list: pullsList, get: pullsGet },
     projects: { list: projectsList },
     cycles: { list: cyclesList },
@@ -2868,6 +2953,14 @@ export interface TenantClient {
     execution(identifier: string): Promise<TicketExecutionResult>;
     /** The same report, asking for only some top-level keys (CTC-4549). */
     execution(identifier: string, select: IssueExecutionOptions): Promise<TicketExecutionProjectedResult>;
+    /** `GET /api/v1/issues/:identifier/execution-card` — the ticket's execution card with its cost
+     *  lines (CTC-10373). Cost needs a workspace admin or owner; an account API key always reads
+     *  `{access:"restricted"}`. */
+    executionCard(identifier: string): Promise<ExecutionCardResult>;
+  };
+  /** `GET /api/v1/execution-cards` — one team's cards, keyset-paged by `nextCursor` (CTC-10373). */
+  executionCards: {
+    list(params: ExecutionCardListParams): Promise<ExecutionCardListResult>;
   };
   pulls: {
     list(params?: PullListParams): Promise<PullListResult>;

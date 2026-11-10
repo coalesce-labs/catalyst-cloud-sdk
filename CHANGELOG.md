@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.16.25
+
+Your code and agents can now read one card per ticket that says what is happening to it: `issues.executionCard(identifier)` returns the ticket's condition (running, queued, blocked, waiting and the rest), who holds it, the current stage, its place in the queue, what blocks it, its history and its recorded cost so far, with one cost line per run. `executionCards.list({ team })` returns a team's cards a page at a time, filtered by `condition` or `linearStateType`, and follows `nextCursor`. Recorded cost needs a workspace admin or owner. On an account API key, cost always reads `cost.access === "restricted"`, never a blank or a zero, and the card still carries its condition and history. A cost the cloud could not read says `unavailable`, and a cost still accruing or not yet reported says `partial` or `running`. A card whose sources could not be read says `unknown`, with the reason `source_stale` or `no_source_read`. `costIsComplete(cost)` tells you whether the amount is final. An unknown ticket is `not-found`; a ticket with no runs returns a card in its empty states.
+
+Requires a Catalyst Cloud server that offers execution cards. On an older one both reads return an `http` 404 outcome.
+
 ## 0.16.24
 
 The SDK now reads a contract that lists a route with an HTTP method it does not know. Before this release, one such route made `contract()` return a `shape` outcome and every `agent.*` method fail, for any code calling them directly. Only that route now counts as unknown, and the agent methods return `route-unknown` for it. No change is needed beyond updating the SDK and both replicas together.
