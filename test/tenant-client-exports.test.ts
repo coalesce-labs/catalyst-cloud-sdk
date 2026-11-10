@@ -35,6 +35,8 @@ describe("⭐ every method on the TenantClient interface is present on a constru
       "issues.list",
       "issues.get",
       "issues.execution",
+      "issues.executionCard",
+      "executionCards.list",
       "pulls.list",
       "pulls.get",
       "projects.list",
